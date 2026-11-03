@@ -11,6 +11,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -81,6 +82,7 @@ constexpr const char* kWorldColumns =
     "statements, last_write_at, stats_at";
 
 std::string text_col(sqlite3_stmt* stmt, int col) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, col));
     return txt == nullptr ? std::string() : std::string(txt);
 }
@@ -117,7 +119,7 @@ WorldRecord read_world(sqlite3_stmt* stmt) {
 struct RegistryDb::Impl {
     fs::path data_dir;
     mutable std::mutex mutex;
-    mutable std::optional<pst::Connection> conn;
+    mutable std::unique_ptr<pst::Connection> conn;
 
     [[nodiscard]] sqlite3* db() const { return conn->raw(); }
 
@@ -179,7 +181,7 @@ RegistryDb RegistryDb::open(const fs::path& data_dir, const fs::path& default_db
     try {
         std::error_code mkdir_err;
         fs::create_directories(impl->data_dir, mkdir_err);
-        impl->conn.emplace(pst::Connection::open(file));
+        impl->conn = std::make_unique<pst::Connection>(pst::Connection::open(file));
         impl->conn->exec(kSchemaSql);
         pst::TransactionGuard guard(*impl->conn);
         std::optional<std::string> version;
@@ -346,7 +348,7 @@ void RegistryDb::remove(const std::string& name) {
     pst::TransactionGuard guard(*impl_->conn);
     for (const char* sql : {"DELETE FROM world_labels WHERE name = ?",
                             "DELETE FROM snapshots WHERE world = ?",
-                            "DELETE FROM worlds WHERE name = ?"}) {
+                            "DELETE FROM worlds WHERE name = ?",}) {
         pst::Stmt stmt(impl_->db(), sql);
         stmt.bind(name);
         stmt.step_done();
