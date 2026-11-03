@@ -1,5 +1,7 @@
 #include "starling/governance/world_store.hpp"
 
+#include "world_store_internal.hpp"
+
 #include "starling/persistence/sqlite_handles.hpp"
 #include "starling/persistence/stmt.hpp"
 
@@ -35,13 +37,18 @@ WorldStoreError::WorldStoreError(std::string code, const std::string& detail)
 const std::string& WorldStoreError::code() const noexcept { return code_; }
 
 bool is_valid_world_name(std::string_view name) {
-    if (name.empty() || name.size() > 32) { return false; }
+    // 世界名：首字符字母或数字，其余字母、数字、'.'、'_'、'-'，长度 1–128。
+    // 磁盘上的目录用 dir_id，不用世界名，所以大小写与 '.' 都安全。
+    constexpr std::size_t kMaxNameLength = 128;
+    if (name.empty() || name.size() > kMaxNameLength) { return false; }
     const auto alnum = [](char chr) {
-        return (chr >= 'a' && chr <= 'z') || (chr >= '0' && chr <= '9');
+        return (chr >= 'a' && chr <= 'z') || (chr >= 'A' && chr <= 'Z') ||
+               (chr >= '0' && chr <= '9');
     };
     if (!alnum(name.front())) { return false; }
-    return std::ranges::all_of(
-        name, [&alnum](char chr) { return alnum(chr) || chr == '_' || chr == '-'; });
+    return std::ranges::all_of(name, [&alnum](char chr) {
+        return alnum(chr) || chr == '.' || chr == '_' || chr == '-';
+    });
 }
 
 namespace {
@@ -353,7 +360,7 @@ void validate_shape(const Registry& reg) {
     for (const auto& [name, world] : reg.worlds) {
         // default 的键是固定的（"default"），不是用户起的名字。
         if (name != reg.default_world && !is_valid_world_name(name)) {
-            corrupt("world name '" + name + "' does not match [a-z0-9][a-z0-9_-]{0,31}");
+            corrupt("world name '" + name + "' does not match [A-Za-z0-9][A-Za-z0-9._-]{0,127}");
         }
         if (!fs::path(world.db_path).is_absolute()) {
             corrupt("db_path of '" + name + "' is not absolute: " + world.db_path);
@@ -948,7 +955,7 @@ WorldEntry create_world(Registry& reg, const fs::path& registry_dir, const std::
                         const AutoSnapshotConfig& auto_snapshot) {
     if (!is_valid_world_name(name)) {
         throw WorldStoreError("invalid_world_name",
-                              "'" + name + "' does not match [a-z0-9][a-z0-9_-]{0,31}");
+                              "'" + name + "' does not match [A-Za-z0-9][A-Za-z0-9._-]{0,127}");
     }
     if (reg.worlds.contains(name)) {
         throw WorldStoreError("world_exists", "world '" + name + "' already exists");
@@ -2069,5 +2076,22 @@ SessionList list_sessions(const Registry& reg, const std::string& world, std::in
     }
     return out;
 }
+
+namespace internal {
+
+std::string random_hex() { return governance::random_hex(); }
+std::string iso_now() { return governance::iso_now(); }
+bool remove_within(const fs::path& base, const fs::path& target) {
+    return governance::remove_within(base, target);
+}
+void require_worlds_root_inside(const fs::path& registry_dir, const fs::path& worlds_root) {
+    governance::require_worlds_root_inside(registry_dir, worlds_root);
+}
+void require_resolved_home(const fs::path& worlds_root, const std::string& name,
+                           const std::string& code) {
+    governance::require_resolved_home(worlds_root, name, code);
+}
+
+}  // namespace internal
 
 }  // namespace starling::governance

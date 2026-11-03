@@ -32,6 +32,7 @@ private:
 // code 取值：invalid_world_name | world_exists | world_not_found | world_protected
 //           | registry_corrupt | invalid_retention | snapshot_not_found
 //           | insufficient_disk | snapshot_failed
+//           | labels_immutable（RegistryDb::set_labels：世界已有标签，标签创建后不可改）
 //           | invalid_snapshot_kind（take_snapshot：kind 不是 manual / auto，或 kind 与 reason 不配对）
 //           | world_tenant_mismatch（verify_world_tenant：库里有别的租户的行）
 //           | snapshot_unsupported_backend（take_snapshot / rollback_world：vector_backend 不是 sqlite）

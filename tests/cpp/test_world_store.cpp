@@ -73,12 +73,14 @@ TEST(WorldName, AcceptsAndRejects) {
     EXPECT_TRUE(is_valid_world_name("0abc"));
     EXPECT_FALSE(is_valid_world_name(""));
     EXPECT_FALSE(is_valid_world_name("-lead"));
-    EXPECT_FALSE(is_valid_world_name("Upper"));
+    EXPECT_TRUE(is_valid_world_name("Upper"));
+    EXPECT_TRUE(is_valid_world_name("rise.deploy-S1_a"));
+    EXPECT_FALSE(is_valid_world_name(".hidden"));
     EXPECT_FALSE(is_valid_world_name("has space"));
     EXPECT_FALSE(is_valid_world_name("../escape"));
     EXPECT_FALSE(is_valid_world_name("a/b"));
-    EXPECT_FALSE(is_valid_world_name(std::string(33, 'a')));
-    EXPECT_TRUE(is_valid_world_name(std::string(32, 'a')));
+    EXPECT_FALSE(is_valid_world_name(std::string(129, 'a')));
+    EXPECT_TRUE(is_valid_world_name(std::string(128, 'a')));
 }
 
 TEST(WorldRegistry, EnsureCreatesDefaultOnce) {
