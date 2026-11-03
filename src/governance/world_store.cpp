@@ -725,7 +725,15 @@ void validate_world(const RegistryDb& reg, const std::string& world) {
     // 先查与布局无关的一层（形状、配置、快照条目），再查布局：与 worlds.json 时代 load_registry
     // 的顺序相同（validate_shape 在 validate_layout 之前）。
     check_world_shape(rec.name, rec.dir_id, rec.db_path, rec.snapshot_dir, is_default);
-    check_auto_snapshot(rec.name, settings_from_json(rec.settings_json).background.auto_snapshot);
+    // 存着的设置解析不了（手改过的 registry.db；写路径都经 merge_settings，存不进这样的值）是注册表
+    // 损坏，不是调用方的输入错：invalid_settings / invalid_auto_snapshot 等转成 registry_corrupt。
+    AutoSnapshotConfig auto_snapshot;
+    try {
+        auto_snapshot = settings_from_json(rec.settings_json).background.auto_snapshot;
+    } catch (const WorldStoreError& err) {
+        corrupt("settings_json of '" + rec.name + "': " + err.what());
+    }
+    check_auto_snapshot(rec.name, auto_snapshot);   // 纵深防御：settings_from_json 已查过范围
     for (const auto& snap : reg.snapshots(world)) {
         check_snapshot_entry(world, rec.snapshot_dir, snap);
     }
@@ -855,6 +863,9 @@ SnapshotEntry take_snapshot(RegistryDb& reg, const std::string& world,
                               "outside the database file");
     }
     require_valid_retention(reg.snapshot_retention());
+    // 裁定 R12：写文件、清扫残留之前先查这个世界的注册表行与布局（snapshot_dir 被手改到世界目录之外、
+    // snapshots/ 外链时拒绝，清扫与 VACUUM INTO 都不会落到外部）。只读：仍在任何文件 I/O 之前。
+    validate_world(reg, world);
     const fs::path dir = entry.snapshot_dir;
 
     // 库文件不存在（世界从未激活）：在打开连接前拒绝，否则 mode=ro 只会报含糊的
@@ -970,6 +981,7 @@ std::vector<std::string> apply_retention(RegistryDb& reg, const std::string& wor
     const WorldRecord found = reg.get(world);   // world_not_found
     const int retention = reg.snapshot_retention();
     require_valid_retention(retention);
+    validate_world(reg, world);   // 裁定 R12：删文件之前先查布局
     std::vector<std::string> removed;
     const std::vector<SnapshotEntry> list = reg.snapshots(world);   // 最新在前
     const auto limit = static_cast<std::size_t>(retention);
@@ -1006,6 +1018,7 @@ std::vector<std::string> apply_retention(RegistryDb& reg, const std::string& wor
 
 void delete_snapshot(RegistryDb& reg, const std::string& world, const std::string& snapshot_id) {
     const WorldRecord found = reg.get(world);   // world_not_found
+    validate_world(reg, world);   // 裁定 R12：删文件之前先查布局
     const std::vector<SnapshotEntry> list = reg.snapshots(world);
     const auto pos = std::ranges::find_if(
         list, [&snapshot_id](const SnapshotEntry& snap) { return snap.id == snapshot_id; });
@@ -1365,6 +1378,7 @@ RollbackTarget check_rollback_target(const RegistryDb& reg, const std::string& w
     // 1. 路径只从注册表取。向量在库文件之外的后端（zvec）恢复不出完整的世界（spec §12）。
     RollbackTarget target;
     target.entry = reg.get(world);   // world_not_found
+    validate_world(reg, world);      // 裁定 R12：替换库、建归档之前先查注册表行与布局
     target.snap = registered_snapshot(reg, world, snapshot_id);
     if (opts.vector_backend != "sqlite") {
         throw WorldStoreError("snapshot_unsupported_backend",
@@ -1512,6 +1526,7 @@ RollbackResult rollback_world(const RegistryDb& reg, const std::string& world,
 
 std::vector<ArchiveEntry> list_rollback_archives(const RegistryDb& reg, const std::string& world) {
     const WorldRecord entry = reg.get(world);   // world_not_found
+    validate_world(reg, world);   // 裁定 R12（purge 经这里删文件）
     const fs::path home = checked_world_home(reg.data_dir(), world, entry.dir_id);
     const fs::path dir = home / "archive";
     if (!fs::exists(lstat_or_throw(dir))) { return {}; }
@@ -1654,11 +1669,13 @@ AutoSnapshotResult take_auto_snapshot(RegistryDb& reg, const std::string& world,
     }
     const auto now = parse_utc_seconds(trigger.now_iso);
     if (!now) { invalid_auto("now_iso is not YYYY-MM-DDTHH:MM:SSZ: '" + trigger.now_iso + "'"); }
+    // 裁定 R12：第 5 步的修剪与拍快照都会删文件，先查注册表行与布局；违反时抛，不当成「拒绝拍」。
+    validate_world(reg, world);
     // 向量在库文件之外的后端拍不出完整的世界：直接不拍，不算失败（用户裁定 2026-10-28）。
     if (base.vector_backend != "sqlite") { return skipped_because("unsupported_backend"); }
 
-    // 配置在世界设置的 background.auto_snapshot 里（裁定 R10）。手改过的 settings_json 可以写进越界的
-    // interval_hours（world_settings 不查范围）：拒绝，与 set_auto_snapshot 同一个码。
+    // 配置在世界设置的 background.auto_snapshot 里（裁定 R10）。范围已由 settings_from_json 与
+    // validate_world 查过（裁定 R11），这里再查一次是纵深防御。
     const AutoSnapshotConfig config =
         settings_from_json(entry.settings_json).background.auto_snapshot;
     require_valid_auto_snapshot(config);

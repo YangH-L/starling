@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <string>
 
 namespace {
@@ -148,6 +149,41 @@ TEST(WorldSettings, RejectsWrongTypesNamingPath) {
               "invalid_settings");
     EXPECT_EQ(error_code([] { merge_settings(WorldSettings{}, R"({"source_lane":{"enabled":"yes"}})", false); }),
               "invalid_settings");
+}
+
+// 裁定 R11：background.auto_snapshot.interval_hours 只收 0–8760，越界抛 invalid_auto_snapshot。
+// settings_from_json 与 merge_settings 都查（每条写路径都经 merge_settings），所以 registry.db 里存不进
+// validate_world 会拒的值，服务不会因为一次设置更新而起不来。
+std::string with_interval(std::int64_t hours) {
+    return R"({"background":{"auto_snapshot":{"interval_hours":)" + std::to_string(hours) + "}}}";
+}
+
+TEST(WorldSettings, FromJsonRejectsIntervalOutOfRange) {
+    for (const std::int64_t bad : {std::int64_t{8761}, std::int64_t{-1}}) {
+        EXPECT_EQ(error_code([&] { (void)settings_from_json(with_interval(bad)); }),
+                  "invalid_auto_snapshot") << bad;
+    }
+    for (const std::int64_t fine : {std::int64_t{0}, std::int64_t{8760}}) {
+        EXPECT_EQ(settings_from_json(with_interval(fine)).background.auto_snapshot.interval_hours,
+                  fine);
+    }
+}
+
+TEST(WorldSettings, MergeRejectsIntervalOutOfRangeAndLeavesBaseAlone) {
+    WorldSettings base;
+    base.background.auto_snapshot = {.on_session = true, .interval_hours = 6};
+    for (const std::int64_t bad : {std::int64_t{8761}, std::int64_t{-1}}) {
+        EXPECT_EQ(error_code([&] { (void)merge_settings(base, with_interval(bad), false); }),
+                  "invalid_auto_snapshot") << bad;
+        // 只读世界会把 background 强制关掉，越界的 overrides 照样拒（不因随后被覆盖就放行）。
+        EXPECT_EQ(error_code([&] { (void)merge_settings(base, with_interval(bad), true); }),
+                  "invalid_auto_snapshot") << bad;
+    }
+    EXPECT_EQ(base.background.auto_snapshot.interval_hours, 6);
+    for (const std::int64_t fine : {std::int64_t{0}, std::int64_t{8760}}) {
+        EXPECT_EQ(merge_settings(base, with_interval(fine), false)
+                      .background.auto_snapshot.interval_hours, fine);
+    }
 }
 
 TEST(WorldSettings, EndpointChanged) {

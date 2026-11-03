@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+
 #include <string_view>
 #include <utility>
 
@@ -117,6 +119,8 @@ void apply_source_lane(const Json& obj, const std::string& path, SourceLaneSetti
     }
 }
 
+constexpr std::int64_t kMaxIntervalHours = 8760;   // 一年，与 world_store 的 set_auto_snapshot 相同
+
 void apply_auto_snapshot(const Json& obj, const std::string& path, AutoSnapshotConfig& out) {
     require_object(obj, path);
     for (const auto& [key, val] : obj.items()) {
@@ -124,7 +128,19 @@ void apply_auto_snapshot(const Json& obj, const std::string& path, AutoSnapshotC
         if (key == "on_session") {
             read_bool(val, sub, out.on_session);
         } else if (key == "interval_hours") {
+            // 大于 int64 的无符号数直接按越界拒，不让 get<int64_t> 回绕成负数。
+            if (val.is_number_unsigned() &&
+                val.get<std::uint64_t>() > static_cast<std::uint64_t>(kMaxIntervalHours)) {
+                throw WorldStoreError("invalid_auto_snapshot", sub + ": 必须在 0–8760 之间");
+            }
             read_int(val, sub, out.interval_hours);
+            // 裁定 R11：越界的值写不进注册表（每条写路径都经 merge_settings），否则 validate_world
+            // 在启动时拒绝整个注册表。码与 set_auto_snapshot 相同。
+            if (out.interval_hours < 0 || out.interval_hours > kMaxIntervalHours) {
+                throw WorldStoreError("invalid_auto_snapshot",
+                                      sub + ": 必须在 0–8760 之间，得到 " +
+                                          std::to_string(out.interval_hours));
+            }
         } else {
             fail(sub, "未知键");
         }

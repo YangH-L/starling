@@ -394,14 +394,15 @@ TEST(WorldSnapshot, UnknownWorldAndMissingDb) {
     EXPECT_TRUE(fs::is_empty(reg.get("sim-1").snapshot_dir));
 }
 
-// 保留策略不需要真实快照文件，构造注册项即可。
+// 保留策略不需要真实快照文件，构造注册项即可。reason 取与 kind 配对的值（auto 默认 interval），
+// 否则 validate_world 把条目当成损坏（裁定 R12：删文件的入口先跑它）。
 SnapshotEntry fake_snapshot(const fs::path& dir, const std::string& stamp,
                             const std::string& kind) {
     SnapshotEntry snap;
     snap.id = stamp;
     snap.path = (dir / (stamp + ".db")).string();
     snap.kind = kind;
-    snap.reason = kind;
+    snap.reason = kind == "auto" ? "interval" : kind;
     snap.created_at = stamp;
     { std::ofstream out(snap.path); out << "x"; }
     return snap;
@@ -575,11 +576,11 @@ TEST(WorldSnapshot, WorldTimeOnDbWithoutSourceUnitMetaTable) {
     EXPECT_EQ(snapshot_world_time((tmp.path() / "absent.db").string(), "t1"), "");
 }
 
-// 注册表可被手改：db_path 里的 % ? # 不能被当成 URI 语法。
+// db_path 里的 % ? # 不能被当成 URI 语法（目录放在世界目录之内，布局校验照常通过）。
 TEST(WorldSnapshot, DbPathWithUriSpecialCharacters) {
     const TempDir tmp;
     auto reg = registry_with_world(tmp, "sim-1");
-    const fs::path odd_dir = tmp.path() / "a#b?c%d";
+    const fs::path odd_dir = world_dir_of(reg, "sim-1") / "a#b?c%d";
     fs::create_directories(odd_dir);
     set_world_column(reg, "sim-1", "db_path", (odd_dir / "w%41.db").string());
     const auto world = reg.get("sim-1");
@@ -834,6 +835,8 @@ TEST(WorldRetention, SoleAutoSurvivesManualFlood) {
 
 // 被篡改的注册项指向 snapshot_dir 之外：外部文件不能被删，而且必须 fail closed——
 // 摘掉注册项会让这份文件再也无法经注册表清理，页面上的快照空间统计也随之失真。
+// 字面越界的路径由开头的 validate_world 拒（registry_corrupt）；字面在 snapshot_dir 里、却是指向
+// 外部的符号链接，validate_world 看不出来（快照路径只比字面），由 remove_within 解析后拒（snapshot_failed）。
 TEST(WorldSnapshotDelete, RefusesPathOutsideSnapshotDir) {
     const TempDir tmp;
     const TempDir outside;
@@ -846,8 +849,16 @@ TEST(WorldSnapshotDelete, RefusesPathOutsideSnapshotDir) {
     snap.kind = "manual";
     snap.reason = "manual";
     reg.put_snapshot("sim-1", snap);
+    EXPECT_EQ(code_of([&] { delete_snapshot(reg, "sim-1", "evil"); }), "registry_corrupt");
+    EXPECT_TRUE(fs::exists(victim));
+
+    const fs::path link = fs::path(reg.get("sim-1").snapshot_dir) / "evil.db";
+    fs::create_symlink(victim, link);
+    set_snapshot_column(reg, "sim-1", "evil", "path", link.string());
+    EXPECT_EQ(code_of([&] { validate_world(reg, "sim-1"); }), "<no throw>");
     EXPECT_EQ(code_of([&] { delete_snapshot(reg, "sim-1", "evil"); }), "snapshot_failed");
     EXPECT_TRUE(fs::exists(victim));
+    EXPECT_TRUE(fs::is_symlink(link));
     ASSERT_EQ(reg.snapshots("sim-1").size(), 1U);
     EXPECT_EQ(reg.snapshots("sim-1").front().id, "evil");
 }
@@ -1008,14 +1019,16 @@ TEST(WorldValidation, RejectsLowRetentionAndOutOfRangeAutoSnapshot) {
     set_retention(reg, 1);
     EXPECT_EQ(code_of([&] { validate_world(reg, "sim-1"); }), "invalid_retention");
     set_retention(reg, 5);
+    // 存着的设置解析不了（只有手改 registry.db 才写得进去）是注册表损坏：registry_corrupt，原码写在消息里。
     for (const std::int64_t bad : {std::int64_t{-1}, std::int64_t{8761}}) {
         set_world_column(reg, "sim-1", "settings_json",
                          R"({"background":{"auto_snapshot":{"on_session":true,"interval_hours":)" +
                              std::to_string(bad) + "}}}");
-        expect_world_corrupt(reg, "sim-1", "interval " + std::to_string(bad), "auto_snapshot of 'sim-1'");
+        expect_world_corrupt(reg, "sim-1", "interval " + std::to_string(bad),
+                             "settings_json of 'sim-1': invalid_auto_snapshot");
     }
     set_world_column(reg, "sim-1", "settings_json", R"({"foo":1})");
-    EXPECT_EQ(code_of([&] { validate_world(reg, "sim-1"); }), "invalid_settings");
+    expect_world_corrupt(reg, "sim-1", "unknown key", "settings_json of 'sim-1': invalid_settings");
 }
 
 // worlds/ 本身指向外部：注册表校验即拒（registry_corrupt）。只靠逐项比较两侧都解析
@@ -1065,7 +1078,8 @@ TEST(WorldRegistry, ValidatesThroughSymlinkedDataDir) {
     EXPECT_EQ(code_of([&] { validate_registry(aliased); }), "registry_corrupt");
 }
 
-// 保留策略遇到越界的注册项：fail closed，外部文件不动，注册项保留。
+// 保留策略遇到越界的注册项：fail closed，外部文件不动，注册项保留。条目字面在 snapshot_dir 里
+// （validate_world 放行），磁盘上却是指向外部的符号链接：由 remove_within 解析后拒。
 TEST(WorldRetention, OutOfBoundsVictimFailsClosed) {
     const TempDir tmp;
     const TempDir outside;
@@ -1076,8 +1090,10 @@ TEST(WorldRetention, OutOfBoundsVictimFailsClosed) {
     { std::ofstream out(victim); out << "x"; }
     SnapshotEntry evil;
     evil.id = "t1";
-    evil.path = victim.string();
+    evil.path = (dir / "t1.db").string();
+    fs::create_symlink(victim, evil.path);
     evil.kind = "manual";
+    evil.reason = "manual";
     set_snapshots(reg, "sim-1", {fake_snapshot(dir, "t3", "manual"),
                               fake_snapshot(dir, "t2", "manual"), evil});
     EXPECT_EQ(code_of([&] { (void)apply_retention(reg, "sim-1"); }), "snapshot_failed");
@@ -1854,10 +1870,9 @@ TEST(WorldRollback, ArchiveStaysInWorldDirWhenSnapshotDirIsASymlinkFromOutside) 
 }
 
 // 注册表不变，worlds/<sim-1>/snapshots 是指到 <外部>/snaps 的符号链接。这种布局已不再支持
-// （用户裁定 2026-10-27）：validate_world 报 registry_corrupt，经服务的操作到不了这里。
-// rollback_world 直接调用时仍不依赖 snapshot_dir：回滚照常成功，归档仍在 worlds/<sim-1>/archive；
-// 外部只有原来那份快照文件。
-TEST(WorldRollback, ArchiveStaysInWorldDirWhenSnapshotsDirPointsOutside) {
+// （用户裁定 2026-10-27）：validate_world 报 registry_corrupt。裁定 R12 起回滚、列出、清理自己先跑
+// validate_world，同样拒绝：库不动，不建归档，外部只有原来那份快照文件。
+TEST(WorldRollback, RefusesWhenSnapshotsDirPointsOutside) {
     const TempDir tmp;
     const TempDir outside;
     auto reg = registry_with_world(tmp, "sim-1");
@@ -1868,19 +1883,22 @@ TEST(WorldRollback, ArchiveStaysInWorldDirWhenSnapshotsDirPointsOutside) {
     fs::create_directory_symlink(outside.path() / "snaps", real_snaps);
     EXPECT_EQ(code_of([&] { validate_world(reg, "sim-1"); }), "registry_corrupt");
     const auto outside_before = tree_of(outside.path());
+    const std::string db_before = slurp(world.db_path);
 
-    const auto result = rollback_world(reg, "sim-1", snap.id, RollbackOptions{});
-    EXPECT_EQ(engram_count(world.db_path), 2);
-    EXPECT_EQ(fs::path(result.archive_path).parent_path(), world_dir_of(reg, "sim-1") / "archive");
-    EXPECT_TRUE(fs::is_regular_file(result.archive_path));
-    EXPECT_EQ(tree_of(outside.path()), outside_before);
-    EXPECT_EQ(list_rollback_archives(reg, "sim-1").size(), 1U);
-    EXPECT_EQ(purge_rollback_archives(reg, "sim-1"), 1U);
+    EXPECT_EQ(code_of([&] { (void)rollback_world(reg, "sim-1", snap.id, RollbackOptions{}); }),
+              "registry_corrupt");
+    EXPECT_EQ(code_of([&] { (void)list_rollback_archives(reg, "sim-1"); }), "registry_corrupt");
+    EXPECT_EQ(code_of([&] { (void)purge_rollback_archives(reg, "sim-1"); }), "registry_corrupt");
+    EXPECT_EQ(engram_count(world.db_path), 5);
+    EXPECT_EQ(slurp(world.db_path), db_before);
+    EXPECT_TRUE(archive_is_empty(world));
+    EXPECT_TRUE(rollback_partials(world).empty());
     EXPECT_EQ(tree_of(outside.path()), outside_before);
 }
 
-// worlds/<sim-1> 本身是指到外部的符号链接：回滚、列出、清理都 fail closed（snapshot_failed），
-// 与 RegistryDb::remove 同一边界。外部的库、快照和预先放好的归档名文件一个字节都不动。
+// worlds/<sim-1> 本身是指到外部的符号链接：回滚、列出、清理都 fail closed。开头的 validate_world
+// 按布局规则 1 拒（registry_corrupt，裁定 R12）；checked_world_home 的同一检查（snapshot_failed，与
+// RegistryDb::remove 同一边界）留作纵深防御。外部的库、快照和预先放好的归档名文件一个字节都不动。
 TEST(WorldArchives, RefuseWhenWorldDirIsASymlinkOutside) {
     const TempDir tmp;
     const TempDir outside;
@@ -1898,11 +1916,11 @@ TEST(WorldArchives, RefuseWhenWorldDirIsASymlinkOutside) {
 
     EXPECT_EQ(code_of([&] {
                   (void)rollback_world(reg, "sim-1", snap.id, RollbackOptions{});
-              }), "snapshot_failed");
+              }), "registry_corrupt");
     EXPECT_EQ(code_of([&] { (void)list_rollback_archives(reg, "sim-1"); }),
-              "snapshot_failed");
+              "registry_corrupt");
     EXPECT_EQ(code_of([&] { (void)purge_rollback_archives(reg, "sim-1"); }),
-              "snapshot_failed");
+              "registry_corrupt");
     EXPECT_EQ(tree_of(outside.path()), outside_before);
     EXPECT_EQ(slurp(outside.path() / "sim-1" / "world.db"), db_before);
     EXPECT_EQ(slurp(planted), "precious");
@@ -2076,7 +2094,7 @@ TEST(WorldRollbackCheck, RefusesEachReadOnlyCaseWithRollbackCodesAndTouchesNothi
              fs::rename(home, outside.path() / "sim-1");
              fs::create_directory_symlink(outside.path() / "sim-1", home);
          },
-         .expected = "snapshot_failed"},
+         .expected = "registry_corrupt"},   // 开头的 validate_world（裁定 R12）
         {.label = "7 insufficient disk", .opts = starved, .expected = "insufficient_disk"},
     };
     for (const auto& tcase : cases) { expect_preflight(tcase); }
@@ -2418,22 +2436,27 @@ TEST(WorldLayout, PurgeArchivesRefusesWorldDirAliasedToASiblingWorldDir) {
     SiblingAliasCase tcase;
     ASSERT_TRUE(fs::is_regular_file(tcase.archive));
     const auto sibling_before = contents_of(tcase.sibling);
+    // 开头的 validate_world 按布局规则 1 拒（registry_corrupt，裁定 R12）：消息与校验相同。
     const std::string what =
         what_of([&] { (void)purge_rollback_archives(tcase.reg, "sim-1"); });
     EXPECT_EQ(code_of([&] { (void)purge_rollback_archives(tcase.reg, "sim-1"); }),
-              "snapshot_failed");
+              "registry_corrupt");
     EXPECT_NE(what.find("home of 'sim-1'"), std::string::npos) << what;
     EXPECT_NE(what.find("resolves to"), std::string::npos) << what;
-    // 同一个检查（checked_world_home）也挡住列出与回滚：sim-1 的操作不会落到 sim-2 上。
+    // 同一个检查也挡住列出与回滚：sim-1 的操作不会落到 sim-2 上。
     EXPECT_EQ(code_of([&] { (void)list_rollback_archives(tcase.reg, "sim-1"); }),
-              "snapshot_failed");
+              "registry_corrupt");
+    EXPECT_EQ(code_of([&] {
+                  (void)rollback_world(tcase.reg, "sim-1", "x", RollbackOptions{});
+              }), "registry_corrupt");
     EXPECT_EQ(contents_of(tcase.sibling), sibling_before);
     EXPECT_TRUE(fs::is_regular_file(tcase.archive));
     EXPECT_EQ(engram_count(tcase.reg.get("sim-2").db_path), 3);
 }
 
-// 注册表里的 dir_id 被手改成越出 worlds/ 的路径：回滚、列出、清理都先验 dir_id 的形状，
-// snapshot_failed，什么都不建、不删。
+// 注册表里的 dir_id 被手改成越出 worlds/ 的路径：回滚、列出、清理开头的 validate_world 先验 dir_id
+// 的形状（registry_corrupt，裁定 R12），什么都不建、不删。checked_world_home 的同一检查
+// （snapshot_failed）是纵深防御。
 TEST(WorldLayout, ArchiveOperationsRefuseATamperedDirId) {
     const TempDir tmp;
     auto reg = registry_with_world(tmp, "sim-1");
@@ -2445,12 +2468,12 @@ TEST(WorldLayout, ArchiveOperationsRefuseATamperedDirId) {
     for (const char* dir_id : {"../x", "..", "a/b", ""}) {
         set_world_column(reg, "sim-1", "dir_id", dir_id);
         EXPECT_EQ(code_of([&] { (void)rollback_world(reg, "sim-1", snap.id, RollbackOptions{}); }),
-                  "snapshot_failed") << dir_id;
+                  "registry_corrupt") << dir_id;
         EXPECT_EQ(code_of([&] { check_rollback(reg, "sim-1", snap.id, RollbackOptions{}); }),
-                  "snapshot_failed") << dir_id;
-        EXPECT_EQ(code_of([&] { (void)list_rollback_archives(reg, "sim-1"); }), "snapshot_failed")
+                  "registry_corrupt") << dir_id;
+        EXPECT_EQ(code_of([&] { (void)list_rollback_archives(reg, "sim-1"); }), "registry_corrupt")
             << dir_id;
-        EXPECT_EQ(code_of([&] { (void)purge_rollback_archives(reg, "sim-1"); }), "snapshot_failed")
+        EXPECT_EQ(code_of([&] { (void)purge_rollback_archives(reg, "sim-1"); }), "registry_corrupt")
             << dir_id;
     }
     EXPECT_EQ(slurp(planted), "precious");
@@ -2533,6 +2556,123 @@ TEST(WorldLayout, LayoutRefusalsCarryARemedyHint) {
 }
 
 
+// ---- 裁定 R12：删除或替换文件的入口自己先跑 validate_world --------------------------------
+// 以前每次操作之前都经 load_registry 校验整份注册表；现在 take_snapshot（含残留清扫）、
+// apply_retention、delete_snapshot、take_auto_snapshot（含修剪）、check_rollback、rollback_world、
+// list / purge_rollback_archives 开头都调 validate_world。snapshot_dir 被手改到世界目录之外
+// （registry.db 上直接 UPDATE），或 snapshots/ 被换成指到外部的符号链接时，它们抛与 validate_world
+// 相同的码，外部的文件一个字节都不动。
+
+// sim-1：库有 2 行，登记了 3 份快照（保留份数 2，修剪会删一份），按时间 24 小时开着。然后把快照目录
+// 挪到外部 <outside>/snaps：via_symlink 时 worlds/<sim-1>/snapshots 换成指向它的符号链接（注册表不变）；
+// 否则 snapshot_dir 与快照路径在 registry.db 里直接改成外部路径。外部目录里还放了残留清扫会删的
+// 诱饵（快照 id 形状的 .db.partial 与未登记的 .db）和一个哨兵文件。
+struct EscapedSnapshotDir {
+    TempDir tmp;
+    TempDir outside;
+    RegistryDb reg = registry_with_world(tmp, "sim-1");
+    std::vector<std::string> ids;   // 最新在前
+
+    explicit EscapedSnapshotDir(bool via_symlink) {
+        set_auto_snapshot(reg, "sim-1", AutoSnapshotConfig{true, 24});
+        seed_world_db(reg.get("sim-1").db_path, "sim-1", 2);
+        set_retention(reg, 10);
+        for (int idx = 0; idx < 3; ++idx) { (void)take_snapshot(reg, "sim-1", SnapshotOptions{}); }
+        set_retention(reg, 2);
+        ids = ids_of(reg.snapshots("sim-1"));
+        EXPECT_EQ(code_of([&] { validate_world(reg, "sim-1"); }), "<no throw>");
+
+        const fs::path real = world_dir_of(reg, "sim-1") / "snapshots";
+        const fs::path moved = outside.path() / "snaps";
+        fs::rename(real, moved);
+        if (via_symlink) {
+            fs::create_directory_symlink(moved, real);
+        } else {
+            set_world_column(reg, "sim-1", "snapshot_dir", moved.string());
+            for (const auto& snap : reg.snapshots("sim-1")) {
+                set_snapshot_column(reg, "sim-1", snap.id, "path",
+                                    (moved / fs::path(snap.path).filename()).string());
+            }
+        }
+        for (const char* bait : {"20260101T000000Z-dead.db.partial", "20260101T000000Z-beef.db",
+                                 "sentinel.txt"}) {
+            std::ofstream out(moved / bait);
+            out << "precious";
+        }
+    }
+};
+
+// 外部目录的指纹：每个条目的相对路径、类型与大小，普通文件再带上内容的 std::hash（失败时消息可读，
+// 不必打出整份 SQLite 文件）。
+std::vector<std::string> fingerprint_of(const fs::path& root) {
+    std::vector<std::string> out;
+    for (const auto& rel : tree_of(root)) {
+        const fs::path entry = root / rel;
+        const auto type = fs::symlink_status(entry).type();
+        std::string line = rel + " type=" + std::to_string(static_cast<int>(type));
+        if (type == fs::file_type::regular) {
+            line += " size=" + std::to_string(fs::file_size(entry)) +
+                    " hash=" + std::to_string(std::hash<std::string>{}(slurp(entry)));
+        }
+        out.push_back(std::move(line));
+    }
+    return out;
+}
+
+TEST(WorldGuard, DestructiveEntryPointsRefuseASnapshotDirOutsideTheWorld) {
+    const std::vector<std::pair<std::string, std::function<void(RegistryDb&, const std::string&)>>> ops{
+        {"take_snapshot",
+         [](RegistryDb& reg, const std::string&) { (void)take_snapshot(reg, "sim-1", SnapshotOptions{}); }},
+        {"apply_retention", [](RegistryDb& reg, const std::string&) { (void)apply_retention(reg, "sim-1"); }},
+        {"delete_snapshot",
+         [](RegistryDb& reg, const std::string& snap_id) { delete_snapshot(reg, "sim-1", snap_id); }},
+        {"take_auto_snapshot interval",
+         [](RegistryDb& reg, const std::string&) {
+             (void)take_auto_snapshot(reg, "sim-1", AutoTrigger{"interval", "", "2031-01-01T00:00:00Z"});
+         }},
+        {"take_auto_snapshot session",
+         [](RegistryDb& reg, const std::string&) {
+             (void)take_auto_snapshot(reg, "sim-1", AutoTrigger{"session", "s-new", "2031-01-01T00:00:00Z"});
+         }},
+        {"check_rollback",
+         [](RegistryDb& reg, const std::string& snap_id) {
+             check_rollback(reg, "sim-1", snap_id, RollbackOptions{});
+         }},
+        {"rollback_world",
+         [](RegistryDb& reg, const std::string& snap_id) {
+             (void)rollback_world(reg, "sim-1", snap_id, RollbackOptions{});
+         }},
+        {"list_rollback_archives",
+         [](RegistryDb& reg, const std::string&) { (void)list_rollback_archives(reg, "sim-1"); }},
+        {"purge_rollback_archives",
+         [](RegistryDb& reg, const std::string&) { (void)purge_rollback_archives(reg, "sim-1"); }},
+    };
+    for (const bool via_symlink : {false, true}) {
+        for (const auto& [name, op] : ops) {
+            const std::string label = name + (via_symlink ? " (snapshots/ symlinked out)"
+                                                          : " (snapshot_dir edited in registry.db)");
+            EscapedSnapshotDir tcase(via_symlink);
+            const std::string expected = code_of([&] { validate_world(tcase.reg, "sim-1"); });
+            ASSERT_EQ(expected, "registry_corrupt") << label;
+            const auto outside_before = fingerprint_of(tcase.outside.path());
+            const std::string registry_before = registry_dump(tcase.reg);
+            const std::string db_before = slurp(tcase.reg.get("sim-1").db_path);
+            // 要删的那份是最旧的：修剪的第一个 victim，也是回滚的目标。
+            const std::string target = tcase.ids.back();
+
+            const std::string what = what_of([&] { op(tcase.reg, target); });
+            EXPECT_EQ(code_of([&] { op(tcase.reg, target); }), expected) << label;
+            EXPECT_NE(what.find("snapshot_dir of 'sim-1'"), std::string::npos) << label << ": " << what;
+            EXPECT_EQ(fingerprint_of(tcase.outside.path()), outside_before) << label;
+            EXPECT_EQ(slurp(tcase.outside.path() / "snaps" / "sentinel.txt"), "precious") << label;
+            EXPECT_EQ(registry_dump(tcase.reg), registry_before) << label;
+            EXPECT_EQ(slurp(tcase.reg.get("sim-1").db_path), db_before) << label;
+            EXPECT_FALSE(fs::exists(fs::symlink_status(world_dir_of(tcase.reg, "sim-1") / "archive")))
+                << label;
+        }
+    }
+}
+
 // ---- W4：自动快照配置、快照元数据、按触发拍快照、会话清单 ---------------------------
 // 计划：docs/superpowers/plans/2026-10-28-world-w4-sessions.md Task 1。
 
@@ -2587,8 +2727,8 @@ TEST(WorldAutoConfig, SetAutoSnapshotWritesAndValidates) {
     EXPECT_EQ(auto_of(reg, "sim-1"), (AutoSnapshotConfig{.on_session = true, .interval_hours = 0}));
 }
 
-// 手改过的 settings_json 写进越界的 interval_hours（world_settings 不查范围）：自动快照拒绝，
-// 与 set_auto_snapshot 同一个码，什么都不拍。
+// 手改 registry.db 写进越界的 interval_hours（写路径都经 merge_settings，存不进这样的值，裁定 R11）：
+// 自动快照开头的 validate_world 按注册表损坏拒绝（registry_corrupt），什么都不拍。
 TEST(WorldAutoConfig, OutOfRangeStoredIntervalIsRefusedByTheTrigger) {
     const TempDir tmp;
     auto reg = registry_with_world(tmp, "sim-1");
@@ -2598,8 +2738,44 @@ TEST(WorldAutoConfig, OutOfRangeStoredIntervalIsRefusedByTheTrigger) {
     EXPECT_EQ(code_of([&] {
                   (void)take_auto_snapshot(reg, "sim-1",
                                            AutoTrigger{"interval", "", "2030-01-01T00:00:00Z"});
-              }), "invalid_auto_snapshot");
+              }), "registry_corrupt");
     EXPECT_TRUE(reg.snapshots("sim-1").empty());
+}
+
+// 裁定 R11（恢复 SaveRefusesWhatLoadWouldReject 守的不变式）：写路径都经 merge_settings，它拒绝的值存
+// 不进 registry.db；它接受的值存进去之后 validate_world 照常通过，服务启动时的 validate_registry 不会
+// 因为一次设置更新而失败。边界：0、8760 放行，-1、8761 在写之前拒绝，注册表不变。
+TEST(WorldAutoConfig, EveryValueMergeSettingsAcceptsPassesValidateWorld) {
+    const TempDir tmp;
+    auto reg = registry_with_world(tmp, "sim-1");
+    seed_world_db(reg.get("sim-1").db_path, "sim-1", 1);
+    for (const bool read_only : {false, true}) {
+        for (const std::int64_t hours : {std::int64_t{0}, std::int64_t{8760}, std::int64_t{-1},
+                                         std::int64_t{8761}}) {
+            const std::string label = std::to_string(hours) + (read_only ? " read_only" : "");
+            const std::string overrides =
+                R"({"background":{"auto_snapshot":{"on_session":false,"interval_hours":)" +
+                std::to_string(hours) + "}}}";
+            const std::string before = reg.get("sim-1").settings_json;
+            const std::string code = code_of([&] {
+                const WorldSettings merged =
+                    merge_settings(settings_from_json(before), overrides, read_only);
+                reg.update_settings("sim-1", settings_to_json(merged));
+            });
+            if (hours == 0 || hours == 8760) {
+                EXPECT_EQ(code, "<no throw>") << label;
+            } else {
+                EXPECT_EQ(code, "invalid_auto_snapshot") << label;
+                EXPECT_EQ(reg.get("sim-1").settings_json, before) << label;
+            }
+            EXPECT_EQ(code_of([&] { validate_world(reg, "sim-1"); }), "<no throw>") << label;
+            EXPECT_EQ(code_of([&] { validate_registry(reg); }), "<no throw>") << label;
+            EXPECT_EQ(code_of([&] {
+                          (void)take_auto_snapshot(reg, "sim-1",
+                                                   AutoTrigger{"interval", "", "2030-01-01T00:00:00Z"});
+                      }), "<no throw>") << label;
+        }
+    }
 }
 
 // 一个 source unit 的写入内容。observed 为空 optional 时写 NULL。
@@ -3566,8 +3742,8 @@ TEST(WorldAutoSnapshot, RetentionStillKeepsTheNewestAuto) {
 // ---- 修剪卡住时自动快照不再增长（Codex I-3） ----
 
 // 一个按时间（24h）与按会话都开的世界，保留 3 份。注册表里 3+extra 份 auto 快照（最新在前），最旧的
-// 那份路径指向 snapshot_dir 之外（被篡改的注册项）：apply_retention 删到它就 fail closed 抛
-// snapshot_failed。outside 里那个文件就是它，修剪不得删它。
+// 那份在 snapshot_dir 里是指向外部的符号链接（字面在目录里，validate_world 放行）：apply_retention
+// 删到它就 fail closed 抛 snapshot_failed。outside 里那个文件就是它，修剪不得删它。
 RegistryDb stuck_retention_world(const TempDir& tmp, const TempDir& outside, int extra) {
     auto reg = registry_with_world(tmp, "sim-1");
     set_auto_snapshot(reg, "sim-1", AutoSnapshotConfig{true, 24});
@@ -3586,8 +3762,9 @@ RegistryDb stuck_retention_world(const TempDir& tmp, const TempDir& outside, int
     stuck.kind = "auto";
     stuck.reason = "interval";
     stuck.created_at = "2029-12-01T00:00:00Z";
-    stuck.path = (outside.path() / "a1.db").string();
-    { std::ofstream out(stuck.path); out << "x"; }
+    stuck.path = (dir / "a1.db").string();
+    { std::ofstream out(outside.path() / "a1.db"); out << "x"; }
+    fs::create_symlink(outside.path() / "a1.db", stuck.path);
     list.push_back(stuck);
     set_snapshots(reg, "sim-1", list);
     return reg;
