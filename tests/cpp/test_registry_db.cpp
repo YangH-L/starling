@@ -1,6 +1,7 @@
 // RegistryDb（SQLite 注册表 registry.db）：默认世界、命名规则、标签不可变、分页、删除边界、
 // 统计与快照条目往返。
 #include "starling/governance/registry_db.hpp"
+#include "starling/governance/world_settings.hpp"
 
 #include <gtest/gtest.h>
 #include <sqlite3.h>
@@ -253,4 +254,39 @@ TEST(RegistryDb, CorruptRegistryFileIsReported) {
         out << "this is not a sqlite database, just garbage bytes padding padding padding";
     }
     EXPECT_EQ(code_of([&] { (void)open_db(tmp); }), "registry_corrupt");
+}
+
+// ---- 设置组合（裁定 R2）：合并在 C++ ----
+
+TEST(WorldSettingsCompose, NewWorldCopiesDefaultSettingsThenOverrides) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    update_world_settings(reg, "default", R"({"vector_backend":"sqlite","source_lane":{"k_source":60}})");
+    const auto text = settings_for_new_world(reg, R"({"source_lane":{"dim":512}})");
+    const auto got = settings_from_json(text);
+    EXPECT_EQ(got.source_lane.k_source, 60);   // 默认世界的值被复制
+    EXPECT_EQ(got.source_lane.dim, 512);       // overrides 覆盖
+    reg.create("w1", "", {}, text, kNow);
+    update_world_settings(reg, "default", R"({"source_lane":{"k_source":10}})");
+    EXPECT_EQ(settings_from_json(reg.get("w1").settings_json).source_lane.k_source, 60);  // 值拷贝
+    EXPECT_EQ(settings_from_json(settings_for_new_world(reg, "")).source_lane.k_source, 10);
+    EXPECT_EQ(code_of([&] { (void)settings_for_new_world(reg, R"({"nope":1})"); }),
+              "invalid_settings");
+}
+
+TEST(WorldSettingsCompose, UpdateMergesOntoCurrentAndPersists) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    reg.create("w1", "", {}, "{}", kNow);
+    update_world_settings(reg, "w1", R"({"source_lane":{"k_source":7}})");
+    const auto merged = update_world_settings(reg, "w1", R"({"source_lane":{"dim":256}})");
+    const auto got = settings_from_json(reg.get("w1").settings_json);
+    EXPECT_EQ(got.source_lane.k_source, 7);    // 前一次的值保留
+    EXPECT_EQ(got.source_lane.dim, 256);
+    EXPECT_EQ(merged, reg.get("w1").settings_json);
+    const auto before = reg.get("w1").settings_json;
+    EXPECT_EQ(code_of([&] { (void)update_world_settings(reg, "w1", R"({"nope":1})"); }),
+              "invalid_settings");
+    EXPECT_EQ(reg.get("w1").settings_json, before);   // 非法 overrides 什么都不写
+    EXPECT_EQ(code_of([&] { (void)update_world_settings(reg, "zz", "{}"); }), "world_not_found");
 }

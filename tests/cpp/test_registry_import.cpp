@@ -565,4 +565,37 @@ TEST_F(RegistryValidation, RejectsKindReasonMismatch) {
     cleanup();
 }
 
+// ---- open_or_import（裁定 R14）：首次打开的编排在 C++ ----
+
+TEST(RegistryOpenOrImport, FreshDirGivesDefaultWorldOnly) {
+    const TempDir tmp;
+    const auto reg = RegistryDb::open_or_import(tmp.path(), tmp.path() / "dashboard.db", "default");
+    EXPECT_EQ(reg.default_world(), "default");
+    EXPECT_EQ(reg.list(WorldQuery{}).total, 1);
+    EXPECT_TRUE(imported_copies(tmp.path()).empty());
+}
+
+TEST(RegistryOpenOrImport, ImportsWorldsJsonWhenRegistryDbMissing) {
+    const TempDir tmp;
+    write_text(tmp.path() / "worlds.json",
+               sample_registry(tmp.path(), older_snapshot_path(tmp.path())));
+    fs::create_directories(tmp.path() / "worlds" / "sim-1" / "snapshots");
+    const auto reg = RegistryDb::open_or_import(tmp.path(), tmp.path() / "ignored.db", "ignored");
+    EXPECT_EQ(reg.list(WorldQuery{}).total, 2);
+    EXPECT_EQ(reg.get("sim-1").label, "模拟一");
+    EXPECT_EQ(reg.snapshots("sim-1").size(), 2U);
+    EXPECT_FALSE(fs::exists(tmp.path() / "worlds.json"));
+    EXPECT_EQ(imported_copies(tmp.path()).size(), 1U);
+}
+
+TEST(RegistryOpenOrImport, DoesNotImportWhenRegistryDbExists) {
+    const TempDir tmp;
+    { const auto reg = RegistryDb::open(tmp.path(), tmp.path() / "dashboard.db", "default"); }
+    write_text(tmp.path() / "worlds.json", "{not json");
+    const auto reg = RegistryDb::open_or_import(tmp.path(), tmp.path() / "dashboard.db", "default");
+    EXPECT_EQ(reg.list(WorldQuery{}).total, 1);
+    EXPECT_EQ(slurp(tmp.path() / "worlds.json"), "{not json");
+    EXPECT_TRUE(imported_copies(tmp.path()).empty());
+}
+
 }  // namespace starling::governance

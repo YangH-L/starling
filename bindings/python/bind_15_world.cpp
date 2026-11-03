@@ -1,21 +1,26 @@
-// bind_15_world — 世界注册表、快照与自动快照（W1–W4）。注册表在 Python 侧以 dict 表示，
-// 格式与 worlds.json 逐字一致；转换经 Python json 模块，C++ 是唯一的序列化实现。
-// 设计：docs/superpowers/specs/2026-10-25-world-scene-management-design.md
+// bind_15_world — 世界注册表（registry.db）、快照、回滚与自动快照。
+// 设计：docs/superpowers/specs/2026-11-03-memory-service-design.md
 //
 // 约定：
-//  - 所有函数都是纯函数式的：入参 dict 不被修改，更新后的注册表作为新 dict 返回。
-//    delete / create / set_active / take_snapshot 只改内存里的注册表（外加世界目录
-//    或快照文件），不落盘 worlds.json；调用方（WorldManager）必须随后
-//    world_save_registry。
-//  - WorldStoreError 带稳定的 code（见 world_store.hpp）。save_registry /
-//    ensure_registry 遇到的 I/O 失败（filesystem_error、runtime_error）没有专门的
-//    code，原样传播，这里不伪装成 WorldStoreError。调用方（routes/worlds.py 的
-//    _run）把它们统一兜成 JSON 500 internal_error，异常文本只进服务端日志。
+//  - WorldRegistry 包 C++ 的 RegistryDb（SQLite，内部互斥，可跨 Python 线程共享）。所有改动都在
+//    C++ 里直接落库，Python 侧没有注册表 dict，也没有「改完再保存」这一步。
+//  - 设置合并、首次打开的导入编排都在 C++（settings_for_new_world / update_world_settings /
+//    RegistryDb::open_or_import），这里只转发。
+//  - 凡碰文件系统或 SQLite 的调用都释放 GIL；py::dict 与 JSON 的互转只在持 GIL 时做。
+//  - WorldStoreError 带稳定的 code（见 world_store.hpp）。I/O 失败（filesystem_error、runtime_error）
+//    没有专门的 code，原样传播。
 
 #include "bind_common.hpp"
 
 #include <pybind11/stl.h>
 
+#include <map>
+#include <memory>
+#include <optional>
+#include <vector>
+
+#include "starling/governance/registry_db.hpp"
+#include "starling/governance/world_settings.hpp"
 #include "starling/governance/world_store.hpp"
 
 namespace starling::bindings {
@@ -23,6 +28,7 @@ namespace starling::bindings {
 namespace {
 
 namespace gov = starling::governance;
+using namespace pybind11::literals;
 
 py::object to_py(const std::string& text) {
     return py::module_::import("json").attr("loads")(text);
@@ -33,25 +39,44 @@ std::string from_py(const py::object& obj) {
         .cast<std::string>();
 }
 
-// 需要持有 GIL（经由 Python json 模块）。解析失败抛 registry_corrupt，
-// retention < 2 抛 invalid_retention，规则与 load_registry 相同。
-gov::Registry reg_in(const py::dict& reg) { return gov::registry_from_json(from_py(reg)); }
-py::object reg_out(const gov::Registry& reg) { return to_py(gov::registry_to_json(reg)); }
-
 py::object text_or_none(const std::string& text) {
     return text.empty() ? py::object(py::none()) : py::object(py::str(text));
 }
 
-// 单份快照的 dict（world_take_snapshot / world_take_auto_snapshot 返回的那份）。W4 的三个字段
-// 总是在，缺省为 None，调用方不必区分新旧条目：sessions_complete（int | None）、session_id
-// （str | None）、content_mark（str | None，只给内部与测试用，HTTP 白名单不外露）。
-// 注册表 dict 里的条目不补这些键：注册表逐字往返（见文件头）。
-py::object snap_out(const gov::SnapshotEntry& snap) {
-    auto out = to_py(gov::snapshot_entry_to_json(snap)).cast<py::dict>();
-    for (const char* key : {"sessions_complete", "session_id", "content_mark"}) {
-        out.attr("setdefault")(key, py::none());
-    }
+// 单份快照的 dict（注册表 snapshots / world_take_snapshot / world_take_auto_snapshot 返回的那份）。
+// W4 的三个字段总是在，缺省为 None：sessions_complete（int | None）、session_id（str | None）、
+// content_mark（str | None，只给内部与测试用，HTTP 白名单不外露）。
+py::dict snap_out(const gov::SnapshotEntry& snap) {
+    py::dict out("id"_a = snap.id, "path"_a = snap.path, "kind"_a = snap.kind,
+                 "reason"_a = snap.reason, "note"_a = snap.note, "created_at"_a = snap.created_at,
+                 "world_time"_a = snap.world_time, "size_bytes"_a = snap.size_bytes);
+    out["sessions_complete"] = snap.sessions_complete.has_value()
+                                   ? py::object(py::int_(*snap.sessions_complete))
+                                   : py::object(py::none());
+    out["session_id"] = text_or_none(snap.session_id);
+    out["content_mark"] = text_or_none(snap.content_mark);
     return out;
+}
+
+// WorldRecord 的全部字段；settings 是解析后的 dict（原文 settings_json 不外露），labels 是 dict。
+py::dict record_out(const gov::WorldRecord& rec) {
+    py::dict labels;
+    for (const auto& [key, value] : rec.labels) { labels[py::str(key)] = value; }
+    return py::dict("name"_a = rec.name, "dir_id"_a = rec.dir_id, "tenant"_a = rec.tenant,
+                    "db_path"_a = rec.db_path, "snapshot_dir"_a = rec.snapshot_dir,
+                    "label"_a = rec.label, "created_at"_a = rec.created_at, "seed"_a = rec.seed,
+                    "read_only"_a = rec.read_only, "reclaimable"_a = rec.reclaimable,
+                    "retention_group"_a = rec.retention_group,
+                    "fork_of_world"_a = rec.fork_of_world,
+                    "fork_of_snapshot"_a = rec.fork_of_snapshot,
+                    "settings"_a = to_py(rec.settings_json), "labels"_a = labels,
+                    "holders"_a = rec.holders, "statements"_a = rec.statements,
+                    "last_write_at"_a = rec.last_write_at, "stats_at"_a = rec.stats_at);
+}
+
+// overrides：None → "{}"，否则 json.dumps（持 GIL）。
+std::string overrides_in(const py::object& overrides) {
+    return overrides.is_none() ? std::string("{}") : from_py(overrides);
 }
 
 [[noreturn]] void invalid_auto(const std::string& detail) {
@@ -79,18 +104,6 @@ gov::AutoSnapshotConfig auto_config_in(const py::handle& on_session, const py::h
                                    .interval_hours = int64_in(hours, "interval_hours"),};
 }
 
-// {"on_session": bool, "interval_hours": int}，两个键都要有，多余的键忽略（与注册表的解析一致）。
-gov::AutoSnapshotConfig auto_config_from_dict(const py::handle& obj) {
-    if (!py::isinstance<py::dict>(obj)) {
-        invalid_auto("auto_snapshot must be a dict {on_session, interval_hours}");
-    }
-    const auto config = py::reinterpret_borrow<py::dict>(obj);
-    if (!config.contains("on_session") || !config.contains("interval_hours")) {
-        invalid_auto("auto_snapshot needs both on_session and interval_hours");
-    }
-    return auto_config_in(config.attr("get")("on_session"), config.attr("get")("interval_hours"));
-}
-
 }  // namespace
 
 // NOLINTNEXTLINE(readability-identifier-length) — `m` matches all sibling bind_NN units
@@ -109,57 +122,117 @@ void bind_15_world(pybind11::module_& m) {
 
     m.def("world_is_valid_name", &gov::is_valid_world_name, py::arg("name"));
 
-    m.def("world_ensure_registry",
-          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const std::string& reg_path, const std::string& db_path, const std::string& tenant) {
-              return reg_out(gov::ensure_registry(reg_path, db_path, tenant));
-          }, py::arg("registry_path"), py::arg("default_db_path"), py::arg("default_tenant"));
+    // ---- 注册表 ----
+    py::class_<gov::RegistryDb>(m, "WorldRegistry")
+        // 首次打开的编排（worlds.json 一次性导入 → open → validate_registry）在 C++ open_or_import。
+        .def_static("open",
+                    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+                    [](const std::string& data_dir, const std::string& default_db_path,
+                       const std::string& default_tenant) {
+                        const py::gil_scoped_release release;
+                        return std::make_unique<gov::RegistryDb>(gov::RegistryDb::open_or_import(
+                            data_dir, default_db_path, default_tenant));
+                    }, py::arg("data_dir"), py::arg("default_db_path"), py::arg("default_tenant"))
+        .def("default_world", [](const gov::RegistryDb& reg) {
+            const py::gil_scoped_release release;
+            return reg.default_world();
+        })
+        .def("get", [](const gov::RegistryDb& reg, const std::string& name) {
+            gov::WorldRecord rec;
+            {
+                const py::gil_scoped_release release;
+                rec = reg.get(name);
+            }
+            return record_out(rec);
+        }, py::arg("name"))
+        .def("list",
+             [](const gov::RegistryDb& reg,
+                const std::optional<std::map<std::string, std::string>>& labels,
+                std::int64_t offset, std::int64_t limit) {
+                 gov::WorldQuery query;
+                 if (labels) { query.labels = *labels; }
+                 query.offset = offset;
+                 query.limit = limit;
+                 gov::WorldPage page;
+                 {
+                     const py::gil_scoped_release release;
+                     page = reg.list(query);
+                 }
+                 py::list worlds;
+                 for (const auto& rec : page.worlds) { worlds.append(record_out(rec)); }
+                 return py::dict("worlds"_a = worlds, "total"_a = page.total);
+             }, py::arg("labels") = py::none(), py::arg("offset") = 0, py::arg("limit") = 50)
+        // 新世界设置 = 默认世界当前设置 + overrides 的值拷贝（C++ settings_for_new_world）。
+        .def("create",
+             // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+             [](gov::RegistryDb& reg, const std::string& name, const std::string& label,
+                const std::map<std::string, std::string>& labels, const py::object& overrides,
+                const std::string& now_iso) {
+                 const auto overrides_text = overrides_in(overrides);
+                 gov::WorldRecord rec;
+                 {
+                     const py::gil_scoped_release release;
+                     rec = reg.create(name, label, labels,
+                                      gov::settings_for_new_world(reg, overrides_text), now_iso);
+                 }
+                 return record_out(rec);
+             }, py::arg("name"), py::arg("label"), py::arg("labels"), py::arg("overrides"),
+             py::arg("now_iso"))
+        // 递归删世界目录可能很大，释放 GIL。
+        .def("remove", [](gov::RegistryDb& reg, const std::string& name) {
+            const py::gil_scoped_release release;
+            reg.remove(name);
+        }, py::arg("name"))
+        .def("update_settings",
+             [](gov::RegistryDb& reg, const std::string& name, const py::object& overrides) {
+                 const auto overrides_text = overrides_in(overrides);
+                 std::string merged;
+                 {
+                     const py::gil_scoped_release release;
+                     merged = gov::update_world_settings(reg, name, overrides_text);
+                 }
+                 return to_py(merged);
+             }, py::arg("name"), py::arg("overrides"))
+        .def("update_stats",
+             // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+             [](gov::RegistryDb& reg, const std::string& name, std::int64_t holders,
+                std::int64_t statements, const std::string& last_write_at,
+                const std::string& now_iso) {
+                 const py::gil_scoped_release release;
+                 reg.update_stats(name, holders, statements, last_write_at, now_iso);
+             }, py::arg("name"), py::arg("holders"), py::arg("statements"),
+             py::arg("last_write_at"), py::arg("now_iso"))
+        .def("snapshots", [](const gov::RegistryDb& reg, const std::string& world) {
+            std::vector<gov::SnapshotEntry> entries;
+            {
+                const py::gil_scoped_release release;
+                entries = reg.snapshots(world);
+            }
+            py::list out;
+            for (const auto& entry : entries) { out.append(snap_out(entry)); }
+            return out;
+        }, py::arg("world"))
+        .def_property_readonly("data_dir", [](const gov::RegistryDb& reg) {
+            return reg.data_dir().string();
+        });
 
-    m.def("world_load_registry",
-          [](const std::string& reg_path) { return reg_out(gov::load_registry(reg_path)); },
-          py::arg("registry_path"));
+    // 一次性导入旧 worlds.json（无 worlds.json 或 registry.db 已在时什么都不做）。
+    m.def("world_import_json", [](const std::string& data_dir) {
+        const py::gil_scoped_release release;
+        gov::import_worlds_json(data_dir);
+    }, py::arg("data_dir"));
 
-    m.def("world_save_registry",
-          [](const std::string& reg_path, const py::dict& reg) {
-              gov::save_registry(reg_path, reg_in(reg));
-          }, py::arg("registry_path"), py::arg("registry"));
+    // world_endpoint 是 settings 里 extraction / embedding / chat 之一的 dict；解析走 C++
+    // settings_from_json（字段规则同一份）。provider_name 为空永不抛，否则 base_url 不同抛 endpoint_changed。
+    m.def("world_require_endpoint_unchanged",
+          [](const py::dict& world_endpoint, const std::string& current_base_url) {
+              const auto parsed = gov::settings_from_json(
+                  from_py(py::dict("extraction"_a = world_endpoint)));
+              gov::require_endpoint_unchanged(*parsed.extraction, current_base_url);
+          }, py::arg("world_endpoint"), py::arg("current_base_url"));
 
-    // auto_snapshot：None 时用新世界的默认值（按会话开、按时间关，C++ create_world 的默认参数）；
-    // 否则是 {"on_session": bool, "interval_hours": int}，形状或类型不对、越界都抛
-    // invalid_auto_snapshot，此时什么都没建。
-    m.def("world_create",
-          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const py::dict& reg, const std::string& reg_dir, const std::string& name,
-             const std::string& label, const std::string& now_iso, const py::object& auto_snapshot) {
-              auto registry = reg_in(reg);
-              const auto world =
-                  auto_snapshot.is_none()
-                      ? gov::create_world(registry, reg_dir, name, label, now_iso)
-                      : gov::create_world(registry, reg_dir, name, label, now_iso,
-                                          auto_config_from_dict(auto_snapshot));
-              return py::dict("registry"_a = reg_out(registry),
-                              "world"_a = to_py(gov::world_entry_to_json(world)));
-          }, py::arg("registry"), py::arg("registry_dir"), py::arg("name"),
-          py::arg("label"), py::arg("now_iso"), py::arg("auto_snapshot") = py::none());
-
-    // 只摘内存注册项并删世界目录，不落盘 worlds.json：调用方必须随后保存返回值。
-    m.def("world_delete",
-          [](const py::dict& reg, const std::string& reg_dir, const std::string& name) {
-              auto registry = reg_in(reg);
-              {
-                  // 递归删目录可能很大，不占着 GIL。
-                  const py::gil_scoped_release release;
-                  gov::delete_world(registry, reg_dir, name);
-              }
-              return reg_out(registry);
-          }, py::arg("registry"), py::arg("registry_dir"), py::arg("name"));
-
-    m.def("world_set_active",
-          [](const py::dict& reg, const std::string& name) {
-              auto registry = reg_in(reg);
-              gov::set_active(registry, name);
-              return reg_out(registry);
-          }, py::arg("registry"), py::arg("name"));
+    m.def("world_ingest_partition", &gov::ingest_partition, py::arg("is_default"),
+          py::arg("tenant"), py::arg("dir_id"));
 
     // 只读打开，busy_timeout 最长 5 秒，所以释放 GIL。键名见 WorldStats。
     // 库文件存在但读不出时抛 snapshot_failed；只有文件不存在才是全 0。
@@ -185,18 +258,16 @@ void bind_15_world(pybind11::module_& m) {
           }, py::arg("db_path"), py::arg("tenant"));
 
     // 快照会 VACUUM 整库，可能要几秒，期间释放 GIL。
-    // take_snapshot 先清扫上次崩溃的残留、写快照文件、插入条目，最后才执行保留策略。
-    // 保留策略失败（清理旧快照时路径无法解析、删不掉或越界）由 C++ 吞掉：成功的快照
-    // 一定返回条目，注册表与磁盘仍一致，只是暂时多出几份旧快照，下次快照或保留策略
-    // 会重试。因此抛出异常只表示快照本身没拍成（磁盘不足、库损坏、kind 非法、
-    // vector_backend 不是 sqlite 等），此时磁盘上没有新文件，传入的 dict 也未被改动。
+    // take_snapshot 先清扫上次崩溃的残留、写快照文件、登记条目（失败时 C++ 自己删掉新文件），最后才
+    // 执行保留策略；保留策略失败由 C++ 吞掉：成功的快照一定返回条目。抛异常只表示快照本身没拍成
+    // （磁盘不足、库损坏、kind 非法、vector_backend 不是 sqlite 等），此时磁盘上没有新文件。
     // vector_backend 由调用方按当前配置传入；拒绝与否由 C++ 判（snapshot_unsupported_backend）。
+    // 条目已写进 registry.db，Python 侧没有保存或补偿步骤。
     m.def("world_take_snapshot",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const py::dict& reg, const std::string& world, const std::string& kind,
+          [](gov::RegistryDb& reg, const std::string& world, const std::string& kind,
              const std::string& reason, const std::string& note,
              const std::string& vector_backend) {
-              auto registry = reg_in(reg);
               gov::SnapshotOptions opts;
               opts.kind = kind;
               opts.reason = reason;
@@ -205,64 +276,46 @@ void bind_15_world(pybind11::module_& m) {
               gov::SnapshotEntry snap;
               {
                   const py::gil_scoped_release release;
-                  snap = gov::take_snapshot(registry, world, opts);
+                  snap = gov::take_snapshot(reg, world, opts);
               }
-              return py::dict("registry"_a = reg_out(registry), "snapshot"_a = snap_out(snap));
+              return py::dict("snapshot"_a = snap_out(snap));
           }, py::arg("registry"), py::arg("world"), py::arg("kind") = "manual",
           py::arg("reason") = "manual", py::arg("note") = "",
           py::kw_only(), py::arg("vector_backend") = "sqlite");
 
-    // 只删一份快照的文件，注册表不动（不返回新注册表）。给 take_snapshot 成功、
-    // world_save_registry 却失败时做补偿：新文件没登记，不删就是列不出来的孤儿。
-    m.def("world_discard_snapshot_file",
-          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const py::dict& reg, const std::string& world, const std::string& snapshot_id) {
-              const auto registry = reg_in(reg);
-              gov::discard_snapshot_file(registry, world, snapshot_id);
-          }, py::arg("registry"), py::arg("world"), py::arg("snapshot_id"));
-
+    // 删一份快照（注册项 + 文件）。快照不存在抛 snapshot_not_found。
     m.def("world_delete_snapshot",
-          [](const py::dict& reg, const std::string& world, const std::string& snapshot_id) {
-              auto registry = reg_in(reg);
-              gov::delete_snapshot(registry, world, snapshot_id);
-              return reg_out(registry);
+          [](gov::RegistryDb& reg, const std::string& world, const std::string& snapshot_id) {
+              const py::gil_scoped_release release;
+              gov::delete_snapshot(reg, world, snapshot_id);
           }, py::arg("registry"), py::arg("world"), py::arg("snapshot_id"));
 
     // ---- 自动快照与会话清单（W4） ----
-    // 三个函数都释放 GIL（参数先在持 GIL 时转换好）。只改内存里的注册表，调用方保存。
+    // 参数先在持 GIL 时转换好，C++ 调用释放 GIL。
 
-    // 改一个世界的自动快照配置，返回新注册表。world_not_found；类型不对或 interval_hours 不在
-    // 0–8760 抛 invalid_auto_snapshot。两种情况入参 dict 都不变。
+    // 改一个世界的自动快照配置（写 registry.db）。world_not_found；类型不对或 interval_hours 不在
+    // 0–8760 抛 invalid_auto_snapshot。
     m.def("world_set_auto_snapshot",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const py::dict& reg, const std::string& world, const py::object& on_session,
+          [](gov::RegistryDb& reg, const std::string& world, const py::object& on_session,
              const py::object& interval_hours) {
-              auto registry = reg_in(reg);
               const auto config = auto_config_in(on_session, interval_hours);
-              {
-                  const py::gil_scoped_release release;
-                  gov::set_auto_snapshot(registry, world, config);
-              }
-              return reg_out(registry);
+              const py::gil_scoped_release release;
+              gov::set_auto_snapshot(reg, world, config);
           }, py::arg("registry"), py::arg("world"), py::arg("on_session"),
           py::arg("interval_hours"));
 
     // 按触发判断要不要拍一份自动快照（规则全在 C++ take_auto_snapshot）。trigger 是 "session" |
-    // "interval"；now_iso 是调用方的时钟，必须是 YYYY-MM-DDTHH:MM:SSZ（快照 id 前缀与 created_at
-    // 都取它；带小数秒等形状不对抛 invalid_auto_snapshot）；session_id 只给 "session" 触发。
-    // 返回 {"registry", "snapshot", "skipped", "refused"}：拍了时 snapshot 是条目（同 world_take_snapshot
-    // 的形状）、skipped 与 refused 为 None；没拍时 snapshot 为 None、skipped 是原因（disabled |
-    // known_session | unchanged | not_due | empty | unsupported_backend），registry 与入参内容相同。
-    // 修剪卡住而拒绝拍时 refused 是原因（"retention cannot prune ..."），snapshot 与 skipped 为 None，
-    // registry 是部分修剪后的注册表（已删文件的条目已摘掉）：调用方必须保存它，并计为失败
-    // （码 snapshot_failed）。拍了时快照文件已落盘，调用方存注册表失败要 world_discard_snapshot_file
-    // 补偿（同 world_take_snapshot）。
+    // "interval"；now_iso 必须是 YYYY-MM-DDTHH:MM:SSZ；session_id 只给 "session" 触发。
+    // 返回 {"snapshot", "skipped", "refused"}：拍了时 snapshot 是条目、skipped 与 refused 为 None；
+    // 没拍时 snapshot 为 None、skipped 是原因（disabled | known_session | unchanged | not_due | empty |
+    // unsupported_backend）。修剪卡住而拒绝拍时 refused 是原因，调用方计为失败（码 snapshot_failed）。
+    // 注册表的改动（登记、部分修剪）C++ 已落库。
     m.def("world_take_auto_snapshot",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const py::dict& reg, const std::string& world, const std::string& trigger,
+          [](gov::RegistryDb& reg, const std::string& world, const std::string& trigger,
              const std::string& now_iso, const std::string& session_id,
              const std::string& vector_backend) {
-              auto registry = reg_in(reg);
               const gov::AutoTrigger auto_trigger{
                   .kind = trigger, .session_id = session_id, .now_iso = now_iso,};
               gov::SnapshotOptions base;
@@ -270,12 +323,11 @@ void bind_15_world(pybind11::module_& m) {
               gov::AutoSnapshotResult result;
               {
                   const py::gil_scoped_release release;
-                  result = gov::take_auto_snapshot(registry, world, auto_trigger, base);
+                  result = gov::take_auto_snapshot(reg, world, auto_trigger, base);
               }
               py::object snapshot = py::none();
               if (result.taken.has_value()) { snapshot = snap_out(*result.taken); }
-              return py::dict("registry"_a = reg_out(registry), "snapshot"_a = snapshot,
-                              "skipped"_a = text_or_none(result.skipped),
+              return py::dict("snapshot"_a = snapshot, "skipped"_a = text_or_none(result.skipped),
                               "refused"_a = text_or_none(result.refused));
           }, py::arg("registry"), py::arg("world"), py::arg("trigger"), py::arg("now_iso"),
           py::arg("session_id") = "", py::kw_only(), py::arg("vector_backend") = "sqlite");
@@ -285,13 +337,12 @@ void bind_15_world(pybind11::module_& m) {
     // 没有时间时为 None，anchor 为 {"snapshot_id", "created_at"} 或 None。limit 不是整数或不在
     // 1–1000 抛 invalid_auto_snapshot，世界不存在抛 world_not_found，库读不出抛 snapshot_failed。
     m.def("world_list_sessions",
-          [](const py::dict& reg, const std::string& world, const py::object& limit) {
-              const auto registry = reg_in(reg);
+          [](const gov::RegistryDb& reg, const std::string& world, const py::object& limit) {
               const auto max_rows = int64_in(limit, "limit");
               gov::SessionList listed;
               {
                   const py::gil_scoped_release release;
-                  listed = gov::list_sessions(registry, world, max_rows);
+                  listed = gov::list_sessions(reg, world, max_rows);
               }
               py::list sessions;
               for (const auto& row : listed.rows) {
@@ -311,68 +362,55 @@ void bind_15_world(pybind11::module_& m) {
           }, py::arg("registry"), py::arg("world"), py::arg("limit") = 200);
 
     // ---- 回滚与归档（W3） ----
-    // 回滚不改注册表，所以不返回新注册表。registry_dir 是注册表文件所在目录（与 world_create /
-    // world_delete 同一参数），世界 home 与归档目录只从它推出。C++ 的连接探测（world_in_use）只是
-    // 纵深防御，看得见哪些连接取决于日志模式（见 world_store.hpp rollback_world）；进程内的安全
-    // 由调用方保证（WorldManager 的租约、旧 Runtime 弱引用、遗留 Runtime 登记）。
-    // 同一世界的回滚已串行化（WorldManager 全程持管理锁）。复制快照 + integrity_check 可能要
-    // 几秒，释放 GIL。C++ 的测试钩子（free_space、before_replace）不暴露。
-    // 回滚预检：world_rollback 第 1–4 步的只读检查（同顺序、同错误码），什么都不动。活动世界
-    // 回滚在停引擎之前先调它，拒掉不存在的快照、缺失的快照文件、不支持的后端、磁盘不足。
-    // 通过不代表 world_rollback 一定成功（它自己再查一遍）。磁盘守卫会 statvfs，释放 GIL。
+    // 回滚不改注册表。世界 home 与归档目录由 C++ 从 RegistryDb 推出（不再传 registry_dir）。
+    // C++ 的连接探测（world_in_use）只是纵深防御；进程内的安全由调用方保证。复制快照 +
+    // integrity_check 可能要几秒，释放 GIL。C++ 的测试钩子（free_space、before_replace）不暴露。
+    // 回滚预检：world_rollback 第 1–4 步的只读检查（同顺序、同错误码），什么都不动。
     m.def("world_check_rollback",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const py::dict& reg, const std::string& reg_dir, const std::string& world,
-             const std::string& snapshot_id, const std::string& vector_backend) {
-              const auto registry = reg_in(reg);
+          [](const gov::RegistryDb& reg, const std::string& world, const std::string& snapshot_id,
+             const std::string& vector_backend) {
               gov::RollbackOptions opts;
               opts.vector_backend = vector_backend;
               const py::gil_scoped_release release;
-              gov::check_rollback(registry, reg_dir, world, snapshot_id, opts);
-          }, py::arg("registry"), py::arg("registry_dir"), py::arg("world"),
-          py::arg("snapshot_id"), py::kw_only(), py::arg("vector_backend") = "sqlite");
+              gov::check_rollback(reg, world, snapshot_id, opts);
+          }, py::arg("registry"), py::arg("world"), py::arg("snapshot_id"), py::kw_only(),
+          py::arg("vector_backend") = "sqlite");
 
     m.def("world_rollback",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const py::dict& reg, const std::string& reg_dir, const std::string& world,
-             const std::string& snapshot_id, const std::string& vector_backend) {
-              const auto registry = reg_in(reg);
+          [](const gov::RegistryDb& reg, const std::string& world, const std::string& snapshot_id,
+             const std::string& vector_backend) {
               gov::RollbackOptions opts;
               opts.vector_backend = vector_backend;
               gov::RollbackResult result;
               {
                   const py::gil_scoped_release release;
-                  result = gov::rollback_world(registry, reg_dir, world, snapshot_id, opts);
+                  result = gov::rollback_world(reg, world, snapshot_id, opts);
               }
               return py::dict("archive_path"_a = result.archive_path,
                               "restored_bytes"_a = result.restored_bytes);
-          }, py::arg("registry"), py::arg("registry_dir"), py::arg("world"),
-          py::arg("snapshot_id"), py::kw_only(), py::arg("vector_backend") = "sqlite");
+          }, py::arg("registry"), py::arg("world"), py::arg("snapshot_id"), py::kw_only(),
+          py::arg("vector_backend") = "sqlite");
 
-    m.def("world_list_archives",
-          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const py::dict& reg, const std::string& reg_dir, const std::string& world) {
-              const auto registry = reg_in(reg);
-              std::vector<gov::ArchiveEntry> listed;
-              {
-                  const py::gil_scoped_release release;
-                  listed = gov::list_rollback_archives(registry, reg_dir, world);
-              }
-              py::list out;
-              for (const auto& item : listed) {
-                  out.append(py::dict("name"_a = item.name, "size_bytes"_a = item.size_bytes));
-              }
-              return out;
-          }, py::arg("registry"), py::arg("registry_dir"), py::arg("world"));
+    m.def("world_list_archives", [](const gov::RegistryDb& reg, const std::string& world) {
+        std::vector<gov::ArchiveEntry> listed;
+        {
+            const py::gil_scoped_release release;
+            listed = gov::list_rollback_archives(reg, world);
+        }
+        py::list out;
+        for (const auto& item : listed) {
+            out.append(py::dict("name"_a = item.name, "size_bytes"_a = item.size_bytes));
+        }
+        return out;
+    }, py::arg("registry"), py::arg("world"));
 
     // 归档是整份旧库，删除可能较慢，释放 GIL。返回删掉的文件数。
-    m.def("world_purge_archives",
-          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const py::dict& reg, const std::string& reg_dir, const std::string& world) {
-              const auto registry = reg_in(reg);
-              const py::gil_scoped_release release;
-              return gov::purge_rollback_archives(registry, reg_dir, world);
-          }, py::arg("registry"), py::arg("registry_dir"), py::arg("world"));
+    m.def("world_purge_archives", [](const gov::RegistryDb& reg, const std::string& world) {
+        const py::gil_scoped_release release;
+        return gov::purge_rollback_archives(reg, world);
+    }, py::arg("registry"), py::arg("world"));
 }
 
 }  // namespace starling::bindings

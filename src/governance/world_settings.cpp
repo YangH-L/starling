@@ -1,5 +1,7 @@
 #include "starling/governance/world_settings.hpp"
 
+#include "starling/governance/registry_db.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -313,6 +315,22 @@ WorldSettings merge_settings(const WorldSettings& base, const std::string& overr
         };
     }
     return out;
+}
+
+std::string settings_for_new_world(const RegistryDb& reg, const std::string& overrides_json) {
+    const auto base = settings_from_json(reg.get(reg.default_world()).settings_json);
+    return settings_to_json(
+        merge_settings(base, overrides_json.empty() ? "{}" : overrides_json, false));
+}
+
+std::string update_world_settings(RegistryDb& reg, const std::string& name,
+                                  const std::string& overrides_json) {
+    const auto rec = reg.get(name);
+    const auto merged = settings_to_json(merge_settings(
+        settings_from_json(rec.settings_json), overrides_json.empty() ? "{}" : overrides_json,
+        rec.read_only));
+    reg.update_settings(name, merged);
+    return merged;
 }
 
 void require_endpoint_unchanged(const EndpointSettings& world_endpoint,

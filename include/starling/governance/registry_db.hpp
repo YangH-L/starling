@@ -55,6 +55,13 @@ public:
                            const std::filesystem::path& default_db_path,
                            const std::string& default_tenant);
 
+    // 服务启动的首次打开（裁定 R14）：<data_dir>/worlds.json 存在而 registry.db 不存在时先
+    // import_worlds_json(data_dir)（两者都看 lstat），再 open，最后 validate_registry。
+    // registry.db 已在时不导入。导入、open、校验的错误原样抛出。
+    static RegistryDb open_or_import(const std::filesystem::path& data_dir,
+                                     const std::filesystem::path& default_db_path,
+                                     const std::string& default_tenant);
+
     RegistryDb(RegistryDb&&) noexcept;
     RegistryDb& operator=(RegistryDb&&) noexcept;
     RegistryDb(const RegistryDb&) = delete;

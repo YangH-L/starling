@@ -253,6 +253,22 @@ RegistryDb RegistryDb::open(const fs::path& data_dir, const fs::path& default_db
     return RegistryDb(std::move(impl));
 }
 
+RegistryDb RegistryDb::open_or_import(const fs::path& data_dir, const fs::path& default_db_path,
+                                      const std::string& default_tenant) {
+    const fs::path dir = fs::absolute(data_dir);
+    // lstat 语义：悬空符号链接也算存在，与 import_worlds_json 一致。
+    const auto exists = [](const fs::path& file) {
+        std::error_code err;
+        return fs::symlink_status(file, err).type() != fs::file_type::not_found;
+    };
+    if (exists(dir / "worlds.json") && !exists(dir / "registry.db")) {
+        import_worlds_json(dir);
+    }
+    auto reg = open(dir, default_db_path, default_tenant);
+    validate_registry(reg);
+    return reg;
+}
+
 std::string RegistryDb::default_world() const {
     const std::scoped_lock lock(impl_->mutex);
     pst::Stmt stmt(impl_->db(), "SELECT value FROM meta WHERE key = 'default_world'");

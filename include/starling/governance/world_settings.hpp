@@ -73,6 +73,16 @@ std::string settings_to_json(const WorldSettings& settings);
 WorldSettings merge_settings(const WorldSettings& base, const std::string& overrides_json,
                              bool read_only);
 
+// 新世界的设置（裁定 R2）：默认世界当前设置 + overrides（空串当 "{}"）按 merge_settings 合并（只读 false），
+// 序列化后返回，供 RegistryDb::create 的 settings_json。是值拷贝：此后改默认世界不影响已建的世界。
+// 默认世界的 settings_json 解析不了、overrides 非法都按 settings_from_json 的码抛，什么都不写。
+std::string settings_for_new_world(const RegistryDb& reg, const std::string& overrides_json);
+
+// 把 overrides 合并到世界 name 当前的设置上（该世界只读时后台强制关），写回 registry.db，返回合并后的
+// settings_json。世界不存在抛 world_not_found；overrides 非法时什么都不写。
+std::string update_world_settings(RegistryDb& reg, const std::string& name,
+                                  const std::string& overrides_json);
+
 // world 里的 provider_name 非空，且 current_provider_base_url != world 记的 base_url
 // → 抛 endpoint_changed。provider_name 为空（客户端显式给的）永不抛。
 void require_endpoint_unchanged(const EndpointSettings& world_endpoint,
