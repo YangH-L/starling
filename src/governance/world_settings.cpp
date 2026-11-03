@@ -19,11 +19,10 @@ std::string join(const std::string& prefix, const std::string& key) {
     return prefix.empty() ? key : prefix + "." + key;
 }
 
-const Json& require_object(const Json& val, const std::string& path) {
+void require_object(const Json& val, const std::string& path) {
     if (!val.is_object()) {
         fail(path.empty() ? "<root>" : path, "必须是 JSON 对象");
     }
-    return val;
 }
 
 void read_str(const Json& val, const std::string& path, std::string& out) {
@@ -191,16 +190,26 @@ Json parse_object(const std::string& text, const std::string& what) {
     return root;
 }
 
-Json endpoint_to_json(const EndpointSettings& ep) {
-    Json obj = {{"provider", ep.provider},     {"provider_name", ep.provider_name},
-                {"base_url", ep.base_url},     {"model", ep.model},
-                {"dim", ep.dim},               {"max_tokens", ep.max_tokens},
-                {"timeout_ms", ep.timeout_ms}, {"thinking_type", ep.thinking_type}};
-    if (ep.max_retries.has_value()) {
-        obj["max_retries"] = *ep.max_retries;
+// 往 JSON 对象写一个键；operator[] 只在这里用一次。
+void put(Json& obj, const std::string& key, Json val) {
+    obj.emplace(key, std::move(val));
+}
+
+Json endpoint_to_json(const EndpointSettings& endpoint) {
+    Json obj = Json::object();
+    put(obj, "provider", endpoint.provider);
+    put(obj, "provider_name", endpoint.provider_name);
+    put(obj, "base_url", endpoint.base_url);
+    put(obj, "model", endpoint.model);
+    put(obj, "dim", endpoint.dim);
+    put(obj, "max_tokens", endpoint.max_tokens);
+    put(obj, "timeout_ms", endpoint.timeout_ms);
+    put(obj, "thinking_type", endpoint.thinking_type);
+    if (endpoint.max_retries.has_value()) {
+        put(obj, "max_retries", *endpoint.max_retries);
     }
-    if (ep.enable_thinking.has_value()) {
-        obj["enable_thinking"] = *ep.enable_thinking;
+    if (endpoint.enable_thinking.has_value()) {
+        put(obj, "enable_thinking", *endpoint.enable_thinking);
     }
     return obj;
 }
@@ -236,34 +245,42 @@ WorldSettings settings_from_json(const std::string& text) {
 std::string settings_to_json(const WorldSettings& settings) {
     Json root = Json::object();
     if (settings.extraction.has_value()) {
-        root["extraction"] = endpoint_to_json(*settings.extraction);
+        put(root, "extraction", endpoint_to_json(*settings.extraction));
     }
     if (settings.embedding.has_value()) {
-        root["embedding"] = endpoint_to_json(*settings.embedding);
+        put(root, "embedding", endpoint_to_json(*settings.embedding));
     }
     if (settings.chat.has_value()) {
-        root["chat"] = endpoint_to_json(*settings.chat);
+        put(root, "chat", endpoint_to_json(*settings.chat));
     }
+    put(root, "vector_backend", settings.vector_backend);
+
     const SourceLaneSettings& lane = settings.source_lane;
-    root["vector_backend"] = settings.vector_backend;
-    root["source_lane"] = {{"enabled", lane.enabled},
-                           {"render_time", lane.render_time},
-                           {"tau_source", lane.tau_source},
-                           {"model", lane.model},
-                           {"dim", lane.dim},
-                           {"k_source", lane.k_source},
-                           {"chunk_byte_budget", lane.chunk_byte_budget}};
+    Json lane_json = Json::object();
+    put(lane_json, "enabled", lane.enabled);
+    put(lane_json, "render_time", lane.render_time);
+    put(lane_json, "tau_source", lane.tau_source);
+    put(lane_json, "model", lane.model);
+    put(lane_json, "dim", lane.dim);
+    put(lane_json, "k_source", lane.k_source);
+    put(lane_json, "chunk_byte_budget", lane.chunk_byte_budget);
+    put(root, "source_lane", std::move(lane_json));
+
     Json gist = Json::object();
     for (const auto& [name, thr] : settings.gist_thresholds) {
-        gist[name] = thr;
+        put(gist, name, thr);
     }
-    root["gist_thresholds"] = std::move(gist);
-    const BackgroundSettings& bg = settings.background;
-    root["background"] = {{"tick_interval_s", bg.tick_interval_s},
-                          {"ingest", bg.ingest},
-                          {"auto_snapshot",
-                           {{"on_session", bg.auto_snapshot.on_session},
-                            {"interval_hours", bg.auto_snapshot.interval_hours}}}};
+    put(root, "gist_thresholds", std::move(gist));
+
+    const BackgroundSettings& background = settings.background;
+    Json snap = Json::object();
+    put(snap, "on_session", background.auto_snapshot.on_session);
+    put(snap, "interval_hours", background.auto_snapshot.interval_hours);
+    Json bg_json = Json::object();
+    put(bg_json, "tick_interval_s", background.tick_interval_s);
+    put(bg_json, "ingest", background.ingest);
+    put(bg_json, "auto_snapshot", std::move(snap));
+    put(root, "background", std::move(bg_json));
     return root.dump();
 }
 
@@ -276,7 +293,8 @@ WorldSettings merge_settings(const WorldSettings& base, const std::string& overr
         out.background = BackgroundSettings{
             .tick_interval_s = 0.0,
             .ingest = false,
-            .auto_snapshot = {.on_session = false, .interval_hours = 0}};
+            .auto_snapshot = {.on_session = false, .interval_hours = 0},
+        };
     }
     return out;
 }
