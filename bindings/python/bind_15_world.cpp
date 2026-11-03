@@ -50,18 +50,19 @@ py::dict snap_out(const gov::SnapshotEntry& snap) {
     py::dict out("id"_a = snap.id, "path"_a = snap.path, "kind"_a = snap.kind,
                  "reason"_a = snap.reason, "note"_a = snap.note, "created_at"_a = snap.created_at,
                  "world_time"_a = snap.world_time, "size_bytes"_a = snap.size_bytes);
-    out["sessions_complete"] = snap.sessions_complete.has_value()
-                                   ? py::object(py::int_(*snap.sessions_complete))
-                                   : py::object(py::none());
-    out["session_id"] = text_or_none(snap.session_id);
-    out["content_mark"] = text_or_none(snap.content_mark);
+    out.attr("update")(py::dict(
+        "sessions_complete"_a = snap.sessions_complete.has_value()
+                                    ? py::object(py::int_(*snap.sessions_complete))
+                                    : py::object(py::none()),
+        "session_id"_a = text_or_none(snap.session_id),
+        "content_mark"_a = text_or_none(snap.content_mark)));
     return out;
 }
 
 // WorldRecord 的全部字段；settings 是解析后的 dict（原文 settings_json 不外露），labels 是 dict。
 py::dict record_out(const gov::WorldRecord& rec) {
     py::dict labels;
-    for (const auto& [key, value] : rec.labels) { labels[py::str(key)] = value; }
+    for (const auto& [key, value] : rec.labels) { labels.attr("setdefault")(py::str(key), py::str(value)); }
     return py::dict("name"_a = rec.name, "dir_id"_a = rec.dir_id, "tenant"_a = rec.tenant,
                     "db_path"_a = rec.db_path, "snapshot_dir"_a = rec.snapshot_dir,
                     "label"_a = rec.label, "created_at"_a = rec.created_at, "seed"_a = rec.seed,
