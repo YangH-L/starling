@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -516,8 +517,8 @@ void write_fresh_registry(const fs::path& file, const std::string& default_world
                           rec.label, rec.created_at, rec.settings_json);
                 stmt.step_done();
                 // 最旧的先登记：seq 递增，snapshots() 按 seq 降序读回来就是原来的顺序。
-                for (auto iter = world.snapshots.rbegin(); iter != world.snapshots.rend(); ++iter) {
-                    insert_snapshot(dbh, rec.name, *iter);
+                for (const auto& snap : std::ranges::reverse_view(world.snapshots)) {
+                    insert_snapshot(dbh, rec.name, snap);
                 }
             }
             guard.commit();
