@@ -2,6 +2,7 @@
 
 #include "starling/governance/registry_db.hpp"
 
+#include "registry_db_internal.hpp"
 #include "world_store_internal.hpp"
 
 #include "starling/persistence/connection.hpp"
@@ -17,6 +18,7 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace starling::governance {
 
@@ -30,6 +32,9 @@ constexpr int kDefaultRetention = 5;
 constexpr std::int64_t kMaxPageLimit = 500;
 
 // 建表 SQL。世界目录用 dir_id 命名，world_labels / snapshots 按世界名关联。
+// snapshots.seq 是登记顺序（全表递增），snapshots() 按它降序列出：「最新」指最后登记的那份，与
+// worlds.json 时代「插到列表开头」一致。不用 created_at 排：同一秒拍的几份 created_at 相同，id 的
+// 后缀是随机的，按 id 兜底会让刚拍的那份排到后面、被保留策略当成最旧的删掉。
 constexpr const char* kSchemaSql = R"sql(
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS worlds (
@@ -72,6 +77,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     sessions_complete INTEGER,
     session_id TEXT NOT NULL DEFAULT '',
     content_mark TEXT NOT NULL DEFAULT '',
+    seq INTEGER NOT NULL,
     PRIMARY KEY (world, id)
 );
 )sql";
@@ -112,6 +118,31 @@ WorldRecord read_world(sqlite3_stmt* stmt) {
 
 [[noreturn]] void registry_corrupt(const std::string& detail) {
     throw WorldStoreError("registry_corrupt", detail);
+}
+
+// 登记一份快照，seq 取全表最大值 + 1（调用方已持锁、在事务里）。SQLite 错误（撞主键等）原样抛出。
+void insert_snapshot(sqlite3* dbh, const std::string& world, const SnapshotEntry& entry) {
+    pst::Stmt stmt(dbh,
+                   "INSERT INTO snapshots (world, id, path, kind, reason, note, created_at, "
+                   "world_time, size_bytes, sessions_complete, session_id, content_mark, seq) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                   "(SELECT COALESCE(MAX(seq), 0) + 1 FROM snapshots))");
+    stmt.bind(world, entry.id, entry.path, entry.kind, entry.reason, entry.note, entry.created_at,
+              entry.world_time, entry.size_bytes);
+    if (entry.sessions_complete) {
+        sqlite3_bind_int64(stmt.raw(), 10, *entry.sessions_complete);
+    } else {
+        sqlite3_bind_null(stmt.raw(), 10);
+    }
+    pst::detail::bind_sv(stmt.raw(), 11, entry.session_id);
+    pst::detail::bind_sv(stmt.raw(), 12, entry.content_mark);
+    stmt.step_done();
+}
+
+void insert_meta(sqlite3* dbh, const char* key, const std::string& value) {
+    pst::Stmt stmt(dbh, "INSERT INTO meta (key, value) VALUES (?, ?)");
+    stmt.bind(key, value);
+    stmt.step_done();
 }
 
 }  // namespace
@@ -338,7 +369,7 @@ void RegistryDb::remove(const std::string& name) {
     } catch (const WorldStoreError& err) {
         throw WorldStoreError("snapshot_failed", err.what());
     }
-    internal::require_resolved_home(worlds_root, dir_id, "snapshot_failed");
+    internal::require_resolved_home(worlds_root, dir_id, "snapshot_failed", name);
     if (!internal::remove_within(worlds_root, worlds_root / dir_id)) {
         throw WorldStoreError("snapshot_failed", "world directory of '" + name +
                                                      "' resolves outside " + worlds_root.string() +
@@ -399,7 +430,7 @@ std::vector<SnapshotEntry> RegistryDb::snapshots(const std::string& world) const
     pst::Stmt stmt(impl_->db(),
                    "SELECT id, path, kind, reason, note, created_at, world_time, size_bytes, "
                    "sessions_complete, session_id, content_mark FROM snapshots WHERE world = ? "
-                   "ORDER BY created_at DESC, id DESC");
+                   "ORDER BY seq DESC");
     stmt.bind(world);
     std::vector<SnapshotEntry> out;
     while (stmt.step_row()) {
@@ -426,27 +457,14 @@ std::vector<SnapshotEntry> RegistryDb::snapshots(const std::string& world) const
 void RegistryDb::put_snapshot(const std::string& world, const SnapshotEntry& entry) {
     const std::scoped_lock lock(impl_->mutex);
     (void)impl_->require(world);
-    pst::TransactionGuard guard(*impl_->conn);
-    pst::Stmt stmt(impl_->db(),
-                   "INSERT INTO snapshots (world, id, path, kind, reason, note, created_at, "
-                   "world_time, size_bytes, sessions_complete, session_id, content_mark) "
-                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    stmt.bind(world, entry.id, entry.path, entry.kind, entry.reason, entry.note, entry.created_at,
-              entry.world_time, entry.size_bytes);
-    if (entry.sessions_complete) {
-        sqlite3_bind_int64(stmt.raw(), 10, *entry.sessions_complete);
-    } else {
-        sqlite3_bind_null(stmt.raw(), 10);
-    }
-    pst::detail::bind_sv(stmt.raw(), 11, entry.session_id);
-    pst::detail::bind_sv(stmt.raw(), 12, entry.content_mark);
     try {
-        stmt.step_done();
+        pst::TransactionGuard guard(*impl_->conn);
+        insert_snapshot(impl_->db(), world, entry);
+        guard.commit();
     } catch (const pst::SqliteError& err) {
         throw WorldStoreError("snapshot_failed", "cannot record snapshot '" + entry.id +
                                                      "' of '" + world + "': " + err.what());
     }
-    guard.commit();
 }
 
 void RegistryDb::drop_snapshot(const std::string& world, const std::string& snapshot_id) {
@@ -475,5 +493,43 @@ int RegistryDb::snapshot_retention() const {
 }
 
 const fs::path& RegistryDb::data_dir() const { return impl_->data_dir; }
+
+namespace internal {
+
+void write_fresh_registry(const fs::path& file, const std::string& default_world,
+                          int snapshot_retention, const std::vector<ImportedWorld>& worlds) {
+    try {
+        auto conn = pst::Connection::open(file);
+        conn.exec(kSchemaSql);
+        {
+            pst::TransactionGuard guard(conn);
+            sqlite3* dbh = conn.raw();
+            insert_meta(dbh, "schema_version", std::to_string(kSchemaVersion));
+            insert_meta(dbh, "default_world", default_world);
+            insert_meta(dbh, "snapshot_retention", std::to_string(snapshot_retention));
+            for (const auto& world : worlds) {
+                const WorldRecord& rec = world.record;
+                pst::Stmt stmt(dbh,
+                               "INSERT INTO worlds (name, dir_id, tenant, db_path, snapshot_dir, "
+                               "label, created_at, settings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+                stmt.bind(rec.name, rec.dir_id, rec.tenant, rec.db_path, rec.snapshot_dir,
+                          rec.label, rec.created_at, rec.settings_json);
+                stmt.step_done();
+                // 最旧的先登记：seq 递增，snapshots() 按 seq 降序读回来就是原来的顺序。
+                for (auto iter = world.snapshots.rbegin(); iter != world.snapshots.rend(); ++iter) {
+                    insert_snapshot(dbh, rec.name, *iter);
+                }
+            }
+            guard.commit();
+        }
+        // 切回 DELETE 日志模式：WAL 合并进主文件、-wal / -shm 删掉，改名只需挪一个文件。
+        conn.exec("PRAGMA journal_mode = DELETE");
+        conn.close();
+    } catch (const pst::SqliteError& err) {
+        registry_corrupt("cannot write " + file.string() + ": " + err.what());
+    }
+}
+
+}  // namespace internal
 
 }  // namespace starling::governance

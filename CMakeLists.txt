@@ -189,6 +189,7 @@ target_sources(starling_core PRIVATE
     src/governance/metrics_gatherer.cpp
     src/governance/world_store.cpp
     src/governance/registry_db.cpp
+    src/governance/registry_import.cpp
     src/governance/world_settings.cpp
 )
 target_compile_options(starling_core PRIVATE ${STARLING_WARNING_FLAGS})
