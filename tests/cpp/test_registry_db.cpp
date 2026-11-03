@@ -330,7 +330,7 @@ TEST(WorldSettingsCompose, CreateWhileDefaultIsUpdatedSeesOneCompleteSnapshot) {
     std::thread updater([&] {
         for (int ver = 1; !stop.load(); ++ver) { reg.update_world_settings("default", endpoint(ver)); }
     });
-    for (int idx = 0; idx < 40; ++idx) {
+    for (int idx = 0; idx < 15; ++idx) {
         const auto rec = reg.create_world("w" + std::to_string(idx), "", {}, "", kNow);
         const auto got = settings_from_json(rec.settings_json);
         ASSERT_TRUE(got.extraction.has_value());

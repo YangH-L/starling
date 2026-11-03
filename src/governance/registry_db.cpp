@@ -218,7 +218,7 @@ struct RegistryDb::Impl {
     // 调用方已持锁，且 name 已过 is_valid_world_name。
     WorldRecord create_row(const std::string& name, const std::string& label,
                            const std::map<std::string, std::string>& labels,
-                           const std::string& settings_json, std::string_view now_iso) {
+                           const std::string& settings_json, std::string_view now_iso) const {
     if (find(name)) { throw WorldStoreError("world_exists", "world '" + name + "' exists"); }
     const fs::path worlds_root = data_dir / "worlds";
     internal::require_worlds_root_inside(data_dir, worlds_root);
