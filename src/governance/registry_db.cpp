@@ -5,6 +5,7 @@
 #include "registry_db_internal.hpp"
 #include "world_store_internal.hpp"
 
+#include "starling/governance/world_settings.hpp"
 #include "starling/persistence/connection.hpp"
 #include "starling/persistence/sqlite_helpers.hpp"
 #include "starling/persistence/stmt.hpp"
@@ -148,6 +149,15 @@ void insert_meta(sqlite3* dbh, const char* key, const std::string& value) {
 
 }  // namespace
 
+namespace {
+void require_valid_name(const std::string& name) {
+    if (!is_valid_world_name(name)) {
+        throw WorldStoreError("invalid_world_name",
+                              "'" + name + "' does not match [A-Za-z0-9][A-Za-z0-9._-]{0,127}");
+    }
+}
+}  // namespace
+
 struct RegistryDb::Impl {
     fs::path data_dir;
     mutable std::mutex mutex;
@@ -187,6 +197,58 @@ struct RegistryDb::Impl {
         pst::Stmt stmt(db(), "SELECT 1 FROM worlds WHERE dir_id = ?");
         stmt.bind(dir_id);
         return stmt.step_row();
+    }
+
+    // 调用方已持锁。
+    [[nodiscard]] std::string default_name() const {
+        pst::Stmt stmt(db(), "SELECT value FROM meta WHERE key = 'default_world'");
+        return stmt.step_row() ? text_col(stmt.raw(), 0) : std::string("default");
+    }
+
+    // 调用方已持锁；world_not_found。
+    void set_settings(const std::string& name, const std::string& settings_json) const {
+        (void)require(name);
+        pst::TransactionGuard guard(*conn);
+        pst::Stmt stmt(db(), "UPDATE worlds SET settings_json = ? WHERE name = ?");
+        stmt.bind(settings_json, name);
+        stmt.step_done();
+        guard.commit();
+    }
+
+    // 调用方已持锁，且 name 已过 is_valid_world_name。
+    WorldRecord create_row(const std::string& name, const std::string& label,
+                           const std::map<std::string, std::string>& labels,
+                           const std::string& settings_json, std::string_view now_iso) {
+    if (find(name)) { throw WorldStoreError("world_exists", "world '" + name + "' exists"); }
+    const fs::path worlds_root = data_dir / "worlds";
+    internal::require_worlds_root_inside(data_dir, worlds_root);
+    std::string dir_id = internal::random_hex();
+    while (dir_id_taken(dir_id) || fs::exists(worlds_root / dir_id)) {
+        dir_id = internal::random_hex();
+    }
+    const fs::path home = worlds_root / dir_id;
+    std::error_code mkdir_err;
+    fs::create_directories(home / "snapshots", mkdir_err);
+    if (mkdir_err) {
+        throw WorldStoreError("snapshot_failed",
+                              "cannot create " + home.string() + ": " + mkdir_err.message());
+    }
+    try {
+        pst::TransactionGuard guard(*conn);
+        pst::Stmt stmt(db(),
+                       "INSERT INTO worlds (name, dir_id, tenant, db_path, snapshot_dir, label, "
+                       "created_at, settings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        stmt.bind(name, dir_id, name, (home / "world.db").string(),
+                  (home / "snapshots").string(), label, now_iso, settings_json);
+        stmt.step_done();
+        insert_labels(name, labels);
+        guard.commit();
+    } catch (...) {
+        std::error_code rm_err;
+        fs::remove_all(home, rm_err);
+        throw;
+    }
+    return require(name);
     }
 
     void insert_labels(const std::string& name,
@@ -323,41 +385,31 @@ WorldPage RegistryDb::list(const WorldQuery& query) const {
 WorldRecord RegistryDb::create(const std::string& name, const std::string& label,
                                const std::map<std::string, std::string>& labels,
                                const std::string& settings_json, std::string_view now_iso) {
-    if (!is_valid_world_name(name)) {
-        throw WorldStoreError("invalid_world_name",
-                              "'" + name + "' does not match [A-Za-z0-9][A-Za-z0-9._-]{0,127}");
-    }
+    require_valid_name(name);
     const std::scoped_lock lock(impl_->mutex);
-    if (impl_->find(name)) { throw WorldStoreError("world_exists", "world '" + name + "' exists"); }
-    const fs::path worlds_root = impl_->data_dir / "worlds";
-    internal::require_worlds_root_inside(impl_->data_dir, worlds_root);
-    std::string dir_id = internal::random_hex();
-    while (impl_->dir_id_taken(dir_id) || fs::exists(worlds_root / dir_id)) {
-        dir_id = internal::random_hex();
-    }
-    const fs::path home = worlds_root / dir_id;
-    std::error_code mkdir_err;
-    fs::create_directories(home / "snapshots", mkdir_err);
-    if (mkdir_err) {
-        throw WorldStoreError("snapshot_failed",
-                              "cannot create " + home.string() + ": " + mkdir_err.message());
-    }
-    try {
-        pst::TransactionGuard guard(*impl_->conn);
-        pst::Stmt stmt(impl_->db(),
-                       "INSERT INTO worlds (name, dir_id, tenant, db_path, snapshot_dir, label, "
-                       "created_at, settings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-        stmt.bind(name, dir_id, name, (home / "world.db").string(),
-                  (home / "snapshots").string(), label, now_iso, settings_json);
-        stmt.step_done();
-        impl_->insert_labels(name, labels);
-        guard.commit();
-    } catch (...) {
-        std::error_code rm_err;
-        fs::remove_all(home, rm_err);
-        throw;
-    }
-    return impl_->require(name);
+    return impl_->create_row(name, label, labels, settings_json, now_iso);
+}
+
+WorldRecord RegistryDb::create_world(const std::string& name, const std::string& label,
+                                     const std::map<std::string, std::string>& labels,
+                                     const std::string& overrides_json, std::string_view now_iso) {
+    require_valid_name(name);
+    const std::scoped_lock lock(impl_->mutex);
+    const auto base = settings_from_json(impl_->require(impl_->default_name()).settings_json);
+    const auto merged = settings_to_json(
+        merge_settings(base, overrides_json.empty() ? "{}" : overrides_json, false));
+    return impl_->create_row(name, label, labels, merged, now_iso);
+}
+
+std::string RegistryDb::update_world_settings(const std::string& name,
+                                              const std::string& overrides_json) {
+    const std::scoped_lock lock(impl_->mutex);
+    const auto rec = impl_->require(name);
+    const auto merged = settings_to_json(merge_settings(
+        settings_from_json(rec.settings_json), overrides_json.empty() ? "{}" : overrides_json,
+        rec.read_only));
+    impl_->set_settings(name, merged);
+    return merged;
 }
 
 void RegistryDb::remove(const std::string& name) {
@@ -419,12 +471,7 @@ void RegistryDb::set_labels(const std::string& name,
 
 void RegistryDb::update_settings(const std::string& name, const std::string& settings_json) {
     const std::scoped_lock lock(impl_->mutex);
-    (void)impl_->require(name);
-    pst::TransactionGuard guard(*impl_->conn);
-    pst::Stmt stmt(impl_->db(), "UPDATE worlds SET settings_json = ? WHERE name = ?");
-    stmt.bind(settings_json, name);
-    stmt.step_done();
-    guard.commit();
+    impl_->set_settings(name, settings_json);
 }
 
 void RegistryDb::update_stats(const std::string& name, std::int64_t holders,

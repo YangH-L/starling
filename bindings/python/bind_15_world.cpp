@@ -14,9 +14,11 @@
 
 #include <pybind11/stl.h>
 
+#include <chrono>
 #include <map>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include "starling/governance/registry_db.hpp"
@@ -163,7 +165,7 @@ void bind_15_world(pybind11::module_& m) {
                  for (const auto& rec : page.worlds) { worlds.append(record_out(rec)); }
                  return py::dict("worlds"_a = worlds, "total"_a = page.total);
              }, py::arg("labels") = py::none(), py::arg("offset") = 0, py::arg("limit") = 50)
-        // 新世界设置 = 默认世界当前设置 + overrides 的值拷贝（C++ settings_for_new_world）。
+        // 新世界设置 = 默认世界当前设置 + overrides 的值拷贝（C++ create_world，一次持锁）。
         .def("create",
              // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
              [](gov::RegistryDb& reg, const std::string& name, const std::string& label,
@@ -173,8 +175,7 @@ void bind_15_world(pybind11::module_& m) {
                  gov::WorldRecord rec;
                  {
                      const py::gil_scoped_release release;
-                     rec = reg.create(name, label, labels,
-                                      gov::settings_for_new_world(reg, overrides_text), now_iso);
+                     rec = reg.create_world(name, label, labels, overrides_text, now_iso);
                  }
                  return record_out(rec);
              }, py::arg("name"), py::arg("label"), py::arg("labels"), py::arg("overrides"),
@@ -190,7 +191,7 @@ void bind_15_world(pybind11::module_& m) {
                  std::string merged;
                  {
                      const py::gil_scoped_release release;
-                     merged = gov::update_world_settings(reg, name, overrides_text);
+                     merged = reg.update_world_settings(name, overrides_text);
                  }
                  return to_py(merged);
              }, py::arg("name"), py::arg("overrides"))
@@ -268,12 +269,19 @@ void bind_15_world(pybind11::module_& m) {
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
           [](gov::RegistryDb& reg, const std::string& world, const std::string& kind,
              const std::string& reason, const std::string& note,
-             const std::string& vector_backend) {
+             const std::string& vector_backend, int test_before_vacuum_sleep_ms) {
               gov::SnapshotOptions opts;
               opts.kind = kind;
               opts.reason = reason;
               opts.note = note;
               opts.vector_backend = vector_backend;
+              if (test_before_vacuum_sleep_ms > 0) {
+                  // 仅测试用：在 VACUUM 之前睡一会儿（GIL 已释放），造出确定的阻塞窗口。
+                  opts.before_vacuum = [test_before_vacuum_sleep_ms] {
+                      std::this_thread::sleep_for(
+                          std::chrono::milliseconds(test_before_vacuum_sleep_ms));
+                  };
+              }
               gov::SnapshotEntry snap;
               {
                   const py::gil_scoped_release release;
@@ -282,7 +290,8 @@ void bind_15_world(pybind11::module_& m) {
               return py::dict("snapshot"_a = snap_out(snap));
           }, py::arg("registry"), py::arg("world"), py::arg("kind") = "manual",
           py::arg("reason") = "manual", py::arg("note") = "",
-          py::kw_only(), py::arg("vector_backend") = "sqlite");
+          py::kw_only(), py::arg("vector_backend") = "sqlite",
+          py::arg("_test_before_vacuum_sleep_ms") = 0);
 
     // 删一份快照（注册项 + 文件）。快照不存在抛 snapshot_not_found。
     m.def("world_delete_snapshot",

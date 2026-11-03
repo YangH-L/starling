@@ -2,6 +2,7 @@
 import gc
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -165,7 +166,6 @@ def _progress_while(blocking_call) -> int:
     started.wait()
     progress = 0
     while not done.is_set():
-        import time
         time.sleep(0.002)
         progress += 1
     thread.join()
@@ -176,10 +176,7 @@ def test_registry_calls_release_gil(tmp_path):
     reg = _open(tmp_path)
     rec = reg.create("big", "", {}, None, NOW)
     _migrate(rec["db_path"])
-    con = sqlite3.connect(rec["db_path"])      # 撑大库，让 VACUUM 有可观的耗时
-    con.execute("CREATE TABLE filler (x BLOB)")
-    with con:
-        con.executemany("INSERT INTO filler VALUES (?)", [(b"x" * 1_000_000,)] * 300)
-    con.close()
-    progress = _progress_while(lambda: _core.world_take_snapshot(reg, "big"))
-    assert progress >= 3, f"take_snapshot 期间主线程仅推进 {progress} 步——GIL 未释放"
+    # before_vacuum 钩子在 C++ 里睡 300ms（GIL 已释放），窗口确定、不需要大库。
+    progress = _progress_while(
+        lambda: _core.world_take_snapshot(reg, "big", _test_before_vacuum_sleep_ms=300))
+    assert progress >= 20, f"take_snapshot 期间主线程仅推进 {progress} 步——GIL 未释放"

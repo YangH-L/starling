@@ -14,6 +14,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -256,37 +257,85 @@ TEST(RegistryDb, CorruptRegistryFileIsReported) {
     EXPECT_EQ(code_of([&] { (void)open_db(tmp); }), "registry_corrupt");
 }
 
-// ---- 设置组合（裁定 R2）：合并在 C++ ----
+// ---- 设置组合（裁定 R2）：合并在 C++，读—合并—写在一次持锁内 ----
 
 TEST(WorldSettingsCompose, NewWorldCopiesDefaultSettingsThenOverrides) {
     const TempDir tmp;
     auto reg = open_db(tmp);
-    update_world_settings(reg, "default", R"({"vector_backend":"sqlite","source_lane":{"k_source":60}})");
-    const auto text = settings_for_new_world(reg, R"({"source_lane":{"dim":512}})");
-    const auto got = settings_from_json(text);
+    reg.update_world_settings("default", R"({"source_lane":{"k_source":60}})");
+    const auto created = reg.create_world("w1", "", {}, R"({"source_lane":{"dim":512}})", kNow);
+    const auto got = settings_from_json(created.settings_json);
     EXPECT_EQ(got.source_lane.k_source, 60);   // 默认世界的值被复制
     EXPECT_EQ(got.source_lane.dim, 512);       // overrides 覆盖
-    reg.create("w1", "", {}, text, kNow);
-    update_world_settings(reg, "default", R"({"source_lane":{"k_source":10}})");
+    reg.update_world_settings("default", R"({"source_lane":{"k_source":10}})");
     EXPECT_EQ(settings_from_json(reg.get("w1").settings_json).source_lane.k_source, 60);  // 值拷贝
-    EXPECT_EQ(settings_from_json(settings_for_new_world(reg, "")).source_lane.k_source, 10);
-    EXPECT_EQ(code_of([&] { (void)settings_for_new_world(reg, R"({"nope":1})"); }),
+    EXPECT_EQ(settings_from_json(reg.create_world("w2", "", {}, "", kNow).settings_json)
+                  .source_lane.k_source, 10);
+    EXPECT_EQ(code_of([&] { (void)reg.create_world("w3", "", {}, R"({"nope":1})", kNow); }),
               "invalid_settings");
+    EXPECT_EQ(code_of([&] { (void)reg.get("w3"); }), "world_not_found");   // 非法 overrides 什么都不写
+    EXPECT_EQ(code_of([&] { (void)reg.create_world("w1", "", {}, "{}", kNow); }), "world_exists");
+    EXPECT_EQ(code_of([&] { (void)reg.create_world("Bad Name", "", {}, "{}", kNow); }),
+              "invalid_world_name");
 }
 
 TEST(WorldSettingsCompose, UpdateMergesOntoCurrentAndPersists) {
     const TempDir tmp;
     auto reg = open_db(tmp);
     reg.create("w1", "", {}, "{}", kNow);
-    update_world_settings(reg, "w1", R"({"source_lane":{"k_source":7}})");
-    const auto merged = update_world_settings(reg, "w1", R"({"source_lane":{"dim":256}})");
+    reg.update_world_settings("w1", R"({"source_lane":{"k_source":7}})");
+    const auto merged = reg.update_world_settings("w1", R"({"source_lane":{"dim":256}})");
     const auto got = settings_from_json(reg.get("w1").settings_json);
     EXPECT_EQ(got.source_lane.k_source, 7);    // 前一次的值保留
     EXPECT_EQ(got.source_lane.dim, 256);
     EXPECT_EQ(merged, reg.get("w1").settings_json);
     const auto before = reg.get("w1").settings_json;
-    EXPECT_EQ(code_of([&] { (void)update_world_settings(reg, "w1", R"({"nope":1})"); }),
+    EXPECT_EQ(code_of([&] { (void)reg.update_world_settings("w1", R"({"nope":1})"); }),
               "invalid_settings");
     EXPECT_EQ(reg.get("w1").settings_json, before);   // 非法 overrides 什么都不写
-    EXPECT_EQ(code_of([&] { (void)update_world_settings(reg, "zz", "{}"); }), "world_not_found");
+    EXPECT_EQ(code_of([&] { (void)reg.update_world_settings("zz", "{}"); }), "world_not_found");
+}
+
+// 并发更新同一世界：每个线程合并一个不同的 gist_thresholds 键，结束后全部都在（不丢合并）。
+TEST(WorldSettingsCompose, ConcurrentUpdatesOfOneWorldLoseNoMerge) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    constexpr int kThreads = 8;
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int idx = 0; idx < kThreads; ++idx) {
+        workers.emplace_back([&reg, idx] {
+            for (int round = 0; round < 5; ++round) {
+                reg.update_world_settings(
+                    "default", R"({"gist_thresholds":{"k)" + std::to_string(idx) + R"(":0.5}})");
+            }
+        });
+    }
+    for (auto& worker : workers) { worker.join(); }
+    const auto got = settings_from_json(reg.get("default").settings_json);
+    EXPECT_EQ(got.gist_thresholds.size(), static_cast<std::size_t>(kThreads));
+}
+
+// 建世界与更新默认世界并发：新世界的 extraction 一定是某一次完整写入的快照（model 与 dim 成对）。
+TEST(WorldSettingsCompose, CreateWhileDefaultIsUpdatedSeesOneCompleteSnapshot) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    const auto endpoint = [](int ver) {
+        return R"({"extraction":{"provider":"openai","base_url":"http://h","model":"m)" +
+               std::to_string(ver) + R"(","dim":)" + std::to_string(ver) +
+               R"(,"max_tokens":10,"timeout_ms":1000}})";
+    };
+    reg.update_world_settings("default", endpoint(0));
+    std::atomic<bool> stop{false};
+    std::thread updater([&] {
+        for (int ver = 1; !stop.load(); ++ver) { reg.update_world_settings("default", endpoint(ver)); }
+    });
+    for (int idx = 0; idx < 40; ++idx) {
+        const auto rec = reg.create_world("w" + std::to_string(idx), "", {}, "", kNow);
+        const auto got = settings_from_json(rec.settings_json);
+        ASSERT_TRUE(got.extraction.has_value());
+        EXPECT_EQ(got.extraction->model, "m" + std::to_string(got.extraction->dim));  // 不撕裂
+    }
+    stop.store(true);
+    updater.join();
 }

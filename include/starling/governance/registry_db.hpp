@@ -75,6 +75,16 @@ public:
     WorldRecord create(const std::string& name, const std::string& label,
                        const std::map<std::string, std::string>& labels,
                        const std::string& settings_json, std::string_view now_iso);
+    // 建世界并继承设置（裁定 R2），整个「读默认世界设置 → merge_settings(overrides) → 插入」在一次
+    // 持锁内完成，并发的 update_world_settings("default", ...) 不会插进中间。新世界的设置是默认世界当时
+    // 设置的值拷贝，之后改默认世界不影响它。overrides_json 空串当 "{}"，非法按 settings_from_json 的码抛
+    // （invalid_settings 等），此时什么都不写。其余错误同 create。
+    WorldRecord create_world(const std::string& name, const std::string& label,
+                             const std::map<std::string, std::string>& labels,
+                             const std::string& overrides_json, std::string_view now_iso);
+    // 把 overrides 合并到世界当前设置上（只读世界后台强制关）并写回，读—合并—写在一次持锁内，
+    // 并发更新同一世界不会丢合并。返回合并后的 settings_json。world_not_found；overrides 非法时什么都不写。
+    std::string update_world_settings(const std::string& name, const std::string& overrides_json);
     // default → world_protected；删注册项（含标签、快照条目）与 worlds/<dir_id>/。
     // dir_id 越出 worlds/ 或布局被符号链接篡改 → snapshot_failed，什么都不删。
     void remove(const std::string& name);
