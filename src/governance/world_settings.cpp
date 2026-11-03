@@ -227,8 +227,8 @@ std::string percent_encode(const std::string& text) {
             out.push_back(chr);
         } else {
             out.push_back('%');
-            out.push_back(kHex[byte >> 4U]);
-            out.push_back(kHex[byte & 0x0FU]);
+            out.push_back(kHex.at(byte >> 4U));
+            out.push_back(kHex.at(byte & 0x0FU));
         }
     }
     return out;
