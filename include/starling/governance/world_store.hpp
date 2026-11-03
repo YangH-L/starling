@@ -44,6 +44,8 @@ private:
 //           | invalid_auto_snapshot（W4：interval_hours 越界、session 触发缺 session_id、
 //             now_iso 解析不了（AutoTrigger 与 SnapshotOptions 的都算）、触发类型非法、
 //             list_sessions 的 limit 越界）
+//           | invalid_settings（world_settings：设置 JSON 解析失败、未知键、类型错误）
+//           | endpoint_changed（require_endpoint_unchanged：继承来的 provider 的 base_url 已被改动）
 
 struct SnapshotEntry {
     std::string id;           // 20261025T011200Z-a1b2
@@ -69,6 +71,7 @@ struct SnapshotEntry {
 struct AutoSnapshotConfig {
     bool on_session = false;
     std::int64_t interval_hours = 0;
+    bool operator==(const AutoSnapshotConfig&) const = default;
 };
 
 struct WorldEntry {
