@@ -77,3 +77,21 @@ def test_env_seeds_extraction_when_unconfigured(tmp_path, monkeypatch):
     cfg = DashboardConfig.load(str(tmp_path / "starling.json"))
     ex = cfg.extraction()
     assert ex is not None and ex["api_key"] == "sk-env" and ex["model"] == "gpt-env"
+
+
+def test_save_without_config_path_never_reaches_the_real_home(tmp_path):
+    """没给 config_path 的 DashboardConfig（world_routes 等用例的 client 夹具就是这样建的）save() 时
+    落到模块级默认路径。conftest 把默认路径改指 tmp；这里钉住：写到的是 tmp 下的副本，
+    不是 ~/.starling/starling.json。"""
+    from pathlib import Path
+    from starling.dashboard import config as dash_config
+    real = Path.home() / ".starling" / "starling.json"
+    assert dash_config._DEFAULT_CONFIG != real
+    assert str(dash_config._DEFAULT_CONFIG).startswith(str(tmp_path))
+    before = real.stat().st_mtime_ns if real.exists() else None
+    cfg = DashboardConfig(db_path=str(tmp_path / "x.db"), token="t")
+    cfg.save()
+    assert Path(cfg.config_path) == dash_config._DEFAULT_CONFIG
+    assert dash_config._DEFAULT_CONFIG.exists()
+    after = real.stat().st_mtime_ns if real.exists() else None
+    assert after == before

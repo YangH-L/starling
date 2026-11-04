@@ -40,6 +40,15 @@ def isolate_dashboard_ingest_spool(tmp_path, monkeypatch):
     monkeypatch.setenv("STARLING_DASH_INGEST_SPOOL", str(tmp_path / "ingest-spool"))
     # 注册表（registry.db）与新世界目录都在数据目录下（裁定 R5）。
     monkeypatch.setenv("STARLING_DATA_DIR", str(tmp_path / "data"))
+    # DashboardConfig 没给 config_path 时 save() 落到模块级默认路径 ~/.starling/starling.json。
+    # POST /api/config 之类的用例会触发 save()，默认路径一律改指 tmp，不得覆盖真实配置。
+    from starling.dashboard import config as dash_config
+    fake_home = tmp_path / "home-starling"
+    monkeypatch.setattr(dash_config, "_DEFAULT_DIR", fake_home)
+    monkeypatch.setattr(dash_config, "_DEFAULT_CONFIG", fake_home / "starling.json")
+    monkeypatch.setattr(dash_config, "_DEFAULT_DB", fake_home / "dashboard.db")
+    monkeypatch.setattr(dash_config, "_DEFAULT_INGEST_SPOOL", fake_home / "ingest-spool")
+    monkeypatch.delenv("STARLING_CONFIG", raising=False)
 
 
 @pytest.fixture
