@@ -4,8 +4,16 @@ The remember / recall / tick / working-set command logic lives in
 `starling._memory_core.MemoryCore` (single implementation shared with
 `starling.Memory`, so the two surfaces cannot drift). This engine keeps only
 the dashboard-specific policy: the chat LLM and the embedder are built from
-`DashboardConfig` (both UI-configurable), so the embedder used to WRITE vectors
+the world's settings (`WorldContext.settings`, merged in C++) plus the live
+provider registry (`providers`, keys only), so the embedder used to WRITE vectors
 (EmbeddingWorker) and READ them (SemanticRetriever) stay the same.
+
+记忆服务（Task 5，spec §8、§10.3）：一个引擎服务一个世界。构造收 `WorldContext`（库、租户、已合并的
+设置、摄入分区目录）与 `providers`（starling.json 的 provider 注册表，只用来按 provider_name 取
+api_key 与当前 base_url）。直接传 `DashboardConfig` 的旧写法照样可用（裁定 R17）：经
+`WorldContext.from_config` 适配，providers 取 `config.providers`。继承来的 endpoint 每次调用前
+都经 C++ `world_require_endpoint_unchanged` 核对 provider 的当前地址（spec §8.3），改了就拒绝
+（endpoint_changed），不把密钥发到另一个地址。
 
 The SQLite runtime/connection is built ONCE at construction (db_path is fixed)
 and never rebuilt — config changes only swap the llm and/or rebuild the
@@ -32,11 +40,41 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from dataclasses import dataclass, field
+
 from starling import _core
 from starling import runtime as _runtime
 from starling._memory_core import LLMNotConfigured, MemoryCore
 from starling.dashboard.ingest_filter import chunk_dialogue, clean_turns, clean_turns_ts
-from starling.dashboard.ingest_spool import tenant_spool_dir
+
+
+@dataclass(frozen=True)
+class WorldContext:
+    """一个世界打开引擎需要的全部输入，从注册表记录推出（WorldPool.context）。
+
+    settings 是 C++ 补齐默认值后的完整 WorldSettings dict（字段见 world_settings.hpp），不含密钥。
+    ingest_spool_dir 是 <摄入根目录>/<world_ingest_partition(...)>（裁定 R4）。"""
+    name: str
+    dir_id: str
+    db_path: str
+    tenant: str
+    agent: str
+    settings: dict = field(default_factory=dict)
+    ingest_spool_dir: str = ""
+    is_default: bool = True
+
+    @classmethod
+    def from_config(cls, config) -> "WorldContext":
+        """DashboardConfig → 默认世界的上下文（裁定 R17 的适配器：现有 DashboardEngine(cfg) 的写法）。
+        只做字段搬运：设置取 config.world_settings() 再由 C++ 补默认值，分区目录名由 C++ 给。
+        DashboardConfig.world_settings() 没写出的 auto_snapshot 由 C++ 补默认值；直接构造的引擎
+        不挂自动快照钩子，用不到它。"""
+        settings = _core.world_effective_settings(config.world_settings())
+        spool = config.ingest_spool_root() / _core.world_ingest_partition(
+            True, config.tenant, "default")
+        return cls(name="default", dir_id="default", db_path=config.db_path,
+                   tenant=config.tenant, agent=config.agent, settings=settings,
+                   ingest_spool_dir=str(spool), is_default=True)
 
 
 # ── Phase 5 backpressure sampler defaults (L1 / L2) ─────────────────────────
@@ -75,6 +113,12 @@ def _now_iso() -> str:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _tick_did_work(stats: dict) -> bool:
+    """tick 这一轮有没有做事。stage_timings_ms 总在（9 项）、DEGRADED 时 stages_skipped 非空，两者都不算
+    （否则每个空闲的 DEGRADED 轮都会误发心跳，3b L8）。"""
+    return any(v for k, v in stats.items() if k not in ("stage_timings_ms", "stages_skipped"))
 
 
 # Routes run engine calls in worker threads (anyio to_thread), so the transient
@@ -164,14 +208,22 @@ class ClearConfirmMismatch(ValueError):
 
 
 class SessionSnapshotDeferred(Exception):
-    """按会话的自动快照这一轮没拿到管理锁（WorldManager 的会话钩子抛出，W4）。
+    """按会话的自动快照这一轮没拿到该世界的世界锁（WorldPool 的会话钩子抛出，W4）。
 
     钩子在写入之前调用，所以抛出时这个摄入 job 还什么都没写：摄入 worker 把它放回 spool，
     不计重试次数，下一轮再来。快照失败不抛这个（照常摄入，只记录失败）。"""
 
 
+# 世界设置里 endpoint 与 _build_chat_adapter / _build_embed_adapter 读的 provider dict 同名的字段。
+_ADAPTER_KEYS = ("provider", "model", "base_url", "dim", "max_tokens", "timeout_ms",
+                 "max_retries", "enable_thinking", "thinking_type")
+# NORM-gist 阈值里绑定层要整数的几项（ReplayScheduler.run_sleep / run_idle 的签名）。世界设置把阈值
+# 存成 double（C++ map<string,double>），所以 4.0 要还原成 4 才能传进去。
+_INT_GIST_KEYS = ("min_holders", "min_replay_count", "entity_gist_enabled")
+
+
 class DashboardEngine:
-    def __init__(self, config) -> None:
+    def __init__(self, ctx, providers: dict | None = None) -> None:
         # Embedded facade runs the reduced capability set (testing_helper_marker
         # test-only; engram_per_record_key deferred M0.4+KMS); the C++ supervisor
         # is built with embedded=True (in _build_local_store_sqlite_runtime), so
@@ -180,29 +232,64 @@ class DashboardEngine:
         # threads (anyio to_thread) and SQLite has a single writer connection.
         # RLock because working_set() re-enters recall().
         self._lock = threading.RLock()
+        # 旧写法 DashboardEngine(config)（裁定 R17）：经 WorldContext.from_config 适配，providers 取
+        # config.providers（同一个 dict，不拷贝，改 provider 立刻可见）。_cfg 只留给测试与 create_app
+        # 的注入校验读；引擎内部一律读 _ctx / _settings / _providers。
+        config = None
+        if not isinstance(ctx, WorldContext):
+            config = ctx
+            # 左脑 lane：开启但未标定阈值即拒绝构造（spec §4.4 硬约束），在打开库之前。
+            validate = getattr(config, "validate_source_lane", None)
+            if callable(validate):
+                validate()
+            ctx = WorldContext.from_config(config)
+            if providers is None:
+                providers = config.providers
+        if not ctx.tenant:
+            raise ValueError("world tenant must not be empty")
+        if not ctx.ingest_spool_dir:
+            # 空串会变成 Path("")，摄入线程就去轮询当前目录。
+            raise ValueError("world ingest spool directory must not be empty")
         self._cfg = config
-        self._db_path = config.db_path
-        rt = _runtime._build_local_store_sqlite_runtime(Path(config.db_path))
-        rt.start()
-        # 左脑 lane：开启但未标定阈值即拒绝构造（spec §4.4 硬约束）。直接构造
-        # 引擎（测试、评测脚本）不经 create_app，所以这里也要守。
-        validate = getattr(config, "validate_source_lane", None)
-        if callable(validate):
-            validate()
-        self._rt = rt   # the live Runtime (holds the C++ RuntimeSupervisor); the
-                        # host drain reaches the supervisor through begin_drain().
-        self._core = MemoryCore(rt, agent=config.agent, tenant_id=config.tenant,
+        self._ctx = ctx
+        # 已合并的设置（WorldPool.sync_default_settings 会经 set_world_settings 换成新的）。只读引用：
+        # 换的时候整体替换，不原地改。
+        self._settings = ctx.settings
+        self._providers = providers if providers is not None else {}
+        self._db_path = ctx.db_path
+        # 写方法成功之后调用一次（WorldPool 设置，用于统计去抖广播）。在引擎锁之外调用。
+        self.on_commit = None
+        self._embedder_live = False             # rebuild_embedder 设置
+        rt = _runtime._build_local_store_sqlite_runtime(Path(ctx.db_path))
+        try:
+            rt.start()
+            self._rt = rt   # the live Runtime (holds the C++ RuntimeSupervisor); the
+                            # host drain reaches the supervisor through begin_drain().
+            self._init_core(rt)
+        except BaseException as exc:
+            # 构造失败时不能让 Runtime（C++ 写连接）挂在异常的回溯上活着：调用方（引擎池）可能留着
+            # 这个异常，同时为同一个库再建一个引擎，就是一个库上两条写连接。已经返回的栈帧清掉局部
+            # 变量，本帧手动丢引用。
+            import traceback
+            traceback.clear_frames(exc.__traceback__)
+            self._core = None
+            self._rt = None
+            rt = None
+            raise
+
+    def _init_core(self, rt) -> None:
+        settings = self._settings
+        lane = settings["source_lane"]
+        self._core = MemoryCore(rt, agent=self._ctx.agent, tenant_id=self._ctx.tenant,
                                 adapter_name="dashboard", source_prefix="dash-",
-                                vector_backend=config.vector_backend,
-                                vector_store_path=(config.vector_store_path or None))
+                                vector_backend=settings["vector_backend"],
+                                vector_store_path=None)
         # 左脑 lane 读写两端：必须在 rebuild_embedder 之前登记，embedder 一到位
         # 就按它是否与标定一致决定 lane 是否生效（不一致时读写都不碰原文）。
-        if getattr(config, "source_lane_enabled", False):
+        if lane["enabled"]:
             self._core.enable_source_lane(
-                tau_source=config.source_lane_tau_source,
-                model=config.source_lane_model, dim=config.source_lane_dim,
-                k_source=config.source_lane_k_source,
-                chunk_byte_budget=config.source_lane_chunk_byte_budget)
+                tau_source=lane["tau_source"], model=lane["model"], dim=lane["dim"],
+                k_source=lane["k_source"], chunk_byte_budget=lane["chunk_byte_budget"])
         # P2.o 后台维护 tick(写→读闭环的离线半边);start_background_tick 启动。
         self._tick_thread: threading.Thread | None = None
         self._tick_stop: threading.Event | None = None
@@ -215,26 +302,27 @@ class DashboardEngine:
         self._debounce_ticks: int = _DEFAULT_DEBOUNCE_TICKS
         self._debounce_window: collections.deque = collections.deque(
             maxlen=self._debounce_ticks)
-        # Roles → adapters. Only extraction (the chat/LLM adapter MemoryCore
-        # uses for remember) and embedding have live consumers today; chat is
-        # wired in Phase 2c (converse). Unbound role → {} → no api_key → None /
-        # stub, matching the pre-registry "no key configured" behaviour.
-        self.set_llm(config.resolve_role("extraction") or {})
-        self.set_chat(config.chat() or {})   # chat role (2c); falls back to extraction
-        self.set_consolidation(config.resolve_role("consolidation") or {})  # #38-C role consumer
-        self.set_gist_thresholds(config.gist_thresholds or {})              # #38-C v2 threshold surface
-        self.rebuild_embedder(config.embedding() or {}, reembed=False)
+        # Roles → adapters, from the world's own settings (copied from the default
+        # world at creation, spec §8.2) + the live provider registry for keys.
+        # No endpoint in the settings → {} → no api_key → None / stub, the same as
+        # an unbound role today (裁定 R15: no fallback to the default world).
+        # consolidation 不在世界设置里（spec §8.1 的字段表没有它）：仍按 provider 注册表的角色绑定取，
+        # 只有直接用 DashboardConfig 构造的引擎（默认世界）才有 roles 可查。
+        self.set_llm(self._endpoint_cfg("extraction"))
+        self.set_chat(self._endpoint_cfg("chat") or self._endpoint_cfg("extraction"))
+        self.set_consolidation(self._consolidation_cfg())                    # #38-C role consumer
+        self.set_gist_thresholds(self._settings.get("gist_thresholds") or {})  # #38-C v2 threshold surface
+        self.rebuild_embedder(self._endpoint_cfg("embedding"), reembed=False)
         # dogfood sub-project A (Task 3): spool ingest worker — drains this
-        # tenant's configured partition (jobs written by the SessionEnd hook via
-        # scripts/ingest_session.py) into remember() calls. Tests inject a
-        # tmp spool dir via `eng._ingest_spool = tmp_path / "spool"`.
-        self._ingest_spool = tenant_spool_dir(
-            config.ingest_spool_root(), config.tenant)
+        # world's partition (WorldContext.ingest_spool_dir; jobs written by the
+        # SessionEnd hook via scripts/ingest_session.py) into remember() calls.
+        # Tests inject a tmp spool dir via `eng._ingest_spool = tmp_path / "spool"`.
+        self._ingest_spool = Path(self._ctx.ingest_spool_dir)
         self._ingest_thread: threading.Thread | None = None
         self._ingest_stop: threading.Event | None = None
-        # W4 按会话的自动快照：hook(session_id)，某个会话第一次写入之前调用。由 WorldManager 在
-        # 起摄入线程之前挂上（_start_workers）；没有世界管理（:memory: 等）时保持 None。
-        # 返回即可继续写入；抛 SessionSnapshotDeferred 表示这一轮没拿到管理锁、job 要放回 spool。
+        # W4 按会话的自动快照：hook(session_id)，某个会话第一次写入之前调用。由 WorldPool 在
+        # 起摄入线程之前挂上（attach_hooks）；没有注册表（:memory: 等）时保持 None。
+        # 返回即可继续写入；抛 SessionSnapshotDeferred 表示这一轮没拿到世界锁、job 要放回 spool。
         self.session_snapshot_hook = None
         # 最近一次 quiesce() 没停下的线程名（"ingest" / "tick"），供调用方在
         # ingest_busy 里点名；每次 quiesce 开头重置，所以不会读到上一轮的陈旧值。
@@ -251,6 +339,71 @@ class DashboardEngine:
         # C++ MigrationRunner。
         self._metrics_db_path = Path(self._db_path).parent / "metrics.db"
         self._metrics_retention_days = 30
+
+    # ── 世界设置 → 适配器配置（只做字段搬运；继承判定在 C++） ─────────────────
+
+    @property
+    def world(self) -> str:
+        return self._ctx.name
+
+    @property
+    def tenant(self) -> str:
+        return self._ctx.tenant
+
+    def _endpoint_cfg(self, role: str) -> dict:
+        """世界设置里 role（extraction / embedding / chat）的 endpoint → _build_*_adapter 读的 provider
+        dict。密钥按 provider_name 从 providers 取；provider_name 为空（客户端显式给的端点）时取服务
+        进程的 OPENAI_API_KEY（spec §8.3，与 make_openai_llm 一致）。没有 endpoint 返回 {}。
+        建适配器不发请求，所以这里不核对地址：核对在每次调用之前（_require_endpoint_unchanged），
+        地址改了的世界照样打开、照样能检视，只是用到那个端点的调用一律拒绝。"""
+        ep = self._settings.get(role)
+        if not ep:
+            return {}
+        cfg = {key: ep[key] for key in _ADAPTER_KEYS if key in ep}
+        name = ep.get("provider_name") or ""
+        if name:
+            key = (self._providers.get(name) or {}).get("api_key")
+        else:
+            key = os.environ.get("OPENAI_API_KEY")
+        if key:
+            cfg["api_key"] = key
+        return cfg
+
+    def _consolidation_cfg(self) -> dict:
+        resolve = getattr(self._cfg, "resolve_role", None)
+        return (resolve("consolidation") or {}) if callable(resolve) else {}
+
+    def _require_endpoint_unchanged(self, role: str) -> None:
+        """继承来的 endpoint（provider_name 非空）对 provider 的当前 base_url 做 C++ 核对
+        （world_require_endpoint_unchanged）：不同就抛 WorldStoreError("endpoint_changed")。provider
+        已被删掉时当前地址按空串算（与记下的地址不同就同样拒绝）。规则全在 C++，这里只取当前地址。"""
+        ep = self._settings.get(role)
+        if not ep or not ep.get("provider_name"):
+            return
+        current = (self._providers.get(ep["provider_name"]) or {}).get("base_url") or ""
+        _core.world_require_endpoint_unchanged(ep, current)
+
+    def _require_embedding_unchanged(self) -> None:
+        """用到嵌入的调用（召回、tick、工作集、检索规划、对话的召回段）之前调。占位嵌入（没有密钥）不发
+        请求，不核对。"""
+        if self._embedder_live:
+            self._require_endpoint_unchanged("embedding")
+
+    def set_world_settings(self, settings: dict) -> None:
+        """WorldPool.sync_default_settings 之后换上新合并的设置（默认世界）。只换引用；适配器由
+        调用方（POST /api/config）按改动的角色热换，这里不重建，与改 config 之前的行为一致。"""
+        with self._lock:
+            self._settings = settings
+
+    def _notify_commit(self) -> None:
+        """写方法成功之后通知 WorldPool（统计去抖）。回调异常只记日志：写已经成功了。"""
+        callback = self.on_commit
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 — 通知失败不能把成功的写变成失败
+            logger.exception("on_commit callback failed")
 
     # `engine.llm` stays read/write: tests and offline harnesses inject a
     # FakeLLMAdapter directly (`eng.llm = fake`).
@@ -289,7 +442,11 @@ class DashboardEngine:
         semantic similarity_threshold (0 = off) / entity_gist_enabled (1 = on) used by
         offline replay (run_idle/run_sleep). Empty/missing keys → the C++ defaults. O(1)
         value swap; the clustering + gating logic lives in the C++ core — this only
-        injects the knobs."""
+        injects the knobs. 世界设置把阈值存成 double（C++ map<string,double>），整数类的几项
+        （_INT_GIST_KEYS）在这里还原成 int：ReplayScheduler 的绑定只收整数。"""
+        thresholds = {k: (int(v) if k in _INT_GIST_KEYS and isinstance(v, float)
+                          and v.is_integer() else v)
+                      for k, v in (thresholds or {}).items()}
         with self._lock:
             self._core.gist_thresholds = {
                 k: thresholds[k]
@@ -305,6 +462,8 @@ class DashboardEngine:
         None — so the config-save handler can tell the user instead of silently
         succeeding with broken embeddings."""
         with self._lock:
+            # 带密钥 = 真适配器（会把密钥发往某个地址），之后用到嵌入的调用要先核对继承来的地址。
+            self._embedder_live = bool(emb_cfg.get("api_key"))
             emb = (_build_embed_adapter(emb_cfg) if emb_cfg.get("api_key")
                    else _core.StubEmbeddingAdapter(8))
             self._core.set_embedder(emb)
@@ -475,12 +634,17 @@ class DashboardEngine:
         取代旧 _role_override('llm', …) 的全局 slot 换入换出——拆锁后换全局
         slot 会被并发轮/后台 tick 读到错误模型(同 _resolve_chat)。"""
         if provider:
-            cfg = self._cfg.resolve_provider(provider)
+            cfg = self._providers.get(provider)
             if not cfg or not cfg.get("api_key"):
                 raise _LLMNotConfigured(
                     f"selected provider '{provider}' is not configured")
             return _build_chat_adapter(cfg)
-        return self._core.llm
+        # 用世界自己的抽取适配器：先核对继承来的地址（endpoint_changed）。没有适配器时不核对，由调用方
+        # 报 llm_not_configured（没有适配器就没有密钥会被发出去）。
+        llm = self._core.llm
+        if llm is not None:
+            self._require_endpoint_unchanged("extraction")
+        return llm
 
     def _check_clear_generation(self, generation: int) -> None:
         """代数过期（claim 之后发生了 clear_memory）抛 _TenantCleared。短暂持 self._lock 读代数。"""
@@ -523,11 +687,11 @@ class DashboardEngine:
             # 提前查一次：钩子之前已经清空过，就不必为一个注定作废的 job 拍快照。持锁块里那次
             # 才是权威的检查。
             self._check_clear_generation(generation)
-            # 锁顺序：钩子（非阻塞）取 manager.lock，它排在 engine._lock 之前，所以调钩子时不得持有
+            # 锁顺序：钩子（非阻塞）取该世界的世界锁，它排在 engine._lock 之前，所以调钩子时不得持有
             # self._lock——上面的提前检查已经放开了它，下面的持锁块在钩子返回之后才取锁。
             hook(session_id)
 
-        speaker_of = {"user": self._cfg.agent or "self",
+        speaker_of = {"user": self._ctx.agent or "self",
                       "assistant": f"claude-code:{project}"}
         listeners = sorted(set(speaker_of.values()))
         payload = [
@@ -547,7 +711,7 @@ class DashboardEngine:
         with self._lock:
             self._check_clear_generation(generation)   # RLock：同一线程重入
             out = _core.retain_source_turns(
-                self._rt.adapter, self._cfg.tenant, listeners, turns_json,
+                self._rt.adapter, self._ctx.tenant, listeners, turns_json,
                 payload[0]["observed_at"])
         return len(json.loads(out).get("engram_refs") or ())
 
@@ -574,18 +738,27 @@ class DashboardEngine:
                 text, holder=holder, interlocutor=interlocutor, now=now)
         extracted = self._core.remember_extract(bundle, llm=extraction)  # ② 锁外 LLM
         with self._lock:                                    # ③ persist + episodic + 写
-            return self._core.remember_commit(bundle, extracted, llm=extraction)
+            out = self._core.remember_commit(bundle, extracted, llm=extraction)
+        self._notify_commit()                               # 锁外：统计去抖（WorldPool）
+        return out
 
     def _resolve_chat(self, provider: str | None):
         """锁内调用:解析本轮 chat 适配器为局部引用(锁外使用)。取代旧
         _role_override('chat_llm', …) 的全局 slot 换入换出——锁外生成期间
         换 slot 会被并发轮读到错误模型。"""
         if provider:
-            cfg = self._cfg.resolve_provider(provider)
+            cfg = self._providers.get(provider)
             if not cfg or not cfg.get("api_key"):
                 raise _LLMNotConfigured(
                     f"selected provider '{provider}' is not configured")
             return _build_chat_adapter(cfg)
+        # 用世界自己的适配器：生成走 chat（没有就回退到抽取），回合末的抽取走 extraction，prepare 的
+        # 召回要嵌入查询词（embedding）。只核对这一轮真会用到的适配器。
+        if self._core.chat_llm is not None:
+            self._require_endpoint_unchanged("chat")
+        if self._core.llm is not None:
+            self._require_endpoint_unchanged("extraction")
+        self._require_embedding_unchanged()
         return self._core.chat_llm or self._core.llm
 
     def _converse_phased(self, message: str, *, on_token=None, on_status=None,
@@ -610,9 +783,12 @@ class DashboardEngine:
         gen_resp = self._core.generate_stream(                               # ② 锁外
             chat, prepared.prompt, on_token, grounded=prepared.grounded)
         with self._lock:                                    # ③ 抽取 + 写
-            return self._core.converse_commit(
+            out = self._core.converse_commit(
                 message, prepared, gen_resp, holder=holder,
                 interlocutor=interlocutor, k=k, now=now)
+        if out.get("statement_ids"):
+            self._notify_commit()
+        return out
 
     def converse(self, message: str, *, holder=None, interlocutor=None,
                  k: int = 6, now=None, provider: str | None = None) -> dict:
@@ -644,16 +820,25 @@ class DashboardEngine:
     def recall(self, query: str, *, perspective="first_person", k=10, mode="semantic",
                holder=None) -> list:
         with self._lock:
+            self._require_embedding_unchanged()   # 语义召回要嵌入查询词
             return self._core.recall(query, perspective=perspective, k=k, mode=mode,
                                      holder=holder)
 
     def tick(self, now: str) -> dict:
+        """后台维护一轮。嵌入阶段走 embedding 端点，先核对继承来的地址（占位嵌入不核对）。做了事（任一计数非零）
+        就通知一次 on_commit（与 _loop 的 did_work 同一判据）。"""
         with self._lock:
-            return self._core.tick(now)
+            self._require_embedding_unchanged()
+            stats = self._core.tick(now)
+        if _tick_did_work(stats):
+            self._notify_commit()
+        return stats
 
     def forget(self, ids, *, now=None) -> dict:
         with self._lock:
-            return self._core.forget(ids, now=now)
+            out = self._core.forget(ids, now=now)
+        self._notify_commit()
+        return out
 
     def clear_memory(self, *, confirm: str) -> dict:
         """设置页「危险区」:物理清空当前租户的全部记忆(保留 self 认知体),并把该
@@ -664,7 +849,7 @@ class DashboardEngine:
         worker 的 claim 也在这把锁内快照代数(见 _ingest_drain_once),所以任何 job
         要么在清空前被 claim(代数不符 → 作废),要么已被这里移走,不会把清空前排队
         的旧会话重新灌回来。"""
-        if confirm != self._cfg.tenant:
+        if confirm != self._ctx.tenant:
             raise ClearConfirmMismatch("confirm_mismatch")
         with self._lock:
             # 先清库:写门关闭时核心抛 WriteGateRejected,此时代数与 spool 都不动,
@@ -672,7 +857,8 @@ class DashboardEngine:
             out = self._core.clear_tenant()
             self._clear_generation += 1
             out["spool_discarded"] = self._ingest_discard_pending()
-        out["tenant"] = self._cfg.tenant
+        out["tenant"] = self._ctx.tenant
+        self._notify_commit()
         return out
 
     # 片 6 干预集:全经 self._lock 串行(对单写者 + 后台 tick)。
@@ -705,6 +891,7 @@ class DashboardEngine:
                    target=None, k: int = 10) -> dict:
         """P3.a1 检索规划(9 意图 + 8 标签 + 拒答);JSON-able 摘要给路由层。"""
         with self._lock:
+            self._require_embedding_unchanged()   # 规划里的语义召回要嵌入查询词
             r = self._core.plan_query(text, intent=intent,
                                       perspective=perspective, target=target, k=k)
             rc = r.receipt
@@ -820,8 +1007,7 @@ class DashboardEngine:
                 # stage_timings_ms is always present (9 entries) and stages_skipped is
                 # non-empty under DEGRADED — exclude both from the work-check, else
                 # every idle DEGRADED tick spuriously fires a WS heartbeat (3b L8).
-                did_work = any(v for k, v in stats.items()
-                               if k not in ("stage_timings_ms", "stages_skipped"))
+                did_work = _tick_did_work(stats)
                 if on_tick is not None and did_work:
                     try:
                         on_tick(stats)
@@ -920,7 +1106,7 @@ class DashboardEngine:
                 job = json.loads(job_path.read_text())
             except Exception:  # noqa: BLE001 — 损坏的 job 也在本分区,一并移走
                 job = None
-            if isinstance(job, dict) and "tenant" in job and job.get("tenant") != self._cfg.tenant:
+            if isinstance(job, dict) and "tenant" in job and job.get("tenant") != self._ctx.tenant:
                 continue
             (sp / "discarded").mkdir(exist_ok=True)
             try:
@@ -1014,7 +1200,7 @@ class DashboardEngine:
             except Exception:
                 candidate_job = None
             if (candidate_job is None or "tenant" not in candidate_job
-                    or candidate_job.get("tenant") == self._cfg.tenant):
+                    or candidate_job.get("tenant") == self._ctx.tenant):
                 job_path = candidate
                 break
         if job_path is None:
@@ -1034,7 +1220,7 @@ class DashboardEngine:
             job = json.loads(claimed.read_text())
         except Exception:                           # noqa: BLE001 — 损坏的 job 文件按空 job 处理,下方统一走有界重试
             job = {}
-        if "tenant" in job and job.get("tenant") != self._cfg.tenant:
+        if "tenant" in job and job.get("tenant") != self._ctx.tenant:
             claimed.rename(job_path)
             return "deferred"
         try:
@@ -1047,7 +1233,7 @@ class DashboardEngine:
             # 写入以配置为准、而非以 lane 是否生效为准：原文是记忆本身，不该因为
             # 一时配错了 embedder 就丢掉。未生效时 source_unit_vectors 留 pending，
             # 换回标定模型后 worker 会补嵌入（模型变更的行由 worker 重置）。
-            if getattr(self._cfg, "source_lane_enabled", False):
+            if self._settings["source_lane"]["enabled"]:
                 self._retain_transcript_turns(
                     lines, job=job, project=project, generation=generation)
             chunks = chunk_dialogue(clean_turns(lines))
@@ -1069,9 +1255,12 @@ class DashboardEngine:
                     f"more of {len(chunks)} chunk(s)")
             (sp / "done").mkdir(exist_ok=True)
             claimed.rename(sp / "done" / job_path.name)
+            # 摄入一个 job 算一次提交（来源通道的写入不经 remember，不会自己通知）。每块 remember 也各
+            # 通知一次，WorldPool 按世界去抖，多发几次无害。
+            self._notify_commit()
             return "done"
         except SessionSnapshotDeferred:
-            # 按会话的自动快照这一轮没拿到 manager.lock（切换、回滚、手动快照正持着它）。钩子在任何
+            # 按会话的自动快照这一轮没拿到该世界的世界锁（恢复、关闭、手动快照正持着它）。钩子在任何
             # 写入之前调用，这个 job 什么都没写：原样放回 spool，不计 attempts（不是失败），下一轮再来。
             # 钩子期间若发生了清空，放回就会把清空前的会话重新灌回来：改进 discarded/（整支审查 I-1）。
             return self._requeue_unless_cleared(claimed, job_path, generation)
@@ -1168,6 +1357,7 @@ class DashboardEngine:
     def working_set(self, interlocutor, *, goal=None, token_budget=2000, holder=None) -> dict:
         """Like Memory.render_working_set but returns a JSON-able dict (API shape)."""
         with self._lock:
+            self._require_embedding_unchanged()   # relevant_memories 走语义召回
             cb = self._core.build_working_set(interlocutor, goal=goal,
                                               token_budget=token_budget, holder=holder)
             return {"render": cb.render(),
@@ -1184,7 +1374,7 @@ class DashboardEngine:
         lane 静默不工作，这里把原因摆出来，免得「开了却没用」无从察觉。"""
         with self._lock:
             core = self._core
-            return {"configured": bool(getattr(self._cfg, "source_lane_enabled", False)),
+            return {"configured": bool(self._settings["source_lane"]["enabled"]),
                     "active": core.source_lane is not None,
                     "inactive_reason": core.source_lane_inactive_reason}
 

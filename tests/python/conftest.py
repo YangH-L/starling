@@ -38,7 +38,8 @@ def isolate_dashboard_ingest_spool(tmp_path, monkeypatch):
     """Dashboard tests must never inspect or mutate the user's live spool
     (nor write a worlds registry into the user's real ~/.starling)."""
     monkeypatch.setenv("STARLING_DASH_INGEST_SPOOL", str(tmp_path / "ingest-spool"))
-    monkeypatch.setenv("STARLING_WORLDS_REGISTRY", str(tmp_path / "worlds.json"))
+    # 注册表（registry.db）与新世界目录都在数据目录下（裁定 R5）。
+    monkeypatch.setenv("STARLING_DATA_DIR", str(tmp_path / "data"))
 
 
 @pytest.fixture
