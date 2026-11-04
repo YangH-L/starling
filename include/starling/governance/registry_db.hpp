@@ -93,9 +93,9 @@ public:
     // 额外核对（例如继承来的 endpoint 地址没变，spec §8.3）。错误码与对应的写方法相同（world_not_found、
     // invalid_settings 等）。预演与随后的写不在同一次持锁内：调用方要求结果不变时自己串行化（WorldPool 持
     // 该世界的世界锁）。
-    std::string preview_world_settings(const std::string& name,
-                                       const std::string& overrides_json) const;
-    std::string preview_new_world_settings(const std::string& overrides_json) const;
+    [[nodiscard]] std::string preview_world_settings(const std::string& name,
+                                                     const std::string& overrides_json) const;
+    [[nodiscard]] std::string preview_new_world_settings(const std::string& overrides_json) const;
     // 权威来源同步（裁定 R27）：world_settings.hpp replace_sections（出现的段整段替换、background 逐叶合并、
     // null 清除），读—替换—写在一次持锁内。只读世界同样强制关后台。返回新的 settings_json。world_not_found；
     // sections 非法时什么都不写。
