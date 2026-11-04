@@ -5,10 +5,12 @@ import asyncio
 import hmac
 import logging
 import os
+import threading
 import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from anyio import to_thread
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -16,6 +18,7 @@ from fastapi.responses import FileResponse
 from starling import _core
 from starling.dashboard.auth import make_require_token
 from starling.dashboard.config import DashboardConfig
+from starling.dashboard.routes.world_scope import lease_off_loop
 from starling.dashboard.world_manager import EngineFactory, WorldPool, WorldSwitchError
 
 logger = logging.getLogger(__name__)
@@ -106,14 +109,16 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         mgr = app.state.ws_manager
         pool.on_tick = mgr.bridge(loop, "tick")
         pool.on_world_changed = mgr.bridge(loop, "world_changed")
-        # P2.o 运行时闭环：默认世界的引擎在此即建（tick_interval_s=0 时不建，与之前一样），闭环从进程
-        # 启动起就在转，库与 schema 也从启动起就在（检视路由只读打开库）。lifespan 只在 ASGI 服务器 /
-        # `with TestClient` 下运行；直接构造 TestClient(app) 的测试不建引擎、不起线程。
-        # 只取一下租约：lifespan 在 yield 处挂起期间局部变量一直活着，不能留着引擎的引用。
-        if config.tick_interval_s > 0:
-            pool.lease(pool.default_world()).release()
-        # 每个开着的世界按自己的 settings.background 起 tick 与摄入线程（摄入独立于 tick：关掉维护 tick
-        # 不连带禁掉摄入），此后新打开的世界也起；再起按时间的自动快照调度与 30 秒统计刷新（有注册表时）。
+        # 默认世界的引擎在此即建，不论 tick_interval_s（裁定 R33，与改之前的生产启动一致）：库与 schema
+        # 从启动起就在（检视路由只读打开库），摄入从启动起就在收本机 hook 投递的会话。lifespan 只在 ASGI
+        # 服务器 / `with TestClient` 下运行；直接构造 TestClient(app) 的测试不建引擎、不起线程。
+        # 只取一下租约：lifespan 在 yield 处挂起期间局部变量一直活着，不能留着引擎的引用。建引擎（首次
+        # 打开取世界锁）在工作线程里做，同 lease_off_loop。
+        default = pool.default_world()
+        await to_thread.run_sync(lambda: pool.lease(default).release())
+        # 每个开着的世界按自己的 settings.background 起线程：tick 只在 tick_interval_s > 0 时起，摄入按
+        # background.ingest（与 tick 无关：关掉维护 tick 不连带禁掉摄入）；此后新打开的世界也起。再起按
+        # 时间的自动快照调度与 30 秒统计刷新（有注册表时）。
         pool.start_background()
         yield
         # D-P2-6 关停顺序：先让每个开着的世界进 DRAINING（写门转为拒绝；在 yield 之后做，不用信号处理器，
@@ -129,6 +134,10 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
     app = FastAPI(title="Starling Dashboard", version="0.1.0", lifespan=lifespan)
     app.state.config = config
     app.state.pool = pool
+    # 写配置的路由（POST /api/config、DELETE /api/config/provider）彼此串行（见 routes/config.py）。线程锁，
+    # 只在工作线程里取：事件循环上的锁（asyncio / anyio）不能跨事件循环唤醒等待者，而不进 lifespan 的
+    # TestClient 每个请求各起一个事件循环。
+    app.state.config_lock = threading.Lock()
 
     if config.cors_origins:
         app.add_middleware(
@@ -231,19 +240,24 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
             k = 6
 
         # 本轮持该世界的一份引擎租约（按轮，不按连接：长连接在两轮之间不挡关闭与恢复）。世界不存在、
-        # 正在关闭或恢复时拒绝，给前端一个可识别的错误帧（码同 HTTP 的 detail）。租约在工作线程里、
-        # 引擎用完的那一刻归还（见 run_blocking），协程被取消也不会提前放走仍在跑的这一轮。
+        # 正在关闭或恢复时拒绝，给前端一个可识别的错误帧（码同 HTTP 的 detail）。租约在工作线程里取
+        # （裁定 R32：首次打开要等世界锁，事件循环不等），在工作线程里、引擎用完的那一刻归还（见
+        # run_blocking），协程被取消也不会提前放走仍在跑的这一轮。
         world = world or pool.default_world()          # 缺省或空串：默认世界
         try:
-            lease = pool.lease(world)
+            lease = await lease_off_loop(pool, world)
         except WorldSwitchError as exc:
             await ws.send_json({"type": "error", "error": exc.code})
             await ws.close()
             return
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
-        done = object()
-        box: dict = {}
+        try:
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue = asyncio.Queue()
+            done = object()
+            box: dict = {}
+        except BaseException:
+            lease.release()
+            raise
 
         def on_token(delta: str) -> None:
             # Runs on the C++ worker thread (binding re-acquires the GIL per

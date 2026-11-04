@@ -18,7 +18,7 @@ from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from starling.dashboard.routes.world_scope import world_name
+from starling.dashboard.routes.world_scope import lease_off_loop, world_name
 
 
 def _now_iso() -> str:
@@ -90,10 +90,11 @@ async def _engine(request: Request, world: str = Depends(world_name)):
     世界不存在 → 404 world_not_found；正在关闭、恢复、删除 → 503 world_busy（world_scope 的异常处理器）：
     关闭与恢复要等在途租约全部归还才丢引擎，窗口里的新请求不能再拿到旧引擎。
 
-    取租约与进入 try 之间不能有 await：任务在那里被取消，租约就永远不归还，此后关闭、恢复这个世界都会
-    等满超时回 world_busy。所以同步取（首次打开世界的构建在事件循环上做，与旧实现的惰性构建一样）。
+    租约在工作线程里取（裁定 R32，world_scope.lease_off_loop）：世界没开着时要取它的世界锁建引擎，世界锁
+    可能被快照、清理归档占着，事件循环不能等它。取到之后立刻进 try（await 返回与 try 之间没有检查点），
+    请求被取消也照样归还；取的途中被取消，由 lease_off_loop 归还线程随后拿到的租约。
     """
-    lease = request.app.state.pool.lease(world)
+    lease = await lease_off_loop(request.app.state.pool, world)
     try:
         yield lease.engine
     finally:

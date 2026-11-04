@@ -119,3 +119,34 @@ def test_reembed_provider_error_is_non_fatal(ctx, monkeypatch):
     monkeypatch.setattr(eng._core, "worker", _RaisingWorker())
     warn = eng._reembed()   # must return normally, not raise
     assert warn and "embedding" in warn.lower()   # surfaced as a warning, not swallowed silently
+
+
+@pytest.mark.parametrize("gist", [{"min_holders": "abc"}, {"entity_gist_enabled": True}])
+def test_invalid_settings_rejected_before_anything_is_written(tmp_path, monkeypatch, gist):
+    """裁定 R31：C++ 校验不过的设置先校验、后写盘。回 400 invalid_settings；starling.json 逐字节不变，
+    内存里的 config 不变（同一请求里一并给的 provider 与角色绑定也回滚）；用这个文件重新启动照常。"""
+    import copy
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfgfile = tmp_path / "starling.json"
+    cfg = DashboardConfig(db_path=str(tmp_path / "c.db"), token="", tick_interval_s=0,
+                          config_path=str(cfgfile), gist_thresholds={"min_holders": 3})
+    cfg.save()
+    before = cfgfile.read_bytes()
+    snapshot = copy.deepcopy(cfg.to_dict())
+    client = TestClient(create_app(cfg))
+    r = client.post("/api/config", json={
+        "providers": {"p2": {"provider": "openai", "model": "m", "api_key": "sk-new"}},
+        "roles": {"extraction": "p2"},
+        "gist_thresholds": gist})
+    assert (r.status_code, r.json()) == (400, {"detail": "invalid_settings"})
+    assert cfgfile.read_bytes() == before
+    assert cfg.to_dict() == snapshot
+    assert client.get("/api/config").json()["gist_thresholds"] == {"min_holders": 3}
+    # 用这个文件重新启动：create_app 同步默认世界的设置不报 invalid_settings。load 在文件里没有 token
+    # 时会生成一个（并写回），请求带上它。
+    reloaded = DashboardConfig.load(str(cfgfile))
+    with TestClient(create_app(reloaded)) as restarted:
+        auth = {"Authorization": f"Bearer {reloaded.token}"}
+        assert restarted.get("/api/overview", headers=auth).status_code == 200
+        assert restarted.get("/api/config", headers=auth).json()["gist_thresholds"] == {
+            "min_holders": 3}

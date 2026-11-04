@@ -10,12 +10,24 @@ the embedding provider triggers a re-embed (expensive). GET never leaks keys.
 config 是默认世界设置的权威来源（记忆服务第 1 期，裁定 R27）：保存之后经 pool.sync_default_settings()
 把它整段替换进注册表里默认世界的设置，开着的默认世界引擎随之换上新设置；适配器仍由这里按改动的角色
 热换。这些路由只作用于默认世界（只挂在 /api 下）。
+
+改动先过 C++ 校验再落盘（裁定 R31）：校验不过就把内存里的 config 恢复原样、回 400 invalid_settings，
+starling.json 与注册表都不动（否则坏值落了盘，下次启动同步默认世界时就起不来）。
+
+写配置的两个路由整段在一个工作线程里做完（裁定 R30）：取租约、改 config、校验、落盘、同步、热换适配器、
+还租约。同步与热换要取默认世界引擎的锁，tick、对话、回放可能持着它几秒到几十秒，事件循环不能等。两个
+写请求彼此串行（app.state.config_lock，线程锁，只在工作线程里取）：改 config 与落盘之间若有别的请求插进来，
+两份改动会交错，校验失败时的恢复也会盖掉对方的改动。
 """
 from __future__ import annotations
+
+import copy
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+
+from starling import _core
 
 
 class ProviderFields(BaseModel):
@@ -87,24 +99,69 @@ def _merge_provider(dst: dict, body: ProviderFields) -> None:
         dst["enable_thinking"] = body.enable_thinking
 
 
-def _persist(request: Request, cfg, eng) -> None:
-    """写 starling.json（config 里没有活动世界了，db_path/tenant 就是默认世界的），再把默认世界的设置
-    同步成新的 config（C++ 整段替换，开着的默认世界引擎换上新设置）。没有注册表（:memory: 等，裁定 R6）
-    时默认世界的设置每次都由 config 现推，开着的引擎直接换上推出来的设置。"""
+# 这些路由改动的 config 字段：校验失败时按这份清单恢复。
+_EDITED_FIELDS = ("providers", "roles", "gist_thresholds")
+
+
+def _snapshot(cfg) -> dict:
+    return {name: copy.deepcopy(getattr(cfg, name)) for name in _EDITED_FIELDS}
+
+
+def _restore(cfg, saved: dict) -> None:
+    """把改动的字段恢复成快照。providers 与 roles 原地恢复：引擎（及引擎池建引擎时）持有的是同一个
+    providers dict（裁定 R17），换成新对象的话引擎就看不到之后的改动。"""
+    for name in ("providers", "roles"):
+        live = getattr(cfg, name)
+        live.clear()
+        live.update(saved[name])
+    cfg.gist_thresholds = saved["gist_thresholds"]
+
+
+def _validate(cfg) -> None:
+    """让 C++ 校验 config 推出的默认世界设置（world_effective_settings 与同步用的整段替换走同一套
+    apply_settings 规则），不写任何东西。不合法 → WorldStoreError(invalid_settings)。"""
+    _core.world_effective_settings(cfg.world_settings())
+
+
+def _persist(pool, cfg, eng) -> None:
+    """工作线程里调用。写 starling.json（config 里没有活动世界了，db_path/tenant 就是默认世界的），再把默认
+    世界的设置同步成新的 config（C++ 整段替换，开着的默认世界引擎换上新设置，要取引擎锁）。没有注册表
+    （:memory: 等，裁定 R6）时默认世界的设置每次都由 config 现推，开着的引擎直接换上推出来的设置。"""
     cfg.save()
-    pool = request.app.state.pool
     if pool.registry is not None:
         pool.sync_default_settings()
     elif eng is not None:
         eng.set_world_settings(pool.context(pool.default_world()).settings)
 
 
-def _lease(request: Request):
-    """热更新要在同一个引擎上做完（改 config、落盘、同步设置、换适配器）：持默认世界的一份租约。正在关闭
-    → 503 world_busy（world_scope 的异常处理器）。先取租约再动 config，被拒时什么都没改。不建引擎：默认
-    世界没开着时只改 config 与注册表里的设置，引擎建出来时自然读到新设置。"""
-    pool = request.app.state.pool
-    return pool.lease(pool.default_world(), build=False)
+def _commit(pool, cfg, saved: dict, eng) -> None:
+    """校验 → 落盘 → 同步。校验不过：恢复 config，抛 WorldStoreError（world_scope 的异常处理器回 400
+    invalid_settings），什么都没写。"""
+    try:
+        _validate(cfg)
+    except _core.WorldStoreError:
+        _restore(cfg, saved)
+        raise
+    _persist(pool, cfg, eng)
+
+
+async def _write_config(request: Request, edit):
+    """在工作线程里持 config_lock 与默认世界的一份租约跑 edit(cfg, pool, eng)，返回它的结果。热更新要在同一个
+    引擎上做完（改 config、落盘、同步设置、换适配器）。默认世界正在关闭 → 503 world_busy（world_scope 的
+    异常处理器），先取租约再动 config，被拒时什么都没改。不建引擎：默认世界没开着时只改 config 与注册表里的
+    设置，引擎建出来时自然读到新设置。工作线程跑完整段才返回（to_thread 不丢下线程）：请求被取消也照样
+    还租约、放锁。"""
+    state = request.app.state
+
+    def run():
+        with state.config_lock:
+            pool = state.pool
+            with pool.lease(pool.default_world(), build=False) as eng:
+                try:
+                    return edit(state.config, pool, eng)
+                finally:
+                    eng = None
+    return await to_thread.run_sync(run)
 
 
 def build_config_router(require_token) -> APIRouter:
@@ -116,17 +173,17 @@ def build_config_router(require_token) -> APIRouter:
 
     @router.post("/config")
     async def post_config(body: ConfigBody, request: Request):
-        with _lease(request) as eng:
-            return await _post_config(body, request, eng)
+        return await _write_config(request, lambda cfg, pool, eng: _post_config(body, cfg, pool, eng))
 
-    async def _post_config(body: ConfigBody, request: Request, eng):
-        cfg = request.app.state.config
+    def _post_config(body: ConfigBody, cfg, pool, eng):
+        saved = _snapshot(cfg)
         # Upsert providers (preserve stored keys on blank-key edits).
         for name, pf in (body.providers or {}).items():
             _merge_provider(cfg.providers.setdefault(name, {}), pf)
         # Bind roles (validate target provider exists).
         for role, name in (body.roles or {}).items():
             if name and name not in cfg.providers:
+                _restore(cfg, saved)                 # 同一请求里已经改了的 provider 也撤回
                 raise HTTPException(status_code=400, detail=f"unknown provider: {name}")
             cfg.roles[role] = name
         # #38-C v2 threshold surface: persist the gist knobs ({} resets to defaults).
@@ -137,7 +194,7 @@ def build_config_router(require_token) -> APIRouter:
                           "similarity_threshold", "entity_gist_enabled")
                 if body.gist_thresholds.get(k) is not None
             }
-        _persist(request, cfg, eng)                  # starling.json (0600) + 默认世界的设置
+        _commit(pool, cfg, saved, eng)               # 校验 → starling.json (0600) → 默认世界的设置
         # Hot-swap only the live roles whose resolved provider changed: a role
         # was (re)bound, or its currently-bound provider was edited.
         touched_providers = set(body.providers or {})
@@ -146,24 +203,22 @@ def build_config_router(require_token) -> APIRouter:
             return role in rebound or cfg.roles.get(role) in touched_providers
         warnings: list[str] = []
         if eng is not None:
-            def _apply() -> None:
-                if _affected("extraction"):
-                    eng.set_llm(cfg.resolve_role("extraction") or {})
-                # chat: rebound/edited, or unbound-and-extraction-changed (chat
-                # falls back to the extraction provider).
-                if _affected("chat") or (not cfg.roles.get("chat") and _affected("extraction")):
-                    eng.set_chat(cfg.chat() or {})
-                if _affected("embedding"):
-                    # rebuild + re-embed; a rejected embedding provider returns a
-                    # warning (non-fatal — the save still succeeds) instead of 500.
-                    warn = eng.rebuild_embedder(cfg.embedding() or {})
-                    if warn:
-                        warnings.append(warn)
-                if _affected("consolidation"):                    # #38-C consolidation role
-                    eng.set_consolidation(cfg.resolve_role("consolidation") or {})
-                if body.gist_thresholds is not None:              # #38-C v2 threshold surface
-                    eng.set_gist_thresholds(cfg.gist_thresholds)
-            await to_thread.run_sync(_apply)
+            if _affected("extraction"):
+                eng.set_llm(cfg.resolve_role("extraction") or {})
+            # chat: rebound/edited, or unbound-and-extraction-changed (chat
+            # falls back to the extraction provider).
+            if _affected("chat") or (not cfg.roles.get("chat") and _affected("extraction")):
+                eng.set_chat(cfg.chat() or {})
+            if _affected("embedding"):
+                # rebuild + re-embed; a rejected embedding provider returns a
+                # warning (non-fatal — the save still succeeds) instead of 500.
+                warn = eng.rebuild_embedder(cfg.embedding() or {})
+                if warn:
+                    warnings.append(warn)
+            if _affected("consolidation"):                    # #38-C consolidation role
+                eng.set_consolidation(cfg.resolve_role("consolidation") or {})
+            if body.gist_thresholds is not None:              # #38-C v2 threshold surface
+                eng.set_gist_thresholds(cfg.gist_thresholds)
         result = _public(cfg)
         if warnings:
             result["warnings"] = warnings
@@ -171,28 +226,26 @@ def build_config_router(require_token) -> APIRouter:
 
     @router.delete("/config/provider/{name}")
     async def delete_provider(name: str, request: Request):
-        with _lease(request) as eng:
-            return await _delete_provider(name, request, eng)
+        return await _write_config(request,
+                                   lambda cfg, pool, eng: _delete_provider(name, cfg, pool, eng))
 
-    async def _delete_provider(name: str, request: Request, eng):
-        cfg = request.app.state.config
+    def _delete_provider(name: str, cfg, pool, eng):
+        saved = _snapshot(cfg)
         cfg.providers.pop(name, None)
         # Unbind any role pointing at the removed provider, then hot-swap it off.
         unbound = [r for r, n in cfg.roles.items() if n == name]
         for r in unbound:
             cfg.roles[r] = ""
-        _persist(request, cfg, eng)
+        _commit(pool, cfg, saved, eng)
         if eng is not None and unbound:
-            def _apply() -> None:
-                if "extraction" in unbound:
-                    eng.set_llm({})            # → None (remember will 409 until rebound)
-                if "chat" in unbound or "extraction" in unbound:
-                    eng.set_chat(cfg.chat() or {})   # re-resolve (may fall back / go None)
-                if "embedding" in unbound:
-                    eng.rebuild_embedder({})   # → stub (recall degraded)
-                if "consolidation" in unbound:
-                    eng.set_consolidation({})  # → None (offline replay falls back to deterministic)
-            await to_thread.run_sync(_apply)
+            if "extraction" in unbound:
+                eng.set_llm({})            # → None (remember will 409 until rebound)
+            if "chat" in unbound or "extraction" in unbound:
+                eng.set_chat(cfg.chat() or {})   # re-resolve (may fall back / go None)
+            if "embedding" in unbound:
+                eng.rebuild_embedder({})   # → stub (recall degraded)
+            if "consolidation" in unbound:
+                eng.set_consolidation({})  # → None (offline replay falls back to deterministic)
         return _public(cfg)
 
     @router.post("/config/test")

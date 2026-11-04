@@ -52,7 +52,16 @@ class ConnectionManager:
     def bridge(self, loop: asyncio.AbstractEventLoop,
                kind: str) -> Callable[[str, dict], None]:
         """引擎池线程（后台 tick、统计去抖计时器、摄入线程）→ 事件循环的桥：返回 callback(world, payload)，
-        把一条 kind 消息交给 loop 去广播，不等它发完（池的线程不能被慢 socket 拖住）。"""
+        把一条 kind 消息交给 loop 去广播，不等它发完（池的线程不能被慢 socket 拖住）。
+
+        起线程时线程就捕获了这个回调，关停之后它仍可能被调用：loop 已关就直接丢掉这条消息；投递时 loop
+        恰好关掉（RuntimeError）就关掉还没开始的协程，不抛、不留下没 await 的协程。"""
         def callback(world: str, payload: dict) -> None:
-            asyncio.run_coroutine_threadsafe(self.broadcast_world(kind, world, payload), loop)
+            if loop.is_closed():
+                return
+            coro = self.broadcast_world(kind, world, payload)
+            try:
+                asyncio.run_coroutine_threadsafe(coro, loop)
+            except RuntimeError:
+                coro.close()
         return callback

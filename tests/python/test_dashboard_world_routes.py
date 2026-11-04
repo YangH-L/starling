@@ -238,7 +238,13 @@ def _build_and_discard(tmp_path, monkeypatch, index: int, shape: str):
         app = create_app(cfg, engine=DashboardEngine(cfg))
     else:
         app = create_app(cfg, engine_factory=_stub_factory)
-    pool_ref = weakref.ref(app.state.pool)
+    pool = app.state.pool
+    pool_ref = weakref.ref(pool)
+
+    def runtime_ref():
+        with pool.lease("default", build=False) as engine:
+            return weakref.ref(engine._rt) if engine is not None else None
+
     if shape == "lifespan":
         with TestClient(app) as test_client:
             _remember(test_client, "/api")
@@ -247,16 +253,16 @@ def _build_and_discard(tmp_path, monkeypatch, index: int, shape: str):
             with test_client.websocket_connect("/ws/converse") as ws:
                 ws.send_json({"message": ""})
                 ws.receive_json()
+            rt_ref = runtime_ref()               # 关停之前取：关停会关掉默认世界
+            assert rt_ref is not None and rt_ref() is not None
+        assert pool.open_worlds() == []
     else:
         test_client = TestClient(app)
         assert test_client.get("/health").status_code == 200
         assert test_client.post("/api/tick", json={}).status_code == 200
-    with app.state.pool._lock:
-        engine = app.state.pool._engines.get("default")
-        rt_ref = weakref.ref(engine._rt) if engine is not None else None
-    engine = None
-    if shape == "lifespan":
-        assert rt_ref is None                    # 关停已关掉默认世界；Runtime 在下面一并确认已回收
+        rt_ref = runtime_ref()
+        assert rt_ref is not None and rt_ref() is not None
+    pool = None
     return pool_ref, rt_ref
 
 
@@ -267,5 +273,122 @@ def test_discarded_apps_release_pool_and_runtime(tmp_path, monkeypatch, shape):
     gc.collect()
     for pool_ref, rt_ref in refs:
         assert pool_ref() is None, "丢掉的 app 的引擎池还活着"
-        if rt_ref is not None:
-            assert rt_ref() is None, "丢掉的 app 的默认世界 Runtime 还活着（C++ 写连接没释放）"
+        assert rt_ref() is None, "丢掉的 app 的默认世界 Runtime 还活着（C++ 写连接没释放）"
+
+
+# ───────────────────────── 事件循环不等世界锁、引擎锁（裁定 R30、R32） ─────────────────────────
+
+def _health_latency(client, during) -> tuple[float, object]:
+    """during() 在另一个线程里跑（它会卡住某个请求）；这期间测一次 GET /health 的耗时。返回
+    (健康检查耗时, during 的返回值)。"""
+    import threading
+    import time
+    out = {}
+
+    def run():
+        out["result"] = during()
+    worker = threading.Thread(target=run)
+    worker.start()
+    time.sleep(0.3)                            # 让被卡住的请求进到等锁的那一步
+    started = time.monotonic()
+    assert client.get("/health").status_code == 200
+    latency = time.monotonic() - started
+    worker.join(timeout=30)
+    assert not worker.is_alive()
+    return latency, out.get("result")
+
+
+def _hold(lock, seconds: float):
+    """在另一个线程里持 lock seconds 秒（模拟世界锁内的快照 / 引擎锁内的 tick）。"""
+    import threading
+    import time
+    held = threading.Event()
+
+    def run():
+        with lock:
+            held.set()
+            time.sleep(seconds)
+    holder = threading.Thread(target=run)
+    holder.start()
+    assert held.wait(5)
+    return holder
+
+
+def test_first_open_waits_for_the_world_lock_off_the_event_loop(client):
+    """裁定 R32：关着的世界第一次被命令路由打开时要取世界锁建引擎；世界锁被快照占着时，等锁在工作线程
+    里，事件循环照常响应别的请求；锁放开后命令照常成功。"""
+    pool = _pool(client)
+    pool.create_world("w1", "")
+    holder = _hold(pool._world_lock("w1"), 2.0)
+    latency, resp = _health_latency(client, lambda: client.post("/api/w/w1/tick", json={}))
+    holder.join()
+    assert latency < 0.3, f"GET /health 等了 {latency:.2f}s：事件循环在等 w1 的世界锁"
+    assert resp.status_code == 200, resp.text
+    assert "w1" in pool.open_worlds()
+
+
+def test_ws_converse_first_open_waits_off_the_event_loop(client):
+    pool = _pool(client)
+    pool.create_world("w1", "")
+    holder = _hold(pool._world_lock("w1"), 2.0)
+
+    def converse():
+        with client.websocket_connect("/ws/converse") as ws:
+            ws.send_json({"message": "who owns auth?", "world": "w1"})
+            while (msg := ws.receive_json())["type"] in ("token", "status"):
+                pass
+            return msg
+    latency, msg = _health_latency(client, converse)
+    holder.join()
+    assert latency < 0.3, f"GET /health 等了 {latency:.2f}s：/ws/converse 在事件循环上等世界锁"
+    assert msg["type"] == "done", msg
+
+
+def test_post_config_waits_for_the_engine_lock_off_the_event_loop(client):
+    """裁定 R30：保存配置要换默认世界引擎的设置（取引擎锁）。tick 等长调用持着引擎锁时，等锁在工作线程
+    里，事件循环照常响应。"""
+    pool = _pool(client)
+    with pool.lease("default", build=False) as eng:
+        holder = _hold(eng._lock, 2.0)
+    eng = None
+    latency, resp = _health_latency(
+        client, lambda: client.post("/api/config", json={"gist_thresholds": {"min_holders": 4}}))
+    holder.join()
+    assert latency < 0.3, f"GET /health 等了 {latency:.2f}s：POST /api/config 在事件循环上等引擎锁"
+    assert resp.status_code == 200, resp.text
+
+
+# ───────────────────────── 默认世界在启动时即开（裁定 R33） ─────────────────────────
+
+def test_default_world_opens_at_startup_even_without_tick(tmp_path):
+    """tick_interval_s=0 的全新安装：启动后默认世界已开、摄入线程在跑、没有维护 tick，旧路径检视照常 200。"""
+    cfg = DashboardConfig(db_path=str(tmp_path / "dashboard.db"), token="", tick_interval_s=0,
+                          source_lane_enabled=False, ingest_spool_path=str(tmp_path / "spool"))
+    app = create_app(cfg)
+    pool = app.state.pool
+    with TestClient(app) as test_client:
+        assert pool.open_worlds() == ["default"]
+        with pool.lease("default", build=False) as eng:
+            ingest, tick = eng._ingest_thread, eng._tick_thread
+        eng = None
+        assert ingest is not None and ingest.is_alive()
+        assert tick is None
+        assert test_client.get("/api/overview").status_code == 200
+        assert test_client.get("/api/runtime_health").status_code == 200
+        assert test_client.get("/api/ingest_status").status_code == 200
+    assert not ingest.is_alive()
+
+
+# ───────────────────────── 关停之后的广播桥 ─────────────────────────
+
+def test_bridge_after_the_loop_closed_is_a_quiet_no_op(recwarn):
+    """后台线程在起线程时捕获了广播回调；事件循环关掉之后它再调，不抛、不留下没 await 的协程。"""
+    import asyncio
+    import gc
+    from starling.dashboard.realtime import ConnectionManager
+    loop = asyncio.new_event_loop()
+    callback = ConnectionManager().bridge(loop, "tick")
+    loop.close()
+    callback("default", {"fired": 0})
+    gc.collect()
+    assert not [w for w in recwarn if "was never awaited" in str(w.message)]
