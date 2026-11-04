@@ -51,6 +51,7 @@ struct WorldSettings {
     std::optional<EndpointSettings> extraction;
     std::optional<EndpointSettings> embedding;
     std::optional<EndpointSettings> chat;
+    std::optional<EndpointSettings> consolidation;  // 裁定 R25：离线回放里判 NORM gist 的模型
     std::string vector_backend = "sqlite";
     SourceLaneSettings source_lane;
     std::map<std::string, double> gist_thresholds;
@@ -62,11 +63,15 @@ struct WorldSettings {
 // vector_backend 不是 "sqlite" 报 snapshot_unsupported_backend；background.auto_snapshot.interval_hours
 // 不在 0–8760 报 invalid_auto_snapshot（与 set_auto_snapshot 同码；validate_world 拒绝的值因此存不进
 // 注册表）。"{}" 得到全默认值。
+// 清除（裁定 R24）：extraction / embedding / chat / consolidation 的值为 JSON null 时删掉该 endpoint，
+// gist_thresholds 为 null 时重置为 {}。只有这五个键收 null，其余位置的 null 仍是 invalid_settings。
 WorldSettings settings_from_json(const std::string& text);
-// 序列化：可选字段（max_retries / enable_thinking / 三个 endpoint）未设置时不写出。
+// 序列化：可选字段（max_retries / enable_thinking / 四个 endpoint）未设置时不写出。
 std::string settings_to_json(const WorldSettings& settings);
 
 // overrides 是部分设置（JSON 对象，只含要覆盖的顶层键与子键）；没给的叶子从 base 复制。
+// 合并本身删不掉键，所以要「解绑一个角色」「清空阈值」时 overrides 给 null（规则同 settings_from_json）：
+// {"extraction": null} 删掉 base 里的 extraction，{"gist_thresholds": null} 把阈值重置为 {}。
 // read_only=true 时 background 强制全关（tick 0、ingest false、auto_snapshot {false,0}）。
 // 非法 overrides 在返回前抛出（与 settings_from_json 同一套规则，含 interval_hours 的范围；只读时
 // 也先校验再强制关后台）；base 不被修改。

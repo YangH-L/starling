@@ -186,6 +186,66 @@ TEST(WorldSettings, MergeRejectsIntervalOutOfRangeAndLeavesBaseAlone) {
     }
 }
 
+// 裁定 R25：consolidation 是第四个可选 endpoint，形状与另外三个相同。
+TEST(WorldSettings, ConsolidationEndpointRoundTripsAndMerges) {
+    WorldSettings src;
+    src.consolidation = make_endpoint("k");
+    const std::string text = settings_to_json(src);
+    EXPECT_NE(text.find(R"("consolidation":)"), std::string::npos);
+    EXPECT_EQ(settings_from_json(text), src);
+    EXPECT_FALSE(settings_from_json("{}").consolidation.has_value());
+    EXPECT_EQ(settings_to_json(WorldSettings{}).find("consolidation"), std::string::npos);
+    const WorldSettings merged =
+        merge_settings(src, R"({"consolidation":{"model":"judge-2"}})", false);
+    ASSERT_TRUE(merged.consolidation.has_value());
+    EXPECT_EQ(merged.consolidation->model, "judge-2");
+    EXPECT_EQ(merged.consolidation->base_url, "http://k");   // 没给的叶子从 base 复制
+    EXPECT_EQ(error_code([] { settings_from_json(R"({"consolidation":{"nope":1}})"); }),
+              "invalid_settings");
+}
+
+// 裁定 R24：overrides 里 endpoint 键为 null 删掉该 endpoint，gist_thresholds 为 null 重置为 {}。
+// 合并本来删不掉键：解绑角色、清空阈值之后同步，旧值会留在注册表里，新世界还会继承它。
+TEST(WorldSettings, NullClearsEndpointsAndGistThresholds) {
+    WorldSettings base;
+    base.extraction = make_endpoint("x");
+    base.embedding = make_endpoint("e");
+    base.chat = make_endpoint("c");
+    base.consolidation = make_endpoint("k");
+    base.gist_thresholds = {{"min_holders", 4.0}};
+    for (const char* key : {"extraction", "embedding", "chat", "consolidation"}) {
+        const WorldSettings merged =
+            merge_settings(base, std::string(R"({")") + key + R"(":null})", false);
+        const auto& cleared = std::string(key) == "extraction"  ? merged.extraction
+                              : std::string(key) == "embedding" ? merged.embedding
+                              : std::string(key) == "chat"      ? merged.chat
+                                                                : merged.consolidation;
+        EXPECT_FALSE(cleared.has_value()) << key;
+        EXPECT_EQ(merged.gist_thresholds, base.gist_thresholds) << key;   // 其余不动
+    }
+    const WorldSettings reset = merge_settings(base, R"({"gist_thresholds":null})", false);
+    EXPECT_TRUE(reset.gist_thresholds.empty());
+    EXPECT_TRUE(reset.extraction.has_value());
+    // 同一份 overrides 里先清后设不是一回事：null 只删，不与 {} 混用。
+    const WorldSettings partial =
+        merge_settings(base, R"({"gist_thresholds":{"min_confidence":0.7}})", false);
+    EXPECT_EQ(partial.gist_thresholds.size(), 2U);   // 对象照旧逐键覆盖
+    // 删掉之后往返仍然一致；本来就没有的 endpoint 再删一次无害。
+    const WorldSettings twice = merge_settings(merge_settings(base, R"({"chat":null})", false),
+                                               R"({"chat":null})", false);
+    EXPECT_FALSE(twice.chat.has_value());
+    EXPECT_EQ(settings_from_json(settings_to_json(twice)), twice);
+    // null 只对这五个键有意义；别处的 null 仍是类型错误。
+    for (const char* bad : {R"({"vector_backend":null})", R"({"source_lane":null})",
+                            R"({"background":null})", R"({"extraction":{"model":null}})",
+                            R"({"gist_thresholds":{"min_holders":null}})"}) {
+        EXPECT_EQ(error_code([&] { (void)merge_settings(base, bad, false); }), "invalid_settings")
+            << bad;
+    }
+    // 存着的设置里出现 null（手改的 registry.db）：settings_from_json 照样按清除处理，结果没有该键。
+    EXPECT_FALSE(settings_from_json(R"({"chat":null})").chat.has_value());
+}
+
 TEST(WorldSettings, EndpointChanged) {
     EndpointSettings ep;
     ep.provider_name = "p";

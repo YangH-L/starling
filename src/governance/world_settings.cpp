@@ -87,8 +87,13 @@ void apply_endpoint(const Json& obj, const std::string& path, EndpointSettings& 
     }
 }
 
+// null 删掉该 endpoint（裁定 R24：合并删不掉键，解绑角色要显式清除）；对象逐键覆盖。
 void apply_optional_endpoint(const Json& obj, const std::string& path,
                              std::optional<EndpointSettings>& out) {
+    if (obj.is_null()) {
+        out.reset();
+        return;
+    }
     require_object(obj, path);
     EndpointSettings work = out.value_or(EndpointSettings{});
     apply_endpoint(obj, path, work);
@@ -172,6 +177,8 @@ void apply_settings(const Json& root, WorldSettings& out) {
             apply_optional_endpoint(val, key, out.embedding);
         } else if (key == "chat") {
             apply_optional_endpoint(val, key, out.chat);
+        } else if (key == "consolidation") {
+            apply_optional_endpoint(val, key, out.consolidation);
         } else if (key == "vector_backend") {
             std::string backend;
             read_str(val, key, backend);
@@ -183,6 +190,10 @@ void apply_settings(const Json& root, WorldSettings& out) {
         } else if (key == "source_lane") {
             apply_source_lane(val, key, out.source_lane);
         } else if (key == "gist_thresholds") {
+            if (val.is_null()) {   // 裁定 R24：null 重置为 {}（C++ 默认阈值）
+                out.gist_thresholds.clear();
+                continue;
+            }
             require_object(val, key);
             for (const auto& [name, thr] : val.items()) {
                 double num = 0.0;
@@ -268,6 +279,9 @@ std::string settings_to_json(const WorldSettings& settings) {
     }
     if (settings.chat.has_value()) {
         put(root, "chat", endpoint_to_json(*settings.chat));
+    }
+    if (settings.consolidation.has_value()) {
+        put(root, "consolidation", endpoint_to_json(*settings.consolidation));
     }
     put(root, "vector_backend", settings.vector_backend);
 
