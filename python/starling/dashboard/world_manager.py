@@ -128,6 +128,10 @@ _SCHEDULER_THREAD = "starling-auto-snapshot"
 _DEFAULT_NAME = "default"
 # 注册表 list 的分页上限（RegistryDb::list 的 limit 1–500）。
 _LIST_PAGE = 500
+# 默认世界经 PUT /api/worlds/default/settings 能改的设置（裁定 R35）：其余段（endpoint、阈值、来源通道、
+# tick 间隔）归 /api/config，下一次 sync_default_settings 会整段覆盖它们。auto_snapshot 与 ingest 不在
+# config 里（裁定 R16），同步时保留。
+_DEFAULT_WORLD_EDITABLE = {"background": {"auto_snapshot", "ingest"}}
 
 EngineFactory = Callable[[WorldContext, dict], DashboardEngine]
 
@@ -397,11 +401,26 @@ class WorldPool:
                 raise WorldSwitchError("world_busy", world)
             ctx = self.context(world)
             self._refuse_leaked(ctx.db_path)          # 旧 Runtime 还开着这个库：不开第二条写连接
+            if not ctx.is_default:
+                self._verify_tenant(ctx)              # 裁定 R36：在打开库之前，拒开时什么都没建
             engine = self._open_engine(world, ctx)
             self._publish(world, engine)
             return engine
         finally:
             lock.release()
+
+    @staticmethod
+    def _verify_tenant(ctx: WorldContext) -> None:
+        """租户不变式（世界设计 §2.1，裁定 R36）：非默认世界第一次建引擎之前，C++ world_verify_tenant 只读
+        扫一遍库，有别的租户的行就拒绝（world_tenant_mismatch），判断全在 C++。库读不出按「打不开」报
+        world_open_failed。默认世界（原地的 dashboard.db）早于世界管理，既有部署可按租户过滤地存多个租户，
+        不核对（与旧的启动校验一致）。"""
+        try:
+            _core.world_verify_tenant(ctx.db_path, ctx.tenant)
+        except _core.WorldStoreError as exc:
+            code = "world_tenant_mismatch" if _store_code(exc) == "world_tenant_mismatch" \
+                else "world_open_failed"
+            raise WorldSwitchError(code, str(exc)) from exc
 
     def _publish(self, world: str, engine) -> None:
         """持世界锁调用：先把引擎放进表，再按后台开关起线程（裁定 R23）。顺序不能反：起线程失败时引擎若还
@@ -511,6 +530,27 @@ class WorldPool:
     def closing_worlds(self) -> list[str]:
         with self._lock:
             return sorted(self._closing)
+
+    def list_worlds(self, labels: dict | None = None, offset: int = 0, limit: int = 50) -> dict:
+        """注册表的一页 {"worlds": [记录], "total"}（C++ RegistryDb::list：标签全部匹配、按 created_at 降序，
+        分页参数由 C++ 校验，invalid_world_query）。只读注册表，不开任何世界的库；开着的世界的计数由调用方
+        经 live_stats 现读。"""
+        reg = self._require_registry()
+        return reg.list(labels=dict(labels or {}), offset=offset, limit=limit)
+
+    def record(self, world: str) -> dict:
+        """注册表记录（world_not_found；没有注册表时 worlds_unavailable）。"""
+        self._require_registry()
+        return self._record(world)
+
+    def db_stats(self, world: str) -> dict:
+        """世界库的完整统计（C++ world_stats：db_bytes、live_bytes、statements、engrams、holders、
+        last_write_at 等），持一份不建引擎的租约只读打开库（恢复要等它归还）。库文件不在时全 0；读不出时
+        C++ 抛 snapshot_failed。"""
+        self._require_registry()
+        with self.lease(world, build=False):
+            ctx = self.context(world)
+            return _core.world_stats(ctx.db_path, ctx.tenant)
 
     def live_stats(self, world: str) -> dict | None:
         """开着的世界：{"holders", "statements", "last_write_at"}（C++ world_stats，持一份不建引擎的
@@ -929,6 +969,41 @@ class WorldPool:
         self._record(world)
         with self._world_lock(world):
             return _core.world_purge_archives(reg, world)
+
+    def update_settings(self, world: str, overrides: dict) -> tuple[dict, list[str]]:
+        """把部分设置 overrides 合并进 world 的设置（C++ update_world_settings：逐叶合并、null 清除、校验，
+        读—合并—写在注册表锁内；非法时什么都不写），返回 (实际生效的完整设置, 重嵌入提示)。世界开着时引擎
+        换上新设置，并按变了的 endpoint 段重建适配器（engine.apply_world_settings，裁定 R35）。
+
+        默认世界只收 _DEFAULT_WORLD_EDITABLE 里的键，其余 → invalid_settings，什么都不写：那些段归 config，
+        下一次同步会覆盖。
+
+        持世界锁（可能等几秒，调用方在工作线程里调）：建引擎（读注册表里的设置）也持世界锁，所以一个正在
+        首次打开的世界要么在合并之前建完（这里换上新设置），要么在合并之后才读到设置，不会建出一个带着旧
+        设置、又没被这里看见的引擎。关闭同样持世界锁，持锁期间表上的引擎不会被丢。这里不持租约（持租约的
+        代码不得阻塞地等世界锁）。"""
+        reg = self._require_registry()
+        if world == reg.default_world():
+            self._require_default_world_editable(overrides)
+        with self._world_lock(world):
+            merged = reg.update_settings(world, overrides)
+            settings = _core.world_effective_settings(merged)
+            with self._lock:
+                engine = self._engines.get(world)
+            warnings: list[str] = []
+            if engine is not None:
+                warnings = engine.apply_world_settings(settings)
+            engine = None
+        return settings, warnings
+
+    @staticmethod
+    def _require_default_world_editable(overrides: dict) -> None:
+        for section, value in overrides.items():
+            allowed = _DEFAULT_WORLD_EDITABLE.get(section)
+            if allowed is None or not isinstance(value, dict) or set(value) - allowed:
+                raise WorldSwitchError(
+                    "invalid_settings",
+                    f"the default world's {section!r} settings come from the dashboard config")
 
     def set_auto_snapshot(self, world: str, on_session: bool, interval_hours: int) -> dict:
         """改一个世界的自动快照配置（C++ 在注册表锁内合并），返回新配置 {"on_session", "interval_hours"}。

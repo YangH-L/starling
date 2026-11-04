@@ -350,8 +350,7 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         app.include_router(commands_router, prefix=prefix)
     app.include_router(build_eval_router(require_token))
     app.include_router(build_config_router(require_token))
-    # /api/worlds（世界管理）：处理函数由 Task 6b 改写到引擎池。改写之前它们找不到 app.state.worlds，
-    # 一律回 503 worlds_unavailable。
+    # /api/worlds（世界管理：列表、详情、建删、设置、关闭、快照、恢复），经引擎池；只挂在 /api 下。
     app.include_router(build_worlds_router(require_token))
 
     _build = Path(__file__).resolve().parents[3] / "dashboard" / "web" / "build"

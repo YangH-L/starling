@@ -230,6 +230,16 @@ class SessionSnapshotDeferred(Exception):
     不计重试次数，下一轮再来。快照失败不抛这个（照常摄入，只记录失败）。"""
 
 
+def endpoint_api_key(endpoint: dict, providers: dict) -> str | None:
+    """一个世界 endpoint 调用时用的密钥（spec §8.3）：provider_name 非空时取 providers 里该 provider 当前
+    保存的密钥，为空（客户端显式给的端点）时取服务进程的 OPENAI_API_KEY。引擎建适配器与世界详情的
+    key_set 都经这里，规则只有一处。"""
+    name = endpoint.get("provider_name") or ""
+    if name:
+        return (providers.get(name) or {}).get("api_key")
+    return _service_openai_key()
+
+
 # 世界设置里 endpoint 与 _build_chat_adapter / _build_embed_adapter 读的 provider dict 同名的字段。
 _ADAPTER_KEYS = ("provider", "model", "base_url", "dim", "max_tokens", "timeout_ms",
                  "max_retries", "enable_thinking", "thinking_type")
@@ -375,11 +385,7 @@ class DashboardEngine:
         if not ep:
             return {}
         cfg = {key: ep[key] for key in _ADAPTER_KEYS if key in ep}
-        name = ep.get("provider_name") or ""
-        if name:
-            key = (self._providers.get(name) or {}).get("api_key")
-        else:
-            key = _service_openai_key()
+        key = endpoint_api_key(ep, self._providers)
         if key:
             cfg["api_key"] = key
         return cfg
@@ -402,9 +408,47 @@ class DashboardEngine:
 
     def set_world_settings(self, settings: dict) -> None:
         """WorldPool.sync_default_settings 之后换上新合并的设置（默认世界）。只换引用；适配器由
-        调用方（POST /api/config）按改动的角色热换，这里不重建，与改 config 之前的行为一致。"""
+        调用方（POST /api/config）按改动的角色热换（reload_adapters），这里不重建，与改 config 之前的
+        行为一致。"""
         with self._lock:
             self._settings = settings
+
+    def reload_adapters(self, roles, *, gist: bool = False) -> list[str]:
+        """按当前设置（self._settings）与 provider 注册表重建 roles 里的适配器（extraction / chat /
+        consolidation / embedding），gist 为真时重新装上阈值；与构造时（_init_core）同一套取法。POST
+        /api/config（按改动的角色，含只改了密钥的 provider）与 PUT /api/worlds/{name}/settings
+        （apply_world_settings，按改动的段）都经这里。返回重嵌入的提示（嵌入 provider 拒绝时，非致命）。"""
+        roles = set(roles)
+        warnings: list[str] = []
+        with self._lock:
+            if "extraction" in roles:
+                self.set_llm(self._endpoint_cfg("extraction"))
+            if "chat" in roles:
+                # 没绑 chat 的世界用抽取的 endpoint 对话（与构造时一致）。
+                self.set_chat(self._endpoint_cfg("chat") or self._endpoint_cfg("extraction"))
+            if "consolidation" in roles:
+                self.set_consolidation(self._endpoint_cfg("consolidation"))
+            if "embedding" in roles:
+                warn = self.rebuild_embedder(self._endpoint_cfg("embedding"))
+                if warn:
+                    warnings.append(warn)
+            if gist:
+                self.set_gist_thresholds(self._settings.get("gist_thresholds") or {})
+        return warnings
+
+    def apply_world_settings(self, settings: dict) -> list[str]:
+        """换上一个世界的新设置（PUT /api/worlds/{name}/settings 之后，C++ 已合并好），并按与旧设置相比
+        变了的段重建适配器：不留旧 endpoint 的适配器（继承来的地址核对按新设置做，见
+        _require_endpoint_unchanged）。chat 没绑定时跟着抽取变。background 只换引用：tick 间隔与摄入开关
+        在下一次打开这个世界时生效，自动快照的配置池每次从注册表现读。返回重嵌入的提示。"""
+        with self._lock:
+            old, self._settings = self._settings, settings
+            changed = {role for role in ("extraction", "embedding", "chat", "consolidation")
+                       if old.get(role) != settings.get(role)}
+            if "extraction" in changed and not settings.get("chat"):
+                changed.add("chat")
+            gist = old.get("gist_thresholds") != settings.get("gist_thresholds")
+            return self.reload_adapters(changed, gist=gist)
 
     def _notify_commit(self) -> None:
         """写方法成功之后通知 WorldPool（统计去抖）。回调异常只记日志：写已经成功了。"""

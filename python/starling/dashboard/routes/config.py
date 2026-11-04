@@ -196,29 +196,23 @@ def build_config_router(require_token) -> APIRouter:
             }
         _commit(pool, cfg, saved, eng)               # 校验 → starling.json (0600) → 默认世界的设置
         # Hot-swap only the live roles whose resolved provider changed: a role
-        # was (re)bound, or its currently-bound provider was edited.
+        # was (re)bound, or its currently-bound provider was edited (a key-only
+        # edit changes no setting, so this is decided here, not by diffing settings).
         touched_providers = set(body.providers or {})
         rebound = set(body.roles or {})
         def _affected(role: str) -> bool:
             return role in rebound or cfg.roles.get(role) in touched_providers
+        roles = {role for role in ("extraction", "embedding", "consolidation") if _affected(role)}
+        # chat: rebound/edited, or unbound-and-extraction-changed (chat
+        # falls back to the extraction provider).
+        if _affected("chat") or (not cfg.roles.get("chat") and _affected("extraction")):
+            roles.add("chat")
         warnings: list[str] = []
         if eng is not None:
-            if _affected("extraction"):
-                eng.set_llm(cfg.resolve_role("extraction") or {})
-            # chat: rebound/edited, or unbound-and-extraction-changed (chat
-            # falls back to the extraction provider).
-            if _affected("chat") or (not cfg.roles.get("chat") and _affected("extraction")):
-                eng.set_chat(cfg.chat() or {})
-            if _affected("embedding"):
-                # rebuild + re-embed; a rejected embedding provider returns a
-                # warning (non-fatal — the save still succeeds) instead of 500.
-                warn = eng.rebuild_embedder(cfg.embedding() or {})
-                if warn:
-                    warnings.append(warn)
-            if _affected("consolidation"):                    # #38-C consolidation role
-                eng.set_consolidation(cfg.resolve_role("consolidation") or {})
-            if body.gist_thresholds is not None:              # #38-C v2 threshold surface
-                eng.set_gist_thresholds(cfg.gist_thresholds)
+            # 适配器按默认世界刚同步好的设置重建（与 PUT /api/worlds/{name}/settings 同一个
+            # reload_adapters，裁定 R35）。嵌入换了会重嵌入；嵌入 provider 拒绝时返回提示（非致命，
+            # 保存照常成功）而不是 500。
+            warnings = eng.reload_adapters(roles, gist=body.gist_thresholds is not None)
         result = _public(cfg)
         if warnings:
             result["warnings"] = warnings
@@ -238,14 +232,13 @@ def build_config_router(require_token) -> APIRouter:
             cfg.roles[r] = ""
         _commit(pool, cfg, saved, eng)
         if eng is not None and unbound:
-            if "extraction" in unbound:
-                eng.set_llm({})            # → None (remember will 409 until rebound)
-            if "chat" in unbound or "extraction" in unbound:
-                eng.set_chat(cfg.chat() or {})   # re-resolve (may fall back / go None)
-            if "embedding" in unbound:
-                eng.rebuild_embedder({})   # → stub (recall degraded)
-            if "consolidation" in unbound:
-                eng.set_consolidation({})  # → None (offline replay falls back to deterministic)
+            # 解绑的角色在同步后的设置里已清掉：extraction → None（remember 回 409 直到重新绑定），
+            # chat 重新解析（可能回退到抽取或变 None），embedding → 占位嵌入（召回降级），
+            # consolidation → None（离线回放退回确定性 gist）。
+            roles = set(unbound) & {"extraction", "embedding", "chat", "consolidation"}
+            if "extraction" in roles:
+                roles.add("chat")
+            eng.reload_adapters(roles)
         return _public(cfg)
 
     @router.post("/config/test")

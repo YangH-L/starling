@@ -225,6 +225,11 @@ void bind_15_world(pybind11::module_& m) {
             for (const auto& entry : entries) { out.append(snap_out(entry)); }
             return out;
         }, py::arg("world"))
+        // 每个世界保留的快照份数（meta.snapshot_retention，默认 5）。
+        .def("snapshot_retention", [](const gov::RegistryDb& reg) {
+            const py::gil_scoped_release release;
+            return reg.snapshot_retention();
+        })
         .def_property_readonly("data_dir", [](const gov::RegistryDb& reg) {
             return reg.data_dir().string();
         });
