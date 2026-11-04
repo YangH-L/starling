@@ -1068,3 +1068,72 @@ def test_worker_start_failure_logging_does_not_pin_the_engine(tmp_path, monkeypa
     finally:
         wm.logger.removeHandler(keep)
         pool.close_all()
+
+
+# ───────────────────────── 注入引擎（create_app(engine=...)，Task 6） ─────────────────────────
+
+def test_seed_engine_publishes_an_injected_engine_without_starting_threads(tmp_path):
+    """seed_engine 把建好的引擎放进池：租约拿到的就是它，池的回调已挂上，不起线程；
+    start_background 之后按世界设置起线程；同一世界不能再塞第二个。"""
+    calls = []
+    cfg = _cfg(tmp_path, tick_interval_s=60.0)
+    pool, _reg, _c = _pool(tmp_path, cfg=cfg, on_world_changed=lambda w, s: calls.append(w))
+    try:
+        injected = DashboardEngine(cfg)
+        pool.seed_engine("default", injected)
+        assert pool.open_worlds() == ["default"]
+        assert injected._tick_thread is None and injected._ingest_thread is None
+        assert injected.session_snapshot_hook is not None
+        with pool.lease("default") as eng:
+            assert eng is injected
+            eng.llm = _fake()
+            eng.remember("Bob owns auth")
+        eng = None
+        assert calls == ["default"]                      # on_commit 已接到池的去抖广播
+        with pytest.raises(WorldSwitchError) as ei:
+            pool.seed_engine("default", injected)
+        assert ei.value.code == "world_busy"
+        pool.start_background(stats_interval_s=999, scheduler_poll_s=999,
+                              scheduler_first_delay_s=999)
+        assert injected._tick_thread is not None and injected._tick_thread.is_alive()
+        assert injected._ingest_thread is not None and injected._ingest_thread.is_alive()
+        threads = (injected._tick_thread, injected._ingest_thread)
+        injected = None
+        pool.close_all()
+        assert not any(t.is_alive() for t in threads)
+        assert pool._leaked == []
+    finally:
+        pool.close_all()
+
+
+def test_seed_engine_refuses_unknown_world_and_shut_pool(tmp_path):
+    pool, _reg, cfg = _pool(tmp_path)
+    injected = DashboardEngine(cfg)
+    try:
+        with pytest.raises(WorldSwitchError) as ei:
+            pool.seed_engine("nope", injected)
+        assert ei.value.code == "world_not_found"
+        pool.close_all()
+        with pytest.raises(WorldSwitchError) as ei:
+            pool.seed_engine("default", injected)
+        assert ei.value.code == "world_busy"
+        assert pool.open_worlds() == []
+    finally:
+        injected.close()
+        pool.close_all()
+
+
+def test_begin_drain_puts_every_open_world_into_draining(tmp_path):
+    pool, _reg, _c = _pool(tmp_path)
+    try:
+        pool.create_world("w1", "")
+        for world in ("default", "w1"):
+            with pool.lease(world):
+                pass
+        pool.begin_drain()
+        for world in ("default", "w1"):
+            with pool.lease(world, build=False) as eng:
+                assert eng.health() == _core.RuntimeHealth.DRAINING
+            eng = None
+    finally:
+        pool.close_all()

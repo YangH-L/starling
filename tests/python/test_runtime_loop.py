@@ -103,12 +103,17 @@ def test_lifespan_starts_and_stops_scheduler(tmp_path):
 
     cfg = DashboardConfig(db_path=str(tmp_path / "ls.db"), token="",
                           tick_interval_s=600.0)  # 不会在测试窗口内触发
-    app = create_app(cfg)   # engine=None:lifespan 应即建引擎并启动调度
+    app = create_app(cfg)   # engine=None:lifespan 应即建默认世界的引擎并启动调度
+    pool = app.state.pool
     with TestClient(app) as _:
-        eng = app.state.engine
-        assert eng is not None
-        assert eng._tick_thread is not None and eng._tick_thread.is_alive()
-    assert app.state.engine._tick_thread is None  # shutdown 收线程
+        assert pool.open_worlds() == ["default"]
+        with pool.lease("default", build=False) as eng:   # 只看,不建
+            assert eng is not None
+            tick = eng._tick_thread
+        eng = None
+        assert tick is not None and tick.is_alive()
+    assert not tick.is_alive()                 # shutdown 收线程
+    assert pool.open_worlds() == []            # 并关掉默认世界(释放 C++ 写连接)
 
 
 def test_scheduler_disabled_when_interval_zero(tmp_path):

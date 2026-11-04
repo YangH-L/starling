@@ -469,10 +469,38 @@ class WorldPool:
         except Exception as exc:
             traceback.clear_frames(exc.__traceback__)
             raise WorldSwitchError("world_open_failed", str(exc)) from exc
+        self._wire(world, engine)
+        return engine
+
+    def _wire(self, world: str, engine) -> None:
+        """挂上池的回调：统计去抖广播（on_commit）与按会话的自动快照钩子（有注册表时）。"""
         engine.on_commit = lambda: self._note_change(world)
         if self._registry is not None:
             self.attach_hooks(world, engine)
-        return engine
+
+    def seed_engine(self, world: str, engine) -> None:
+        """把一个已经建好的引擎作为 world 的引擎放进池（create_app(engine=...)：测试与嵌入式调用方注入默认
+        世界的引擎）。不建引擎：换上池给这个世界的设置、挂上池的回调，然后与新建的引擎一样发布（_publish）。
+        create_app 在 lifespan 之前调用，后台线程还没开，所以什么都不起；之后 start_background 按世界设置起。
+
+        world 不存在 → world_not_found；池已关停、该世界正在关闭、已经有引擎，或之前的关闭留下的 Runtime
+        还开着这个库 → world_busy（同一个库上不能有两条写连接）。引擎打开的库与租户是否就是这个世界的，
+        由调用方先核对（app._require_engine_matches）。"""
+        try:
+            ctx = self.context(world)                 # world_not_found
+            with self._world_lock(world):
+                with self._lock:
+                    busy = self._shut or world in self._closing or world in self._engines
+                if busy:
+                    raise WorldSwitchError("world_busy", world)
+                self._refuse_leaked(ctx.db_path)
+                engine.set_world_settings(ctx.settings)
+                self._wire(world, engine)
+                self._publish(world, engine)
+        except BaseException:
+            # 异常的回溯持有本帧：调用方留着异常时，engine 参数会钉住被拒的引擎（同 _close_engine）。
+            engine = None
+            raise
 
     # ───────────────────────── 只读查询 ─────────────────────────
 
@@ -696,6 +724,21 @@ class WorldPool:
                 return
 
     # ───────────────────────── 关闭 ─────────────────────────
+
+    def begin_drain(self) -> None:
+        """关停的第一步（D-P2-6）：每个开着的世界的引擎进 DRAINING，写门转为拒绝，之后才停摄入、停 tick、
+        关引擎（顺序见 app 的 lifespan）。每个世界持一份不建引擎的租约调用，正在关闭的世界跳过。引擎的
+        begin_drain 不拿引擎锁，在途的长请求挡不住它。关停路径：一个世界出错只记日志，不挡别的世界。"""
+        for world in self.open_worlds():
+            try:
+                with self.lease(world, build=False) as engine:
+                    if engine is not None:
+                        engine.begin_drain()
+                    engine = None
+            except WorldSwitchError:
+                continue
+            except Exception:  # noqa: BLE001 — 关停路径
+                logger.exception("cannot drain world %s at shutdown", world)
 
     def close_world(self, world: str, timeout_s: float = _LEASE_DRAIN_TIMEOUT_S) -> None:
         """关一个世界：等该世界租约归零、停线程、丢引擎、写统计缓存（Review Focus 2）。之后的 lease 会重新

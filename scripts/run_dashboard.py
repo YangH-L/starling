@@ -43,12 +43,10 @@ def main() -> None:
     cfg = DashboardConfig.load(args.config)
     cfg.validate_bind()
     _ensure_build(args.no_build)
+    # 引擎由引擎池按世界建：lifespan 启动时即建默认世界的引擎（tick_interval_s > 0 时，默认 30 秒），
+    # 库与 schema 从启动起就在；其余世界在第一次被写入时打开。注册表在 cfg.data_dir（环境变量
+    # STARLING_DATA_DIR，没设就是默认世界库文件所在的目录）。
     app = create_app(cfg)
-    from starling.dashboard.engine import DashboardEngine
-    # Build the engine eagerly so the SQLite schema exists from startup. The
-    # inspection routes open the DB read-only (mode=ro) and would 500 on a fresh
-    # DB if a request arrived before the first command lazily built the engine.
-    app.state.engine = DashboardEngine(cfg)
     shown = cfg.host if cfg.host not in ("0.0.0.0", "::") else "127.0.0.1"
     print(f"\nDashboard ready → http://{shown}:{cfg.port}/#token={cfg.token}\n", flush=True)
     uvicorn.run(app, host=cfg.host, port=cfg.port)

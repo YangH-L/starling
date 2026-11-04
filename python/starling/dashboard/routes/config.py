@@ -6,14 +6,16 @@ converse() (2c); consolidation (#38-C) judges NORM gists in offline replay.
 Hot-swap is per affected role:
 rebinding/editing the extraction provider re-swaps the LLM adapter (O(1));
 the embedding provider triggers a re-embed (expensive). GET never leaks keys.
+
+config 是默认世界设置的权威来源（记忆服务第 1 期，裁定 R27）：保存之后经 pool.sync_default_settings()
+把它整段替换进注册表里默认世界的设置，开着的默认世界引擎随之换上新设置；适配器仍由这里按改动的角色
+热换。这些路由只作用于默认世界（只挂在 /api 下）。
 """
 from __future__ import annotations
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-
-from starling.dashboard.world_manager import WorldSwitchError, engine_lease
 
 
 class ProviderFields(BaseModel):
@@ -85,21 +87,24 @@ def _merge_provider(dst: dict, body: ProviderFields) -> None:
         dst["enable_thinking"] = body.enable_thinking
 
 
-def _persist(request: Request, cfg) -> None:
-    """写 starling.json。活动世界只记在注册表里：config 里的 db_path/tenant 是
-    活动世界的值，直接 save 会把它写成「默认世界」，重启后丢掉真正的默认世界。"""
-    worlds = getattr(request.app.state, "worlds", None)
-    (worlds.persistable_config(cfg) if worlds is not None else cfg).save()
+def _persist(request: Request, cfg, eng) -> None:
+    """写 starling.json（config 里没有活动世界了，db_path/tenant 就是默认世界的），再把默认世界的设置
+    同步成新的 config（C++ 整段替换，开着的默认世界引擎换上新设置）。没有注册表（:memory: 等，裁定 R6）
+    时默认世界的设置每次都由 config 现推，开着的引擎直接换上推出来的设置。"""
+    cfg.save()
+    pool = request.app.state.pool
+    if pool.registry is not None:
+        pool.sync_default_settings()
+    elif eng is not None:
+        eng.set_world_settings(pool.context(pool.default_world()).settings)
 
 
 def _lease(request: Request):
-    """热更新要在同一个引擎上做完（改 config、落盘、换适配器）：持一份租约，切换窗口内
-    → 503 world_switching。先取租约再动 config，被拒时什么都没改。不惰性建引擎：没有
-    引擎时只改 config，引擎建出来时自然读到新 config。"""
-    try:
-        return engine_lease(request.app.state)
-    except WorldSwitchError as exc:
-        raise HTTPException(status_code=503, detail=exc.code) from exc
+    """热更新要在同一个引擎上做完（改 config、落盘、同步设置、换适配器）：持默认世界的一份租约。正在关闭
+    → 503 world_busy（world_scope 的异常处理器）。先取租约再动 config，被拒时什么都没改。不建引擎：默认
+    世界没开着时只改 config 与注册表里的设置，引擎建出来时自然读到新设置。"""
+    pool = request.app.state.pool
+    return pool.lease(pool.default_world(), build=False)
 
 
 def build_config_router(require_token) -> APIRouter:
@@ -107,10 +112,6 @@ def build_config_router(require_token) -> APIRouter:
 
     @router.get("/config")
     async def get_config(request: Request):
-        # 切换窗口内 config 还是旧世界的（tenant 字段会是旧租户）：与检视路由一致回 503。
-        worlds = getattr(request.app.state, "worlds", None)
-        if worlds is not None and worlds.switching:
-            raise HTTPException(status_code=503, detail="world_switching")
         return _public(request.app.state.config)
 
     @router.post("/config")
@@ -136,7 +137,7 @@ def build_config_router(require_token) -> APIRouter:
                           "similarity_threshold", "entity_gist_enabled")
                 if body.gist_thresholds.get(k) is not None
             }
-        _persist(request, cfg)                       # persist starling.json (0600)
+        _persist(request, cfg, eng)                  # starling.json (0600) + 默认世界的设置
         # Hot-swap only the live roles whose resolved provider changed: a role
         # was (re)bound, or its currently-bound provider was edited.
         touched_providers = set(body.providers or {})
@@ -180,7 +181,7 @@ def build_config_router(require_token) -> APIRouter:
         unbound = [r for r, n in cfg.roles.items() if n == name]
         for r in unbound:
             cfg.roles[r] = ""
-        _persist(request, cfg)
+        _persist(request, cfg, eng)
         if eng is not None and unbound:
             def _apply() -> None:
                 if "extraction" in unbound:
