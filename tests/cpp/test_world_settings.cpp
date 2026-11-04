@@ -246,6 +246,67 @@ TEST(WorldSettings, NullClearsEndpointsAndGistThresholds) {
     EXPECT_FALSE(settings_from_json(R"({"chat":null})").chat.has_value());
 }
 
+// 裁定 R27：同步权威来源（默认世界跟 config）要整段替换，不能逐叶合并：合并删不掉叶子，改绑到另一个
+// provider 之后旧 provider 的 thinking_type / max_tokens / base_url 会留下来。
+TEST(WorldSettings, ReplaceSectionsDropsOldLeavesOfAReboundEndpoint) {
+    WorldSettings base;
+    base.extraction = make_endpoint("a");   // max_retries 3、enable_thinking false、thinking_type disabled
+    const WorldSettings out = replace_sections(
+        base, R"({"extraction":{"provider":"openai","provider_name":"b","model":"mb"}})");
+    ASSERT_TRUE(out.extraction.has_value());
+    EndpointSettings want;
+    want.provider = "openai";
+    want.provider_name = "b";
+    want.model = "mb";
+    EXPECT_EQ(*out.extraction, want);       // 其余叶子全是默认值：base_url 空、可选字段未设置
+    EXPECT_EQ(out.extraction->base_url, "");
+    EXPECT_FALSE(out.extraction->max_retries.has_value());
+}
+
+TEST(WorldSettings, ReplaceSectionsReplacesGistAndLaneWholesale) {
+    WorldSettings base;
+    base.gist_thresholds = {{"min_holders", 4.0}, {"min_confidence", 0.7}};
+    base.source_lane.k_source = 77;
+    base.source_lane.model = "old";
+    const WorldSettings out = replace_sections(
+        base, R"({"gist_thresholds":{"min_holders":4},"source_lane":{"model":"new"}})");
+    EXPECT_EQ(out.gist_thresholds, (std::map<std::string, double>{{"min_holders", 4.0}}));
+    EXPECT_EQ(out.source_lane.model, "new");
+    EXPECT_EQ(out.source_lane.k_source, SourceLaneSettings{}.k_source);   // 没给的回默认值
+}
+
+TEST(WorldSettings, ReplaceSectionsKeepsBackgroundLeafMergedAndAbsentSectionsUntouched) {
+    WorldSettings base;
+    base.chat = make_endpoint("c");
+    base.consolidation = make_endpoint("k");
+    base.background = {.tick_interval_s = 30.0,
+                       .ingest = false,
+                       .auto_snapshot = {.on_session = true, .interval_hours = 6}};
+    const WorldSettings out = replace_sections(
+        base, R"({"background":{"tick_interval_s":12},"extraction":null})");
+    EXPECT_EQ(out.background.tick_interval_s, 12.0);
+    EXPECT_FALSE(out.background.ingest);                                  // 逐叶合并（R16）
+    EXPECT_EQ(out.background.auto_snapshot,
+              (AutoSnapshotConfig{.on_session = true, .interval_hours = 6}));
+    EXPECT_EQ(out.chat, base.chat);                                       // 没出现的段原样
+    EXPECT_EQ(out.consolidation, base.consolidation);
+    EXPECT_FALSE(out.extraction.has_value());                            // null 照样清除（R24）
+    const WorldSettings cleared = replace_sections(base, R"({"chat":null,"gist_thresholds":null})");
+    EXPECT_FALSE(cleared.chat.has_value());
+    EXPECT_TRUE(cleared.gist_thresholds.empty());
+}
+
+TEST(WorldSettings, ReplaceSectionsValidatesLikeMerge) {
+    const WorldSettings base;
+    EXPECT_EQ(error_code([&] { (void)replace_sections(base, R"({"vector_backend":"zvec"})"); }),
+              "snapshot_unsupported_backend");
+    EXPECT_EQ(error_code([&] { (void)replace_sections(base, R"({"extraction":{"bogus":1}})"); }),
+              "invalid_settings");
+    EXPECT_EQ(error_code([&] { (void)replace_sections(base, "not json"); }), "invalid_settings");
+    EXPECT_EQ(error_code([&] { (void)replace_sections(base, with_interval(9000)); }),
+              "invalid_auto_snapshot");
+}
+
 TEST(WorldSettings, EndpointChanged) {
     EndpointSettings ep;
     ep.provider_name = "p";

@@ -85,6 +85,10 @@ public:
     // 把 overrides 合并到世界当前设置上（只读世界后台强制关）并写回，读—合并—写在一次持锁内，
     // 并发更新同一世界不会丢合并。返回合并后的 settings_json。world_not_found；overrides 非法时什么都不写。
     std::string update_world_settings(const std::string& name, const std::string& overrides_json);
+    // 权威来源同步（裁定 R27）：world_settings.hpp replace_sections（出现的段整段替换、background 逐叶合并、
+    // null 清除），读—替换—写在一次持锁内。只读世界同样强制关后台。返回新的 settings_json。world_not_found；
+    // sections 非法时什么都不写。
+    std::string replace_world_sections(const std::string& name, const std::string& sections_json);
     // default → world_protected；删注册项（含标签、快照条目）与 worlds/<dir_id>/。
     // dir_id 越出 worlds/ 或布局被符号链接篡改 → snapshot_failed，什么都不删。
     void remove(const std::string& name);

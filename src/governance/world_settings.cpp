@@ -329,6 +329,34 @@ WorldSettings merge_settings(const WorldSettings& base, const std::string& overr
     return out;
 }
 
+WorldSettings replace_sections(const WorldSettings& base, const std::string& sections_json) {
+    const Json sections = parse_object(sections_json, "sections");
+    WorldSettings out = base;  // 值拷贝；非法 sections 在这里之后抛，base 不受影响
+    // 先把出现的整段（background 除外）复位成默认值，再按同一套规则应用：没给的叶子就停在默认值上。
+    const WorldSettings defaults;
+    for (const auto& [key, val] : sections.items()) {
+        (void)val;
+        if (key == "extraction") {
+            out.extraction.reset();
+        } else if (key == "embedding") {
+            out.embedding.reset();
+        } else if (key == "chat") {
+            out.chat.reset();
+        } else if (key == "consolidation") {
+            out.consolidation.reset();
+        } else if (key == "gist_thresholds") {
+            out.gist_thresholds.clear();
+        } else if (key == "source_lane") {
+            out.source_lane = defaults.source_lane;
+        } else if (key == "vector_backend") {
+            out.vector_backend = defaults.vector_backend;
+        }
+        // background 与未知键不复位：background 逐叶合并，未知键由 apply_settings 报 invalid_settings。
+    }
+    apply_settings(sections, out);
+    return out;
+}
+
 void require_endpoint_unchanged(const EndpointSettings& world_endpoint,
                                 const std::string& current_provider_base_url) {
     if (world_endpoint.provider_name.empty()) {

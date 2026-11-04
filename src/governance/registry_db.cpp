@@ -412,6 +412,19 @@ std::string RegistryDb::update_world_settings(const std::string& name,
     return merged;
 }
 
+std::string RegistryDb::replace_world_sections(const std::string& name,
+                                               const std::string& sections_json) {
+    const std::scoped_lock lock(impl_->mutex);
+    const auto rec = impl_->require(name);
+    WorldSettings replaced = replace_sections(settings_from_json(rec.settings_json),
+                                              sections_json.empty() ? "{}" : sections_json);
+    // 只读世界的后台恒关，与 update_world_settings（merge_settings 的 read_only）同一条规则。
+    replaced = merge_settings(replaced, "{}", rec.read_only);
+    const auto text = settings_to_json(replaced);
+    impl_->set_settings(name, text);
+    return text;
+}
+
 void RegistryDb::remove(const std::string& name) {
     const std::scoped_lock lock(impl_->mutex);
     const WorldRecord rec = impl_->require(name);

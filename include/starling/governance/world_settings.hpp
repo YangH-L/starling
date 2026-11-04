@@ -78,6 +78,13 @@ std::string settings_to_json(const WorldSettings& settings);
 WorldSettings merge_settings(const WorldSettings& base, const std::string& overrides_json,
                              bool read_only);
 
+// 整段替换（裁定 R27）：给权威来源同步用（默认世界跟 config，见 RegistryDb::replace_world_sections）。
+// sections 里出现的顶层段 extraction / embedding / chat / consolidation / gist_thresholds / source_lane /
+// vector_backend 整段换成给出的值（没给的叶子取默认值，不从 base 复制），null 照样清除（同 merge_settings）；
+// background 仍逐叶合并（config 不带 auto_snapshot、ingest，裁定 R16）；sections 里没出现的段原样保留。
+// 校验规则与 settings_from_json 相同，非法时在返回前抛出，base 不被修改。
+WorldSettings replace_sections(const WorldSettings& base, const std::string& sections_json);
+
 // world 里的 provider_name 非空，且 current_provider_base_url != world 记的 base_url
 // → 抛 endpoint_changed。provider_name 为空（客户端显式给的）永不抛。
 void require_endpoint_unchanged(const EndpointSettings& world_endpoint,

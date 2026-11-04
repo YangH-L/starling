@@ -195,6 +195,17 @@ void bind_15_world(pybind11::module_& m) {
                  }
                  return to_py(merged);
              }, py::arg("name"), py::arg("overrides"))
+        // 权威来源同步（裁定 R27）：出现的段整段替换、background 逐叶合并、null 清除。返回新的设置 dict。
+        .def("replace_settings_sections",
+             [](gov::RegistryDb& reg, const std::string& name, const py::object& sections) {
+                 const auto sections_text = overrides_in(sections);
+                 std::string replaced;
+                 {
+                     const py::gil_scoped_release release;
+                     replaced = reg.replace_world_sections(name, sections_text);
+                 }
+                 return to_py(replaced);
+             }, py::arg("name"), py::arg("sections"))
         .def("update_stats",
              // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
              [](gov::RegistryDb& reg, const std::string& name, std::int64_t holders,
@@ -224,7 +235,7 @@ void bind_15_world(pybind11::module_& m) {
         gov::import_worlds_json(data_dir);
     }, py::arg("data_dir"));
 
-    // world_endpoint 是 settings 里 extraction / embedding / chat 之一的 dict；解析走 C++
+    // world_endpoint 是 settings 里 extraction / embedding / chat / consolidation 之一的 dict；解析走 C++
     // settings_from_json（字段规则同一份）。provider_name 为空永不抛，否则 base_url 不同抛 endpoint_changed。
     m.def("world_require_endpoint_unchanged",
           [](const py::dict& world_endpoint, const std::string& current_base_url) {

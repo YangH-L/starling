@@ -316,6 +316,32 @@ TEST(WorldSettingsCompose, ConcurrentUpdatesOfOneWorldLoseNoMerge) {
     EXPECT_EQ(got.gist_thresholds.size(), static_cast<std::size_t>(kThreads));
 }
 
+// 裁定 R27：RegistryDb::replace_world_sections 在一次持锁内读—整段替换—写，返回新的 settings_json。
+TEST(WorldSettingsCompose, ReplaceWorldSectionsReplacesUnderTheRegistryLock) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    (void)reg.update_world_settings(
+        "default", R"({"extraction":{"provider_name":"a","base_url":"http://a","model":"ma",)"
+                   R"("max_tokens":8192,"thinking_type":"disabled"},)"
+                   R"("background":{"auto_snapshot":{"on_session":true,"interval_hours":6}}})");
+    const std::string out = reg.replace_world_sections(
+        "default", R"({"extraction":{"provider_name":"b","model":"mb"}})");
+    const auto got = settings_from_json(reg.get("default").settings_json);
+    EXPECT_EQ(settings_to_json(got), out);
+    ASSERT_TRUE(got.extraction.has_value());
+    EXPECT_EQ(got.extraction->provider_name, "b");
+    EXPECT_EQ(got.extraction->base_url, "");
+    EXPECT_EQ(got.extraction->max_tokens, EndpointSettings{}.max_tokens);
+    EXPECT_EQ(got.extraction->thinking_type, EndpointSettings{}.thinking_type);
+    EXPECT_EQ(got.background.auto_snapshot,
+              (AutoSnapshotConfig{.on_session = true, .interval_hours = 6}));
+    EXPECT_EQ(code_of([&] { (void)reg.replace_world_sections("nope", "{}"); }), "world_not_found");
+    const std::string before = reg.get("default").settings_json;
+    EXPECT_EQ(code_of([&] { (void)reg.replace_world_sections("default", R"({"x":1})"); }),
+              "invalid_settings");
+    EXPECT_EQ(reg.get("default").settings_json, before);   // 非法输入什么都不写
+}
+
 // 建世界与更新默认世界并发：新世界的 extraction 一定是某一次完整写入的快照（model 与 dim 成对）。
 TEST(WorldSettingsCompose, CreateWhileDefaultIsUpdatedSeesOneCompleteSnapshot) {
     const TempDir tmp;
