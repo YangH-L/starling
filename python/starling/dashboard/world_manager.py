@@ -38,6 +38,10 @@ DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个�
   - 该世界不能被删除（delete_world 回 world_busy）：进程仍在往已 unlink 的 inode 里写。
 每次检查前先 gc 并摘掉已回收的条目，所以 Runtime 一旦被回收，这些操作就照常进行。
 
+新建的引擎一律先发布、再起后台线程（_publish，裁定 R23）：起线程失败时引擎已经在表上，不会变成一个
+既没发布、也没登记成泄漏的活 Runtime。失败只记日志、标记 workers-lost，下一次租约（非阻塞取世界锁）
+补起；补起之前引擎照常服务请求。
+
 锁顺序（全局唯一，任何代码都不得反向持有）
 ------------------------------------------
   1. pool._lock（Lock，短）：只保护 _engines / _leases / _closing 三张表，以及只在表上做的簿记
@@ -243,6 +247,9 @@ class WorldPool:
         self._auto_last_error: str | None = None
         self._auto_last_error_at: str | None = None
         self._threads: dict[str, tuple[threading.Thread, threading.Event]] = {}
+        self._vector_warned = False                   # 非 sqlite 的 config 只提醒一次（裁定 R26）
+        # 发布时没起来后台线程的世界（裁定 R23）：下一次租约在世界锁内补起，补起之前引擎照常服务请求。
+        self._workers_lost: set[str] = set()
 
     # ───────────────────────── 注册表与上下文 ─────────────────────────
 
@@ -277,16 +284,28 @@ class WorldPool:
 
     def context(self, world: str) -> WorldContext:
         """一个世界打开引擎需要的全部输入：库、租户、C++ 补齐默认值后的设置、摄入分区目录
-        （<config.ingest_spool_root()>/<world_ingest_partition(...)>，裁定 R4）。"""
+        （<config.ingest_spool_root()>/<world_ingest_partition(...)>，裁定 R4）。默认世界的向量后端与路径
+        取 config（裁定 R26，默认世界「原地」），其余世界 sqlite、没有路径。"""
         rec = self._record(world)
         is_default = world == self.default_world()
         partition = _core.world_ingest_partition(is_default, rec["tenant"], rec["dir_id"])
+        backend, store_path = self._vector_store(world, is_default)
         return WorldContext(
             name=world, dir_id=rec["dir_id"], db_path=rec["db_path"], tenant=rec["tenant"],
             agent=self._config.agent,
             settings=_core.world_effective_settings(rec["settings"]),
             ingest_spool_dir=str(self._config.ingest_spool_root() / partition),
-            is_default=is_default)
+            is_default=is_default, vector_backend=backend, vector_store_path=store_path)
+
+    def _vector_store(self, world: str, is_default: bool | None = None) -> tuple[str, str]:
+        """(向量后端, 路径)：默认世界取 config（裁定 R26），其余世界 ("sqlite", "")。快照、恢复、自动快照
+        把这个后端交给 C++，zvec 的默认世界由 C++ 拒绝（snapshot_unsupported_backend）。"""
+        if is_default is None:
+            is_default = world == self.default_world()
+        if is_default:
+            return (self._config.vector_backend or "sqlite",
+                    self._config.vector_store_path or "")
+        return "sqlite", ""
 
     def _world_lock(self, world: str) -> threading.RLock:
         with self._lock:
@@ -313,10 +332,13 @@ class WorldPool:
                 raise WorldSwitchError("world_busy", world)
             self._leases[world] = self._leases.get(world, 0) + 1
             engine = self._engines.get(world)
+            lost = world in self._workers_lost
         lease = EngineLease(self, world, None)
         try:
             if engine is None and build:
                 engine = self._build(world)
+            elif engine is not None and lost:
+                self._retry_lost_workers(world)
             lease.engine = engine
         except BaseException:
             engine = None
@@ -371,13 +393,61 @@ class WorldPool:
             ctx = self.context(world)
             self._refuse_leaked(ctx.db_path)          # 旧 Runtime 还开着这个库：不开第二条写连接
             engine = self._open_engine(world, ctx)
-            if self._background:
-                self._start_workers(world, engine)
-            with self._lock:
-                self._engines[world] = engine
+            self._publish(world, engine)
             return engine
         finally:
             lock.release()
+
+    def _publish(self, world: str, engine) -> None:
+        """持世界锁调用：先把引擎放进表，再按后台开关起线程（裁定 R23）。顺序不能反：起线程失败时引擎若还
+        不在表上，它的 Runtime（已打开写连接，起了一半的 tick 线程还引用着它）既没发布也没登记成泄漏，
+        下一次租约会在同一个库上再建一条写连接。起线程失败只记日志、标记 workers-lost，下一次租约补起；
+        这个引擎照常服务请求。"""
+        with self._lock:
+            self._engines[world] = engine
+        if self._background:
+            self._start_workers_or_mark_lost(world, engine)
+
+    def _start_workers_or_mark_lost(self, world: str, engine) -> bool:
+        """持世界锁调用。起 tick / 摄入线程；任一步失败就把已经起来的停掉（不留半套线程，补起时整套重来），
+        记日志，标记 workers-lost，返回 False。成功时清掉标记，返回 True。"""
+        try:
+            self._start_workers(world, engine)
+        except Exception:  # noqa: BLE001 — 线程起不来不能连带租约失败（与旧 _restart_lost_workers 相同）
+            logger.exception("cannot start background workers of world %s; retrying on the next "
+                             "lease", world)
+            if not engine.quiesce():
+                logger.warning("background threads of world %s did not stop after a failed start: %s",
+                               world, "/".join(engine.quiesce_stuck))
+            with self._lock:
+                self._workers_lost.add(world)
+            return False
+        with self._lock:
+            self._workers_lost.discard(world)
+        return True
+
+    def _retry_lost_workers(self, world: str) -> None:
+        """租约发现该世界 workers-lost：非阻塞取世界锁补起线程。世界锁被占（快照、关闭、恢复）就这次不补，
+        下一次租约再试；持租约时不能阻塞地等世界锁（见模块文档锁顺序）。补起失败同样只记日志。"""
+        lock = self._world_lock(world)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            with self._lock:
+                engine = self._engines.get(world)
+                still_lost = world in self._workers_lost
+                closing = world in self._closing or self._shut
+            if engine is None or not still_lost or closing or not self._background:
+                return
+            self._start_workers_or_mark_lost(world, engine)
+        finally:
+            engine = None
+            lock.release()
+
+    def workers_lost_worlds(self) -> list[str]:
+        """发布时没起来后台线程、等下一次租约补起的世界。"""
+        with self._lock:
+            return sorted(self._workers_lost)
 
     def _open_engine(self, world: str, ctx: WorldContext):
         """建引擎并挂上池的回调。失败抛 world_open_failed：清掉回溯里的栈帧，半建的 Runtime 不能被异常
@@ -510,6 +580,15 @@ class WorldPool:
         reg = self._require_registry()
         default = reg.default_world()
         merged = reg.update_settings(default, self._config.world_settings())
+        backend = self._config.vector_backend or "sqlite"
+        if backend != "sqlite":
+            with self._lock:
+                warn, self._vector_warned = not self._vector_warned, True
+            if warn:
+                # 裁定 R26：世界设置只收 sqlite。默认世界照常按 config 的后端打开，新世界一律 sqlite，
+                # 快照、恢复由 C++ 拒绝（snapshot_unsupported_backend）。
+                logger.warning("vector_backend=%r applies to the default world only; new worlds use "
+                               "sqlite, and snapshots of the default world are refused", backend)
         with self._lock:
             engine = self._engines.get(default)
         if engine is not None:
@@ -543,7 +622,7 @@ class WorldPool:
                 with self._lock:
                     engine = self._engines.get(world)
                 if engine is not None:
-                    self._start_workers(world, engine)
+                    self._start_workers_or_mark_lost(world, engine)
                 engine = None
         if self._registry is not None:
             self._start_thread(_SCHEDULER_THREAD, self._scheduler_loop,
@@ -669,6 +748,7 @@ class WorldPool:
         engine.session_snapshot_hook = None
         with self._lock:
             self._engines.pop(world, None)
+            self._workers_lost.discard(world)
         engine.close()
         engine = None
         self._cancel_debounce(world)
@@ -683,12 +763,10 @@ class WorldPool:
         return WorldSwitchError("world_busy", f"{stuck} thread did not stop in 5s")
 
     def _restart_after_failed_close(self, world: str, engine) -> None:
-        if not self._background:
-            return
-        try:
-            self._start_workers(world, engine)
-        except Exception:  # noqa: BLE001 — 线程起不来不能盖掉 world_busy
-            logger.exception("cannot restart background workers of world %s", world)
+        """关闭没成（world_busy）、引擎留在表上：把停掉的线程补回来。补不起来就标记 workers-lost，
+        下一次租约再试；不能盖掉 world_busy。"""
+        if self._background:
+            self._start_workers_or_mark_lost(world, engine)
 
     def _release_runtime(self, rt_ref, db_path: str) -> bool:
         """丢掉引擎之后等旧 Runtime 被回收，返回是否已回收。宽限期过了仍活着就记 warning，并把
@@ -815,7 +893,8 @@ class WorldPool:
                     "last_error_at": self._auto_last_error_at}
 
     def _vector_backend(self, world: str) -> str:
-        return _core.world_effective_settings(self._record(world)["settings"])["vector_backend"]
+        self._record(world)                           # world_not_found
+        return self._vector_store(world)[0]
 
     # ───────────────────────── 恢复（只停这一个世界，spec §7.2） ─────────────────────────
 
@@ -874,10 +953,7 @@ class WorldPool:
             detail = f"{cause}; reopening the world also failed: {exc}"
             logger.error("world rollback (%s): %s", world, detail)
             raise WorldSwitchError("world_open_failed", detail) from cause
-        if self._background:
-            self._start_workers(world, engine)
-        with self._lock:
-            self._engines[world] = engine
+        self._publish(world, engine)                  # 起线程失败只标记 workers-lost（裁定 R23）
 
     # ───────────────────────── 自动快照（W4） ─────────────────────────
 

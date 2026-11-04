@@ -53,7 +53,11 @@ class WorldContext:
     """一个世界打开引擎需要的全部输入，从注册表记录推出（WorldPool.context）。
 
     settings 是 C++ 补齐默认值后的完整 WorldSettings dict（字段见 world_settings.hpp），不含密钥。
-    ingest_spool_dir 是 <摄入根目录>/<world_ingest_partition(...)>（裁定 R4）。"""
+    ingest_spool_dir 是 <摄入根目录>/<world_ingest_partition(...)>（裁定 R4）。
+
+    vector_backend / vector_store_path 不从 settings 取（裁定 R26）：注册表里的设置只收 sqlite，默认世界
+    「原地」沿用 config 的向量后端与路径（zvec 的默认世界也照常打开，只是拍快照会被 C++ 拒绝），其余世界
+    一律 sqlite、没有路径。"""
     name: str
     dir_id: str
     db_path: str
@@ -62,19 +66,23 @@ class WorldContext:
     settings: dict = field(default_factory=dict)
     ingest_spool_dir: str = ""
     is_default: bool = True
+    vector_backend: str = "sqlite"
+    vector_store_path: str = ""
 
     @classmethod
     def from_config(cls, config) -> "WorldContext":
         """DashboardConfig → 默认世界的上下文（裁定 R17 的适配器：现有 DashboardEngine(cfg) 的写法）。
         只做字段搬运：设置取 config.world_settings() 再由 C++ 补默认值，分区目录名由 C++ 给。
         DashboardConfig.world_settings() 没写出的 auto_snapshot 由 C++ 补默认值；直接构造的引擎
-        不挂自动快照钩子，用不到它。"""
+        不挂自动快照钩子，用不到它。向量后端与路径直接取 config，不经设置（裁定 R26）。"""
         settings = _core.world_effective_settings(config.world_settings())
         spool = config.ingest_spool_root() / _core.world_ingest_partition(
             True, config.tenant, "default")
         return cls(name="default", dir_id="default", db_path=config.db_path,
                    tenant=config.tenant, agent=config.agent, settings=settings,
-                   ingest_spool_dir=str(spool), is_default=True)
+                   ingest_spool_dir=str(spool), is_default=True,
+                   vector_backend=config.vector_backend,
+                   vector_store_path=config.vector_store_path or "")
 
 
 # ── Phase 5 backpressure sampler defaults (L1 / L2) ─────────────────────────
@@ -151,6 +159,14 @@ def _env_swap(api_key: str, base_url: str, *,
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+
+def _service_openai_key() -> str | None:
+    """服务进程自己的 OPENAI_API_KEY（裁定 R22）。在 _ENV_SWAP_LOCK 下读：别的线程正在 _env_swap 里给
+    provider P 建适配器时，环境变量暂时是 P 的密钥，不持锁读会把它当成服务级密钥，发到客户端给的地址。
+    显式端点的世界只用这个函数取密钥。"""
+    with _ENV_SWAP_LOCK:
+        return os.environ.get("OPENAI_API_KEY")
 
 
 def _build_chat_adapter(llm_cfg: dict):
@@ -282,8 +298,8 @@ class DashboardEngine:
         lane = settings["source_lane"]
         self._core = MemoryCore(rt, agent=self._ctx.agent, tenant_id=self._ctx.tenant,
                                 adapter_name="dashboard", source_prefix="dash-",
-                                vector_backend=settings["vector_backend"],
-                                vector_store_path=None)
+                                vector_backend=self._ctx.vector_backend,
+                                vector_store_path=(self._ctx.vector_store_path or None))
         # 左脑 lane 读写两端：必须在 rebuild_embedder 之前登记，embedder 一到位
         # 就按它是否与标定一致决定 lane 是否生效（不一致时读写都不碰原文）。
         if lane["enabled"]:
@@ -306,11 +322,10 @@ class DashboardEngine:
         # world at creation, spec §8.2) + the live provider registry for keys.
         # No endpoint in the settings → {} → no api_key → None / stub, the same as
         # an unbound role today (裁定 R15: no fallback to the default world).
-        # consolidation 不在世界设置里（spec §8.1 的字段表没有它）：仍按 provider 注册表的角色绑定取，
-        # 只有直接用 DashboardConfig 构造的引擎（默认世界）才有 roles 可查。
+        # consolidation 是世界设置的第四个 endpoint（裁定 R25），与另外三个同样建、同样核对地址。
         self.set_llm(self._endpoint_cfg("extraction"))
         self.set_chat(self._endpoint_cfg("chat") or self._endpoint_cfg("extraction"))
-        self.set_consolidation(self._consolidation_cfg())                    # #38-C role consumer
+        self.set_consolidation(self._endpoint_cfg("consolidation"))          # #38-C role consumer
         self.set_gist_thresholds(self._settings.get("gist_thresholds") or {})  # #38-C v2 threshold surface
         self.rebuild_embedder(self._endpoint_cfg("embedding"), reembed=False)
         # dogfood sub-project A (Task 3): spool ingest worker — drains this
@@ -364,14 +379,10 @@ class DashboardEngine:
         if name:
             key = (self._providers.get(name) or {}).get("api_key")
         else:
-            key = os.environ.get("OPENAI_API_KEY")
+            key = _service_openai_key()
         if key:
             cfg["api_key"] = key
         return cfg
-
-    def _consolidation_cfg(self) -> dict:
-        resolve = getattr(self._cfg, "resolve_role", None)
-        return (resolve("consolidation") or {}) if callable(resolve) else {}
 
     def _require_endpoint_unchanged(self, role: str) -> None:
         """继承来的 endpoint（provider_name 非空）对 provider 的当前 base_url 做 C++ 核对
@@ -876,6 +887,8 @@ class DashboardEngine:
 
     def run_replay(self, mode: str, *, now=None) -> dict:
         with self._lock:
+            if self._core.consolidation_llm is not None:   # 离线回放用 consolidation 判 gist
+                self._require_endpoint_unchanged("consolidation")
             if not self._rt.adapter.write_admitted():
                 # host-side gate(P3.c write-gate follow-up):手动 replay 是重 DB 写。
                 # DRAINING/UNREADY 时拒(不跑 ReplayScheduler)。返回带标记 dict —— route

@@ -267,3 +267,88 @@ def test_failed_construction_does_not_pin_the_runtime(tmp_path, monkeypatch):
     gc.collect()
     assert built and built[0]() is None
     assert os.path.exists(tmp_path / "w1.db")
+
+
+# ───────────────────────── 修复轮 1 ─────────────────────────
+
+def test_explicit_endpoint_never_captures_a_key_mid_env_swap(tmp_path, monkeypatch):
+    """裁定 R22：别的线程正在 _env_swap 里给 provider P 建适配器时，环境变量暂时是 P 的密钥。显式端点
+    的世界（provider_name 为空、地址由客户端给）读服务级密钥时不能读到它，否则 P 的密钥会被发到客户端
+    给的地址（显式端点不做 endpoint_changed 核对）。"""
+    import threading
+    import starling.dashboard.engine as engmod
+    secret = "sk-provider-p-SECRET-7f3a"
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    captured = []
+    monkeypatch.setattr(engmod, "_build_chat_adapter",
+                        lambda cfg: captured.append(cfg.get("api_key")) or _core.FakeLLMAdapter())
+    ep = {"provider": "openai", "base_url": "http://client-chosen", "model": "m"}
+    stop = threading.Event()
+
+    def other_provider():
+        while not stop.is_set():
+            with engmod._env_swap(secret, "http://p"):
+                pass
+
+    swapper = threading.Thread(target=other_provider)
+    swapper.start()
+    try:
+        for idx in range(200):
+            DashboardEngine(_ctx(tmp_path, {"extraction": ep}, db_path=str(tmp_path / f"w{idx}.db")),
+                            {})
+    finally:
+        stop.set()
+        swapper.join(5)
+    assert secret not in captured
+    assert all(key is None for key in captured)              # 服务进程本身没设密钥
+
+
+def test_service_key_is_read_under_the_env_swap_lock(tmp_path, monkeypatch):
+    import starling.dashboard.engine as engmod
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-service")
+    assert engmod._service_openai_key() == "sk-service"
+    with engmod._env_swap("sk-other", ""):
+        pass
+    assert engmod._service_openai_key() == "sk-service"     # 换回之后照旧
+
+
+def test_consolidation_endpoint_comes_from_world_settings(tmp_path, monkeypatch):
+    """裁定 R25：consolidation 是世界设置里的第四个 endpoint，按 ctx.settings 建，同样核对地址。"""
+    import starling.dashboard.engine as engmod
+    built = []
+    monkeypatch.setattr(engmod, "_build_chat_adapter",
+                        lambda cfg: built.append(dict(cfg)) or _core.FakeLLMAdapter())
+    providers = {"j": {"provider": "openai", "model": "judge", "base_url": "http://j",
+                       "api_key": "sk-judge"}}
+    ep = {"provider": "openai", "provider_name": "j", "base_url": "http://j", "model": "judge"}
+    eng = DashboardEngine(_ctx(tmp_path, {"consolidation": ep}), providers)
+    assert eng._core.consolidation_llm is not None
+    assert [b["model"] for b in built] == ["judge"] and built[0]["api_key"] == "sk-judge"
+    assert eng.run_replay("idle")["mode"] == "idle"
+    providers["j"]["base_url"] = "http://elsewhere"
+    with pytest.raises(_core.WorldStoreError) as ei:
+        eng.run_replay("idle")
+    assert _core.world_store_error_code(ei.value) == "endpoint_changed"
+
+
+def _spy_vector_index(monkeypatch):
+    """这个构建没有 zvec：记下 MemoryCore 拿到的后端与路径，用 sqlite 句柄代替。"""
+    import starling._memory_core as mc
+    seen = []
+
+    def spy(backend, dim, store_path):
+        seen.append((backend, store_path))
+        return _core.SqliteBlobVectorIndex()
+
+    monkeypatch.setattr(mc, "_make_vector_index", spy)
+    return seen
+
+
+def test_config_adapter_passes_vector_backend_and_path_straight_through(tmp_path, monkeypatch):
+    """裁定 R26：DashboardEngine(config) 的向量后端与路径直接取 config，不经世界设置（世界设置只收 sqlite）。"""
+    seen = _spy_vector_index(monkeypatch)
+    cfg = DashboardConfig(db_path=str(tmp_path / "z.db"), token="", vector_backend="zvec",
+                          vector_store_path=str(tmp_path / "vectors"), source_lane_enabled=False)
+    eng = DashboardEngine(cfg)
+    assert seen == [("zvec", str(tmp_path / "vectors"))]
+    assert eng._settings["vector_backend"] == "sqlite"       # 设置里永远是 sqlite

@@ -801,3 +801,145 @@ def test_data_dir_follows_env_or_db_parent(tmp_path, monkeypatch):
     assert cfg.data_dir == str(tmp_path / "data")      # conftest 设了 STARLING_DATA_DIR
     monkeypatch.delenv("STARLING_DATA_DIR")
     assert cfg.data_dir == str(tmp_path)
+
+
+# ───────────────────────── 修复轮 1 ─────────────────────────
+
+def test_failed_worker_start_publishes_the_engine_and_retries(tmp_path, monkeypatch):
+    """裁定 R23：起后台线程失败时引擎照样发布（标记 workers-lost），下一次租约补起线程。不能留一个没登记的
+    活 Runtime，让下一次租约在同一个库上再建一条写连接。"""
+    refs = []
+
+    def factory(ctx, providers):
+        eng = DashboardEngine(ctx, providers)
+        refs.append(weakref.ref(eng._rt))
+        return eng
+
+    pool, _reg, _c = _pool(tmp_path, cfg=_cfg(tmp_path, tick_interval_s=60.0),
+                           engine_factory=factory)
+    try:
+        pool.create_world("w1", "")
+        pool.start_background(stats_interval_s=999, scheduler_poll_s=999,
+                              scheduler_first_delay_s=999)
+        real = DashboardEngine.start_ingest_worker
+        calls = {"n": 0}
+
+        def flaky(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("spool unreadable")
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(DashboardEngine, "start_ingest_worker", flaky)
+        with pool.lease("w1") as first:                      # 起线程失败不让租约失败
+            assert first is not None
+            first_id = id(first)
+        first = None
+        assert "w1" in pool.open_worlds()
+        assert pool.workers_lost_worlds() == ["w1"]
+        with pool.lease("w1") as second:                     # 下一次租约补起线程
+            assert id(second) == first_id
+            assert second._tick_thread is not None and second._ingest_thread is not None
+        second = None
+        gc.collect()
+        assert sum(ref() is not None for ref in refs) == 1    # 只有一个 Runtime 活着
+        assert pool.workers_lost_worlds() == []
+        ticks = [t for t in threading.enumerate() if t.name == "starling-bg-tick"]
+        assert len(ticks) == 1
+    finally:
+        pool.close_all()
+
+
+def test_reopen_after_rollback_with_failed_workers_still_publishes(tmp_path, monkeypatch):
+    pool, _reg, _c = _pool(tmp_path, cfg=_cfg(tmp_path, tick_interval_s=60.0))
+    try:
+        pool.create_world("w1", "")
+        _remember(pool, "w1", "Alice owns auth", subject="Alice")
+        snap = pool.take_snapshot("w1", "")
+        pool.start_background(stats_interval_s=999, scheduler_poll_s=999,
+                              scheduler_first_delay_s=999)
+
+        def boom(self, *args, **kwargs):
+            raise OSError("spool unreadable")
+
+        monkeypatch.setattr(DashboardEngine, "start_ingest_worker", boom)
+        out = pool.rollback("w1", snap["id"])                # 恢复本身成功
+        assert out["reopened"] is True
+        assert "w1" in pool.open_worlds() and pool.workers_lost_worlds() == ["w1"]
+    finally:
+        pool.close_all()
+
+
+def test_unbinding_a_role_and_resetting_gist_reach_the_registry(tmp_path):
+    """裁定 R24（复现审查的两个场景）：解绑抽取角色后同步，重建的默认世界引擎没有 llm；gist 阈值设成 {}
+    后同步，注册表里也是 {}。"""
+    cfg = _cfg(tmp_path, providers={"p": {"provider": "openai", "model": "m",
+                                          "base_url": "http://a", "api_key": "k"}},
+               roles={"extraction": "p"}, gist_thresholds={"min_holders": 4})
+    pool, reg, _c = _pool(tmp_path, cfg=cfg)
+    try:
+        assert reg.get("default")["settings"]["extraction"]["provider_name"] == "p"
+        cfg.roles["extraction"] = ""
+        cfg.gist_thresholds = {}
+        pool.sync_default_settings()
+        stored = reg.get("default")["settings"]
+        assert "extraction" not in stored and "chat" not in stored
+        assert stored["gist_thresholds"] == {}
+        eng = DashboardEngine(pool.context("default"), cfg.providers)
+        assert eng.llm is None
+        eng = None
+        pool.create_world("w2", "")                            # 新世界也不继承旧绑定
+        assert "extraction" not in reg.get("w2")["settings"]
+    finally:
+        pool.close_all()
+
+
+def test_pool_built_default_world_has_the_consolidation_role(tmp_path, monkeypatch):
+    """裁定 R25：按 pool.context("default") 建的默认世界引擎有 consolidation 适配器。"""
+    import starling.dashboard.engine as engmod
+    monkeypatch.setattr(engmod, "_build_chat_adapter", lambda cfg: _fake())
+    cfg = _cfg(tmp_path, providers={"j": {"provider": "openai", "model": "judge",
+                                          "base_url": "http://j", "api_key": "k"}},
+               roles={"consolidation": "j"})
+    pool, reg, _c = _pool(tmp_path, cfg=cfg)
+    try:
+        assert reg.get("default")["settings"]["consolidation"]["model"] == "judge"
+        with pool.lease("default") as eng:
+            assert eng._cfg is None                            # 走的是 WorldContext 这条路
+            assert eng._core.consolidation_llm is not None
+        cfg.roles["consolidation"] = ""
+        pool.sync_default_settings()
+        assert "consolidation" not in reg.get("default")["settings"]
+    finally:
+        pool.close_all()
+
+
+def test_registry_default_world_uses_config_vector_backend(tmp_path, monkeypatch, caplog):
+    """裁定 R26：注册表的默认世界按 config 的向量后端与路径建引擎（默认世界「原地」）；注册表里的设置与新世界
+    继承到的都是 sqlite；config 是 zvec 时同步记一次 warning。"""
+    import starling._memory_core as mc
+    seen = []
+
+    def spy(backend, dim, store_path):
+        seen.append((backend, store_path))
+        return _core.SqliteBlobVectorIndex()
+
+    monkeypatch.setattr(mc, "_make_vector_index", spy)
+    cfg = _cfg(tmp_path, vector_backend="zvec", vector_store_path=str(tmp_path / "vec"))
+    with caplog.at_level("WARNING"):
+        pool, reg, _c = _pool(tmp_path, cfg=cfg)
+        pool.sync_default_settings()
+    try:
+        assert sum("zvec" in rec.message for rec in caplog.records) == 1   # 只记一次
+        assert cfg.world_settings()["vector_backend"] == "sqlite"
+        assert reg.get("default")["settings"]["vector_backend"] == "sqlite"
+        with pool.lease("default"):
+            pass
+        assert seen[-1] == ("zvec", str(tmp_path / "vec"))
+        pool.create_world("w1", "")
+        assert reg.get("w1")["settings"]["vector_backend"] == "sqlite"
+        with pool.lease("w1"):
+            pass
+        assert seen[-1] == ("sqlite", None)
+    finally:
+        pool.close_all()

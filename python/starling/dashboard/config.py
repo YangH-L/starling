@@ -217,16 +217,18 @@ class DashboardConfig:
         密钥在调用时按 provider_name 从 providers 取（spec §8.3）。不带 background.auto_snapshot
         （裁定 R16），所以同步默认世界时保留注册表里按世界存的自动快照配置。
 
-        没绑定的角色不写出（合并保留注册表里已存的值）。chat 没绑定时按 DashboardConfig.chat()
-        的回退取抽取的 provider。"""
+        没绑定的角色（或绑到不存在的 provider）写 null，gist_thresholds 为空时写 null：合并本身删不掉
+        键，null 让 C++ 删掉注册表里的旧绑定、把阈值重置为 {}（裁定 R24）。chat 没绑定时按
+        DashboardConfig.chat() 的回退取抽取的 provider。vector_backend 永远写 sqlite（裁定 R26）：
+        注册表里的设置只收 sqlite，zvec 不进存着的、被继承的设置；默认世界的引擎直接按 config 的后端建。"""
         out: dict = {}
         for role, name in (("extraction", self.roles.get("extraction")),
                            ("embedding", self.roles.get("embedding")),
-                           ("chat", self.roles.get("chat") or self.roles.get("extraction"))):
+                           ("chat", self.roles.get("chat") or self.roles.get("extraction")),
+                           ("consolidation", self.roles.get("consolidation"))):
             prov = self.providers.get(name) if name else None
-            if prov is not None:
-                out[role] = _endpoint_settings(name, prov)
-        out["vector_backend"] = self.vector_backend
+            out[role] = _endpoint_settings(name, prov) if prov is not None else None
+        out["vector_backend"] = "sqlite"
         out["source_lane"] = {
             "enabled": bool(self.source_lane_enabled),
             "render_time": bool(self.source_lane_render_time),
@@ -236,8 +238,8 @@ class DashboardConfig:
             "k_source": int(self.source_lane_k_source),
             "chunk_byte_budget": int(self.source_lane_chunk_byte_budget),
         }
-        out["gist_thresholds"] = {k: v for k, v in (self.gist_thresholds or {}).items()
-                                  if v is not None}
+        gist = {k: v for k, v in (self.gist_thresholds or {}).items() if v is not None}
+        out["gist_thresholds"] = gist or None
         out["background"] = {"tick_interval_s": float(self.tick_interval_s)}
         return out
 
