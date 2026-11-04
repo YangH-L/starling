@@ -9,7 +9,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -144,31 +144,37 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
 
     app.state.ws_manager = ConnectionManager()
 
+    # 下面的路由函数一律从连接上取 app.state（ws.app / request.app），不闭包捕获 app、config、pool
+    # （裁定 R29）：FastAPI 在模块级 lru_cache 里留着每个路由函数，捕获了它们，丢掉的 app 就连同引擎池、
+    # 已开的 C++ 写连接一直活着（测试里每个 create_app 都留下一份，gc 越来越慢）。
+
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
+        state = ws.app.state
+        cfg = state.config
         origin = ws.headers.get("origin", "")
-        if not _ws_origin_allowed(origin, config.cors_origins):
+        if not _ws_origin_allowed(origin, cfg.cors_origins):
             await ws.close(code=1008)
             return
         # auth handshake: first text frame must be the token (when configured).
         # Sending the token in-band (not via URL query) avoids leaking it in logs.
-        if config.token:
+        if cfg.token:
             await ws.accept()
             try:
                 first = await ws.receive_text()
             except WebSocketDisconnect:
                 return
-            if not hmac.compare_digest(first, config.token):
+            if not hmac.compare_digest(first, cfg.token):
                 await ws.close(code=1008)
                 return
-            app.state.ws_manager.register(ws)
+            state.ws_manager.register(ws)
         else:
-            await app.state.ws_manager.connect(ws)
+            await state.ws_manager.connect(ws)
         try:
             while True:
                 await ws.receive_text()
         except WebSocketDisconnect:
-            app.state.ws_manager.disconnect(ws)
+            state.ws_manager.disconnect(ws)
 
     @app.websocket("/ws/converse")
     async def ws_converse(ws: WebSocket) -> None:
@@ -185,17 +191,19 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         # after the stream) — disconnect mid-stream does not abort the turn.
         from starling.dashboard.engine import _LLMNotConfigured
 
+        state = ws.app.state
+        cfg, pool = state.config, state.pool
         origin = ws.headers.get("origin", "")
-        if not _ws_origin_allowed(origin, config.cors_origins):
+        if not _ws_origin_allowed(origin, cfg.cors_origins):
             await ws.close(code=1008)
             return
         await ws.accept()
-        if config.token:
+        if cfg.token:
             try:
                 first = await ws.receive_text()
             except WebSocketDisconnect:
                 return
-            if not hmac.compare_digest(first, config.token):
+            if not hmac.compare_digest(first, cfg.token):
                 await ws.close(code=1008)
                 return
         try:
@@ -299,13 +307,13 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         await ws.send_json({"type": "done", **result})
         # Mirror POST /converse: a consolidated turn tells other views to refresh.
         if result.get("statement_ids"):
-            await app.state.ws_manager.broadcast_world(
+            await state.ws_manager.broadcast_world(
                 "statement_added", world, {"statement_ids": result["statement_ids"]})
         await ws.close()
 
     @app.get("/health")
-    async def health() -> dict:
-        return {"status": "ok", "version": app.version}
+    async def health(request: Request) -> dict:
+        return {"status": "ok", "version": request.app.version}
 
     @app.get("/api/ping", dependencies=[Depends(require_token)])
     async def ping() -> dict:

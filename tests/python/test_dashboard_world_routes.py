@@ -219,3 +219,53 @@ def test_lifespan_drains_then_closes_every_world(tmp_path, monkeypatch):
     last_drain = max(i for i, (_w, name) in enumerate(events) if name == "begin_drain")
     first_stop = min(i for i, (_w, name) in enumerate(events) if name != "begin_drain")
     assert last_drain < first_stop, events
+
+
+# ───────────────────────── 丢掉的 app 不留下池与引擎（裁定 R29） ─────────────────────────
+
+def _build_and_discard(tmp_path, monkeypatch, index: int, shape: str):
+    """建一个 app、按 shape 用一下、丢掉，只返回弱引用：(池, 默认世界引擎的 Runtime 或 None)。
+    FastAPI 在模块级 lru_cache 里留着每个路由函数；路由函数若闭包捕获 app 或池，丢掉的 app 就一直
+    活着，连同它开着的 C++ 写连接。"""
+    import weakref
+    root = tmp_path / f"app{index}"
+    cfg = DashboardConfig(db_path=str(root / "dashboard.db"), token="",
+                          tick_interval_s=600.0 if shape == "lifespan" else 0,
+                          source_lane_enabled=False, ingest_spool_path=str(root / "spool"))
+    root.mkdir()
+    monkeypatch.setenv("STARLING_DATA_DIR", str(root / "data"))   # 每个 app 各自的注册表
+    if shape == "injected":
+        app = create_app(cfg, engine=DashboardEngine(cfg))
+    else:
+        app = create_app(cfg, engine_factory=_stub_factory)
+    pool_ref = weakref.ref(app.state.pool)
+    if shape == "lifespan":
+        with TestClient(app) as test_client:
+            _remember(test_client, "/api")
+            with test_client.websocket_connect("/ws"):
+                pass
+            with test_client.websocket_connect("/ws/converse") as ws:
+                ws.send_json({"message": ""})
+                ws.receive_json()
+    else:
+        test_client = TestClient(app)
+        assert test_client.get("/health").status_code == 200
+        assert test_client.post("/api/tick", json={}).status_code == 200
+    with app.state.pool._lock:
+        engine = app.state.pool._engines.get("default")
+        rt_ref = weakref.ref(engine._rt) if engine is not None else None
+    engine = None
+    if shape == "lifespan":
+        assert rt_ref is None                    # 关停已关掉默认世界；Runtime 在下面一并确认已回收
+    return pool_ref, rt_ref
+
+
+@pytest.mark.parametrize("shape", ["plain", "injected", "lifespan"])
+def test_discarded_apps_release_pool_and_runtime(tmp_path, monkeypatch, shape):
+    import gc
+    refs = [_build_and_discard(tmp_path, monkeypatch, index, shape) for index in range(3)]
+    gc.collect()
+    for pool_ref, rt_ref in refs:
+        assert pool_ref() is None, "丢掉的 app 的引擎池还活着"
+        if rt_ref is not None:
+            assert rt_ref() is None, "丢掉的 app 的默认世界 Runtime 还活着（C++ 写连接没释放）"
