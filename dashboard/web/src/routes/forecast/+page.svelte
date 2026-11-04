@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { api, type ForecastResponse } from '$lib/api';
+	import { api, type ForecastResponse, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Badge, EmptyState, Skeleton } from '$lib/components/ui';
 	import { retrievabilityPct, riskTone, riskLabel, type Tone } from '$lib/forecast';
 
-	const q = createQuery(() => api.get<ForecastResponse>('/api/forecast'));
+	const q = createQuery(() => api.get<ForecastResponse>(worldPath('/api/forecast')));
 	$effect(() => {
 		q.refetch();
 	});

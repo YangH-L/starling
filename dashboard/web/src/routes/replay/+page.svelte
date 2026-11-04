@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import DataTable from '$lib/components/DataTable.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -13,7 +13,7 @@
 		ledger: LedgerRow[];
 		windows: Record<string, unknown>[];
 	};
-	const q = createQuery(() => api.get<ReplayData>('/api/replay'));
+	const q = createQuery(() => api.get<ReplayData>(worldPath('/api/replay')));
 	$effect(() => {
 		q.refetch();
 	});
@@ -24,7 +24,7 @@
 		triggering = true;
 		try {
 			const r = await api.post<{ mode: string; sampled: number; compressed: number }>(
-				'/api/replay_trigger',
+				worldPath('/api/replay_trigger'),
 				{ mode },
 				{ timeoutMs: 60000 }
 			);

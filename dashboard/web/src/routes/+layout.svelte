@@ -7,6 +7,8 @@
 	import { page } from '$app/state';
 	import { api } from '$lib/api';
 	import { connectWs } from '$lib/ws';
+	import { currentWorld, setWorld, noteDefaultWorld, withWorld } from '$lib/world.svelte';
+	import { worldsApi, type WorldRow } from '$lib/worlds';
 	import { wsConn, llmConfigured, embedderConfigured, lastWsEvent } from '$lib/health';
 	import { type Config, roleConfigured } from '$lib/models';
 	import { ALL_NAV_ITEMS, NAV_GROUPS, matchesHref, activeNavItem } from '$lib/nav';
@@ -48,7 +50,7 @@
 	function go(href: string) {
 		search = '';
 		searchEl?.blur();
-		goto(href);
+		goto(withWorld(href));
 	}
 	function onSearchKey(e: KeyboardEvent) {
 		if (e.key === 'Enter' && hits.length) go(hits[0].href);
@@ -80,6 +82,48 @@
 			})
 			.catch(() => (healthOk = false));
 	});
+
+	// ── 世界选择器(裁定 R44) ──────────────────────────────────────────────
+	// 选中的世界只在 URL ?world= 里。下拉列第一页(50 个)世界,在已载入的这一页里按输入过滤;
+	// 更多世界去 /worlds(那里有标签过滤与分页)。启动时顺带取一次默认世界名。
+	const WORLD_PAGE = 50;
+	let worldList = $state<WorldRow[]>([]);
+	let worldTotal = $state(0);
+	let worldMenuOpen = $state(false);
+	let worldFilter = $state('');
+	let worldFilterEl = $state<HTMLInputElement | null>(null);
+	let curWorld = $derived(currentWorld());
+	let shownWorlds = $derived.by(() => {
+		const f = worldFilter.trim().toLowerCase();
+		return f
+			? worldList.filter((w) => `${w.name} ${w.label}`.toLowerCase().includes(f))
+			: worldList;
+	});
+	async function loadWorlds() {
+		try {
+			const r = await worldsApi.list({ offset: 0, limit: WORLD_PAGE });
+			noteDefaultWorld(r.default);
+			worldList = r.worlds;
+			worldTotal = r.total;
+		} catch {
+			/* 世界列表取不到时选择器仍显示当前世界名,不挡住别的页面 */
+		}
+	}
+	$effect(() => {
+		void loadWorlds();
+	});
+	function toggleWorldMenu() {
+		worldMenuOpen = !worldMenuOpen;
+		if (worldMenuOpen) {
+			worldFilter = '';
+			void loadWorlds();
+			setTimeout(() => worldFilterEl?.focus(), 0);
+		}
+	}
+	function pickWorld(name: string) {
+		worldMenuOpen = false;
+		setWorld(name);
+	}
 
 	$effect(() => {
 		const dispose = connectWs((e) => lastWsEvent.set(e));
@@ -132,7 +176,7 @@
 			: 'hidden'} w-56 shrink-0 flex-col border-r border-border bg-surface md:flex"
 		aria-label="主导航"
 	>
-		<a href="/" class="flex items-center gap-2.5 px-4 pb-2 pt-4">
+		<a href={withWorld('/')} class="flex items-center gap-2.5 px-4 pb-2 pt-4">
 			<span class="flex size-8 items-center justify-center rounded-control bg-brand-tint-strong text-base"
 				>🪶</span
 			>
@@ -172,7 +216,7 @@
 						<div class="mt-0.5">
 							{#each g.items as n}
 								<a
-									href={n.href}
+									href={withWorld(n.href)}
 									aria-current={isActive(n.href) ? 'page' : undefined}
 									onclick={() => (mobileOpen = false)}
 									class="mb-0.5 flex items-center gap-2.5 rounded-control px-2.5 py-1.5 text-sm transition {isActive(
@@ -215,7 +259,7 @@
 				>☰</IconButton
 			>
 			<nav aria-label="面包屑" class="flex items-center gap-1.5 text-sm">
-				<a href="/" class="text-subtle hover:text-fg">Starling</a>
+				<a href={withWorld('/')} class="text-subtle hover:text-fg">Starling</a>
 				{#if crumb}
 					<span class="text-subtle" aria-hidden="true">›</span>
 					<span class="text-subtle">{crumb.group}</span>
@@ -223,7 +267,62 @@
 					<span class="font-medium text-brand">{crumb.label}</span>
 				{/if}
 			</nav>
-			<div class="relative ml-auto hidden sm:block">
+			<div class="relative ml-auto">
+				<button
+					type="button"
+					onclick={toggleWorldMenu}
+					aria-haspopup="listbox"
+					aria-expanded={worldMenuOpen}
+					aria-label={`当前世界：${curWorld}，点击切换`}
+					class="flex max-w-48 items-center gap-1.5 rounded-full border border-border bg-surface px-3 py-1.5 text-sm text-fg transition hover:bg-brand-tint focus-visible:outline-2 focus-visible:outline-offset-0 focus-visible:outline-brand"
+				>
+					<span class="text-xs text-subtle">世界</span>
+					<span class="truncate font-medium">{curWorld}</span>
+				</button>
+				{#if worldMenuOpen}
+					<div
+						class="absolute right-0 top-full z-50 mt-1 w-64 overflow-hidden rounded-control border border-border bg-card py-1 shadow-lg"
+					>
+						<input
+							bind:this={worldFilterEl}
+							bind:value={worldFilter}
+							onkeydown={(e) => {
+								if (e.key === 'Escape') worldMenuOpen = false;
+								if (e.key === 'Enter' && shownWorlds.length) pickWorld(shownWorlds[0].name);
+							}}
+							placeholder="输入过滤世界"
+							aria-label="过滤世界"
+							class="mx-2 mb-1 w-[calc(100%-1rem)] rounded-control border border-border bg-surface px-2 py-1 text-sm text-fg placeholder:text-subtle"
+						/>
+						<ul role="listbox" aria-label="世界" class="max-h-64 overflow-y-auto">
+							{#each shownWorlds as w (w.name)}
+								<li role="option" aria-selected={w.name === curWorld}>
+									<button
+										type="button"
+										onclick={() => pickWorld(w.name)}
+										class="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-sm hover:bg-brand-tint {w.name ===
+										curWorld
+											? 'font-medium text-brand'
+											: 'text-fg'}"
+									>
+										<span class="truncate">{w.name}</span>
+										{#if w.label}<span class="truncate text-xs text-subtle">{w.label}</span>{/if}
+									</button>
+								</li>
+							{:else}
+								<li class="px-3 py-1.5 text-xs text-subtle">没有匹配的世界</li>
+							{/each}
+						</ul>
+						<a
+							href="/worlds"
+							onclick={() => (worldMenuOpen = false)}
+							class="block border-t border-border px-3 py-1.5 text-xs text-muted hover:bg-brand-tint hover:text-fg"
+							>全部世界…{worldTotal > worldList.length ? `（共 ${worldTotal} 个）` : ''}</a
+						>
+					</div>
+				{/if}
+			</div>
+			<div class="relative hidden sm:block">
 				<input
 					bind:this={searchEl}
 					bind:value={search}

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import Graph from '$lib/components/Graph.svelte';
 	import DataTable from '$lib/components/DataTable.svelte';
@@ -15,7 +15,7 @@
 		fiske_weights_json: string;
 	};
 
-	const q = createQuery(() => api.get<{ nodes: Cognizer[]; relations: Relation[] }>('/api/cognizers'));
+	const q = createQuery(() => api.get<{ nodes: Cognizer[]; relations: Relation[] }>(worldPath('/api/cognizers')));
 	$effect(() => {
 		q.refetch();
 	});

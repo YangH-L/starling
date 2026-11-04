@@ -1,19 +1,19 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent } from '$lib/world.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Card, Badge, Skeleton, EmptyState } from '$lib/components/ui';
 	import { stateTone, isHealthy, nonZeroMetrics, type RuntimeHealthResponse } from '$lib/runtime_health';
 
 	// D4 (/plan-design-review): reuse createQuery + existing WS tick refetch. No new WS event types.
-	const q = createQuery(() => api.get<RuntimeHealthResponse>('/api/runtime_health'));
+	const q = createQuery(() => api.get<RuntimeHealthResponse>(worldPath('/api/runtime_health')));
 	$effect(() => {
 		q.refetch();
 	});
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	const healthy = $derived(q.data != null && isHealthy(q.data));

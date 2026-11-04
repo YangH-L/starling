@@ -1,7 +1,8 @@
 <script lang="ts">
+	import { withWorld } from '$lib/world.svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { api, type ProvenanceNode, type StatementSearchResponse } from '$lib/api';
+	import { api, type ProvenanceNode, type StatementSearchResponse, worldPath } from '$lib/api';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import CodeBlock from '$lib/components/CodeBlock.svelte';
 	import { Card, Badge, Button, Input, EmptyState, Skeleton } from '$lib/components/ui';
@@ -30,7 +31,7 @@
 		loading = true;
 		loadErr = '';
 		try {
-			tree = await api.get<ProvenanceNode>(`/api/provenance/${encodeURIComponent(id)}`);
+			tree = await api.get<ProvenanceNode>(worldPath(`/api/provenance/${encodeURIComponent(id)}`));
 		} catch (e) {
 			tree = null;
 			loadErr = e instanceof Error ? e.message : String(e);
@@ -41,7 +42,7 @@
 
 	// 选中 → 反映到 URL(可分享/可回退),effect 据此加载。
 	function select(id: string) {
-		void goto(`/lens?stmt=${encodeURIComponent(id)}`, { keepFocus: true, noScroll: true });
+		void goto(withWorld(`/lens?stmt=${encodeURIComponent(id)}`), { keepFocus: true, noScroll: true });
 	}
 
 	async function runSearch() {
@@ -54,7 +55,7 @@
 		searchErr = '';
 		try {
 			const r = await api.get<StatementSearchResponse>(
-				`/api/statement_search?q=${encodeURIComponent(q)}`
+				worldPath(`/api/statement_search?q=${encodeURIComponent(q)}`)
 			);
 			searchRows = r.rows;
 		} catch (e) {

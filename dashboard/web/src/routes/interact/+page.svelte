@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { api, type PlannedRecallResponse } from '$lib/api';
+	import { withWorld } from '$lib/world.svelte';
+	import { api, type PlannedRecallResponse, worldPath } from '$lib/api';
 	import { toast } from '$lib/ui/toast';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Button, Textarea, Input, Badge, Card, Chip, EmptyState, Select } from '$lib/components/ui';
@@ -67,7 +68,7 @@
 			if (interlocutor) body.interlocutor = interlocutor;
 			if (extractProvider) body.provider = extractProvider;
 			// 真模型抽取实测 20-110s(长文本更慢),放宽到 180s(后端有自己的重试与超时)。
-			const r = await api.post<{ statement_ids: string[]; outcome: string }>('/api/remember', body, {
+			const r = await api.post<{ statement_ids: string[]; outcome: string }>(worldPath('/api/remember'), body, {
 				timeoutMs: 180_000
 			});
 			remembered = r.statement_ids;
@@ -87,14 +88,14 @@
 			if (mode.startsWith('intent:')) {
 				const body: Record<string, unknown> = { query, intent: mode.slice(7) };
 				if (target.trim()) body.target = target.trim();
-				const r = await api.post<PlannedRecallResponse>('/api/recall', body, {
+				const r = await api.post<PlannedRecallResponse>(worldPath('/api/recall'), body, {
 					timeoutMs: 60_000
 				});
 				planned = r;
 				results = r.results;
 			} else {
 				const r = await api.post<{ results: typeof results }>(
-					'/api/recall',
+					worldPath('/api/recall'),
 					{ query, mode },
 					{ timeoutMs: 60_000 } // query embed 走网络,留足重试余量
 				);
@@ -140,7 +141,7 @@
 			{:else if remembered.length}
 				<div class="flex flex-wrap gap-1">
 					{#each remembered as id}
-						<a href="/statements" title={id}><Badge tone="brand">{id.slice(0, 8)}…</Badge></a>
+						<a href={withWorld('/statements')} title={id}><Badge tone="brand">{id.slice(0, 8)}…</Badge></a>
 					{/each}
 				</div>
 			{/if}

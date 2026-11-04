@@ -1,6 +1,7 @@
 <script lang="ts">
+	import { withWorld } from '$lib/world.svelte';
 	import { goto } from '$app/navigation';
-	import { api, type EngramDetail, type EngramListResp, type EngramRow } from '$lib/api';
+	import { api, type EngramDetail, type EngramListResp, type EngramRow, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import DataTable from '$lib/components/DataTable.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -20,7 +21,7 @@
 		if (privacyClass) p.set('privacy_class', privacyClass);
 		if (erased) p.set('erased', erased);
 		if (q) p.set('q', q);
-		return `/api/engrams?${p}`;
+		return worldPath(`/api/engrams?${p}`);
 	}
 	const listQuery = createQuery(() => api.get<EngramListResp>(url()));
 	$effect(() => {
@@ -50,7 +51,7 @@
 		detailLoading = true;
 		detailForId = id;
 		try {
-			const res = await api.get<EngramDetail>(`/api/engram/${encodeURIComponent(id)}`);
+			const res = await api.get<EngramDetail>(worldPath(`/api/engram/${encodeURIComponent(id)}`));
 			if (detailForId === id) detail = res;
 		} catch (e) {
 			if (detailForId === id) detailError = e instanceof Error ? e.message : String(e);
@@ -200,7 +201,7 @@
 								<span class="truncate text-fg">{r.subject_id} {r.predicate}</span>
 								<Button
 									variant="ghost"
-									onclick={() => goto(`/lens?stmt=${encodeURIComponent(r.id)}`)}
+									onclick={() => goto(withWorld(`/lens?stmt=${encodeURIComponent(r.id)}`))}
 								>
 									透视 →
 								</Button>

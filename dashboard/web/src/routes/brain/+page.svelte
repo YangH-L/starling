@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Badge, Skeleton, EmptyState } from '$lib/components/ui';
@@ -15,7 +15,7 @@
 		dormant: boolean; // true = 特性未落地(透视镜),静默显、不可点
 	};
 
-	const q = createQuery(() => api.get<{ regions: Region[] }>('/api/brain_map'));
+	const q = createQuery(() => api.get<{ regions: Region[] }>(worldPath('/api/brain_map')));
 	$effect(() => {
 		q.refetch();
 	});

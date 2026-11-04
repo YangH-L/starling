@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent } from '$lib/world.svelte';
 	import { labelFor, glossFor, orderedEntries } from '$lib/labels';
 	import StatCard from '$lib/components/StatCard.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -15,7 +15,7 @@
 		vectors_by_status: Record<string, number>;
 	};
 
-	const q = createQuery(() => api.get<QueueData>('/api/queues'));
+	const q = createQuery(() => api.get<QueueData>(worldPath('/api/queues')));
 	$effect(() => {
 		q.refetch();
 	});
@@ -24,7 +24,7 @@
 	//   embedding_backlog = statements 里没有向量的行 —— 而 post-write pump 没有 embed 阶段
 	//                       (嵌入只在 tick 跑),故新语句落库「瞬间」积压 +1,只订 tick 要等 30s。
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	let ticking = $state(false);
@@ -33,7 +33,7 @@
 		ticking = true;
 		try {
 			// tick 批量嵌入积压语句(逐条走网络),按积压量放宽。
-			await api.post('/api/tick', {}, { timeoutMs: 120_000 });
+			await api.post(worldPath('/api/tick'), {}, { timeoutMs: 120_000 });
 			toast.success('Tick 发送成功');
 			await q.refetch();
 		} catch (e) {

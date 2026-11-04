@@ -1,14 +1,14 @@
 <script lang="ts">
-	import { api, type Gist, type GistData, type GistMember } from '$lib/api';
+	import { api, type Gist, type GistData, type GistMember, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent } from '$lib/world.svelte';
 	import { toast } from '$lib/ui/toast';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Badge, Card, EmptyState, Skeleton, Drawer } from '$lib/components/ui';
 
 	// #38-C v2 可观测:固化 NORM gist 的只读检视(GET /api/gists)+ 谱系钻取。
-	const q = createQuery(() => api.get<GistData>('/api/gists'));
+	const q = createQuery(() => api.get<GistData>(worldPath('/api/gists')));
 	$effect(() => {
 		q.refetch();
 	});
@@ -16,7 +16,7 @@
 	// review M1 — 但页面还渲染 review_status 与 consolidation_state,而审批走 /review
 	// (广播 statement_added)、遗忘走 statement_forgotten,只订 tick 会漏掉这两类。
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	let gists = $derived(q.data?.gists ?? []);
@@ -45,7 +45,7 @@
 		detailForId = gist.id;
 		try {
 			const res = await api.get<{ members: GistMember[] }>(
-				`/api/gist_members/${encodeURIComponent(gist.id)}`
+				worldPath(`/api/gist_members/${encodeURIComponent(gist.id)}`)
 			);
 			if (detailForId === gist.id) members = res.members;
 		} catch (e) {

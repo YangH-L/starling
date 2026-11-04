@@ -242,6 +242,8 @@
 		if (!tenant || clearConfirm !== tenant) return;
 		clearing = true;
 		try {
+			// 固定走旧路径 /api/clear_memory(默认世界):这里的租户名取自 /api/config(默认世界的租户),
+			// 确认串与之对应;不随顶栏选中的世界走,免得拿默认世界的租户名去确认另一个世界。
 			const r = await api.post<{ tenant: string; total: number; spool_discarded: number }>(
 				'/api/clear_memory',
 				{ confirm: clearConfirm },

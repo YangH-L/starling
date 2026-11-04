@@ -14,12 +14,28 @@
 //   commitment_transition  {stmt_id, state}            commands.py:214,226
 //   statement_forgotten    {forgotten: number}         commands.py:174
 //   memory_cleared         {tenant, total, spool_discarded}  commands.py clear_memory
-//   world_switched         {active}                    routes/worlds.py(W1/W2)
+//   world_changed          {statements, last_write_at, ...}  引擎池,每世界每秒至多一条(去抖)
 //   snapshot_created       {world, id}                 routes/worlds.py(W1/W2)
 //   world_rolled_back      {world, snapshot_id}        routes/worlds.py(W3)
 //
 // 未知类型/缺字段/脏 payload 一律优雅回退(只读面板,不因后端加事件或改 payload 而崩)。
 // 原则:宁可少说,不断言——无法确认时给空细节,不编造「空转」之类的结论。
+
+import { mutatesMemory, type WsEvent } from './ws';
+
+/**
+ * 这条消息属于 world 吗?广播 /ws 把所有世界的消息发给每个客户端,页面只处理当前世界的。
+ * 没带 world 的帧(旧后端)一律放行,免得升级窗口里页面不刷新。
+ */
+export const isForWorld = (e: { world?: string }, world: string): boolean =>
+	e.world === undefined || e.world === world;
+
+/**
+ * 当前页要不要因为这条消息重取。纯读事件(recall)不重取;别的世界的消息忽略;
+ * world 传 null = 不限世界(世界列表页:任何世界变了都要刷新)。
+ */
+export const shouldRefetch = (e: WsEvent | null | undefined, world: string | null): boolean =>
+	!!e && mutatesMemory(e) && (world === null || isForWorld(e, world));
 
 export type FeedTone = 'neutral' | 'brand' | 'success' | 'warn' | 'danger' | 'info';
 
@@ -165,10 +181,14 @@ export function describeEvent(type: string, payload: unknown): FeedEventView {
 				.join(' · ');
 			return { label: '清空记忆', detail, tone: 'danger' };
 		}
-		case 'world_switched': {
-			// 世界页「切换」成功:整个数据源换了,detail 点出切到了哪个世界。
-			const active = typeof p.active === 'string' ? p.active : '';
-			return { label: '切换世界', detail: active ? `切换到世界 ${active}` : '', tone: 'info' };
+		case 'world_changed': {
+			// 某个世界有写入(后端去抖后的汇总),detail 给出写入后的语句总数。
+			const n = num(p.statements);
+			return {
+				label: '世界有写入',
+				detail: n === null ? '' : `语句共 ${n} 条`,
+				tone: 'info'
+			};
 		}
 		case 'snapshot_created': {
 			const world = typeof p.world === 'string' ? p.world : '';

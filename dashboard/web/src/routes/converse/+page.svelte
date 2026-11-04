@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { api, type ConverseResponse } from '$lib/api';
+	import { currentWorld, withWorld } from '$lib/world.svelte';
 	import { streamConverse } from '$lib/ws';
 	import { toast } from '$lib/ui/toast';
 	import { worldErrorMessage } from '$lib/worlds';
@@ -47,7 +48,7 @@
 		const idx = turns.length; // assistant turn 的下标(下面紧接 push)
 		turns = [...turns, { role: 'assistant', text: '', streaming: true }];
 		streamConverse(
-			{ message: msg, ...(chatProvider ? { provider: chatProvider } : {}) },
+			{ message: msg, world: currentWorld(), ...(chatProvider ? { provider: chatProvider } : {}) },
 			{
 				onStatus: (status) => {
 					turns[idx].status = status;
@@ -66,7 +67,7 @@
 				onError: (code) => {
 					if (code === 'llm_not_configured')
 						toast.error('未配置 LLM:去「模型」页绑定 extraction / chat 角色');
-					else if (code === 'world_switching') toast.error(worldErrorMessage(code));
+					else if (code === 'world_busy') toast.error(worldErrorMessage(code));
 					else toast.error('对话出错:' + code);
 					if (!turns[idx].text) turns[idx].text = `（出错:${code}）`;
 					turns[idx].streaming = false;
@@ -128,7 +129,7 @@
 												: '无回复'}
 									/>
 									{#each tr.statement_ids as id}
-										<a href="/statements" title={id}><Chip>{id.slice(0, 8)}…</Chip></a>
+										<a href={withWorld('/statements')} title={id}><Chip>{id.slice(0, 8)}…</Chip></a>
 									{/each}
 									{#if tr.gen_total_tokens || tr.gen_latency_ms}
 										<span class="text-subtle"

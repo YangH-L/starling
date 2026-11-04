@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { api, worldPath } from '$lib/api';
 	import { byDeadline, deriveFired, isOverdue } from '$lib/commitments';
 	import { createQuery } from '$lib/query.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -15,7 +15,7 @@
 	};
 	type Trigger = { commitment_stmt_id: string; status: string };
 
-	const q = createQuery(() => api.get<{ rows: Row[]; triggers: Trigger[] }>('/api/commitments'));
+	const q = createQuery(() => api.get<{ rows: Row[]; triggers: Trigger[] }>(worldPath('/api/commitments')));
 	$effect(() => {
 		q.refetch();
 	});

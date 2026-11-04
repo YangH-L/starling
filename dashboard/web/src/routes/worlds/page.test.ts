@@ -3,6 +3,7 @@ import { tick } from 'svelte';
 import { render, fireEvent } from '@testing-library/svelte';
 import { ApiError } from '$lib/api';
 import { lastWsEvent } from '$lib/health';
+import { noteDefaultWorld } from '$lib/world.svelte';
 
 const toastError = vi.fn();
 const toastSuccess = vi.fn();
@@ -16,7 +17,7 @@ vi.mock('$lib/ui/toast', () => ({
 
 const list = vi.fn();
 const create = vi.fn();
-const activate = vi.fn();
+const detail = vi.fn();
 const remove = vi.fn();
 const snapshots = vi.fn();
 const snapshot = vi.fn();
@@ -32,7 +33,7 @@ vi.mock('$lib/worlds', async (orig) => {
 		worldsApi: {
 			list: (...a: unknown[]) => list(...a),
 			create: (...a: unknown[]) => create(...a),
-			activate: (...a: unknown[]) => activate(...a),
+			detail: (...a: unknown[]) => detail(...a),
 			remove: (...a: unknown[]) => remove(...a),
 			snapshots: (...a: unknown[]) => snapshots(...a),
 			snapshot: (...a: unknown[]) => snapshot(...a),
@@ -56,18 +57,31 @@ const settle = async () => {
 };
 
 const DATA = {
-	active: 'default', default: 'default', snapshot_retention: 5,
+	default: 'default', total: 2, snapshot_retention: 5,
 	auto_snapshot_status: { failures: 0, last_error: null, last_error_at: null },
 	worlds: [
-		{ name: 'default', label: '主世界', tenant: 'default', created_at: '', active: true,
-		  db_bytes: 2_500_000_000, live_bytes: 60_000_000, statements: 3632, engrams: 101,
+		{ name: 'default', label: '主世界', labels: {}, tenant: 'default', created_at: '', open: true,
+		  holders: 4, last_write_at: '2026-11-03T10:00:00Z', statements: 3632,
 		  snapshots: 0, snapshot_bytes: 0, archives: 0, archive_bytes: 0,
 		  auto_snapshot: { on_session: false, interval_hours: 24 } },
-		{ name: 'sim-1', label: '', tenant: 'sim-1', created_at: '', active: false,
-		  db_bytes: 0, live_bytes: 0, statements: 0, engrams: 0, snapshots: 0, snapshot_bytes: 0,
+		{ name: 'sim-1', label: '', labels: { env: 'test' }, tenant: 'sim-1', created_at: '', open: false,
+		  holders: 0, last_write_at: null, statements: 0, snapshots: 0, snapshot_bytes: 0,
 		  archives: 0, archive_bytes: 0, auto_snapshot: { on_session: true, interval_hours: 0 } }
 	]
 };
+
+// 默认世界的详情:新建世界表单的自动快照初值取自它的 settings.background.auto_snapshot。
+const DEFAULT_DETAIL = {
+	...DATA.worlds[0],
+	db_bytes: 2_500_000_000, live_bytes: 60_000_000, engrams: 101,
+	settings: { background: { auto_snapshot: { on_session: true, interval_hours: 0 } } }
+};
+
+// 每个用例都先把默认世界的详情接好（新建表单挂载时就会取它）。
+beforeEach(() => {
+	detail.mockReset().mockResolvedValue(DEFAULT_DETAIL);
+	noteDefaultWorld('default');
+});
 
 const button = (c: HTMLElement, text: string) =>
 	[...c.querySelectorAll('button')].find((b) => b.textContent?.trim() === text) as
@@ -77,8 +91,9 @@ const button = (c: HTMLElement, text: string) =>
 describe('/worlds', () => {
 	beforeEach(() => {
 		list.mockReset().mockResolvedValue(DATA);
+		detail.mockReset().mockResolvedValue(DEFAULT_DETAIL);
+		noteDefaultWorld('default');
 		create.mockReset();
-		activate.mockReset();
 		remove.mockReset();
 		snapshots.mockReset().mockResolvedValue({ snapshots: [] });
 		snapshot.mockReset();
@@ -88,18 +103,91 @@ describe('/worlds', () => {
 		lastWsEvent.set(null);
 	});
 
-	it('列出世界，当前与默认有标记，活动世界没有切换按钮', async () => {
+	it('列出世界：默认有标记、开着的有「已打开」，没有「当前」徽标，也没有切换/激活按钮', async () => {
 		const { container } = render(Worlds);
 		await settle();
 		expect(container.textContent).toContain('default');
 		expect(container.textContent).toContain('sim-1');
-		expect(container.textContent).toContain('当前');
 		expect(container.textContent).toContain('默认');
 		expect(container.textContent).toContain('3632');
-		const switches = [...container.querySelectorAll('button')].filter(
-			(b) => b.textContent?.trim() === '切换到此世界'
-		);
-		expect(switches.length).toBe(1);   // 只有 sim-1 有
+		const badges = [...container.querySelectorAll('span')].map((e) => e.textContent?.trim());
+		expect(badges).not.toContain('当前');
+		expect(container.textContent).not.toContain('切换');
+		expect(container.textContent).toContain('已打开');
+		expect(container.textContent?.match(/已打开/g)?.length).toBe(1); // 只有 default 开着
+	});
+
+	it('每个世界行显示标签（key=value）', async () => {
+		const { container } = render(Worlds);
+		await settle();
+		const labels = container.querySelector('[aria-label="sim-1 的标签"]');
+		expect(labels?.textContent).toContain('env=test');
+		expect(container.querySelector('[aria-label="default 的标签"]')).toBeNull();
+	});
+
+	it('首次请求第一页：offset 0、limit 25、无标签过滤', async () => {
+		render(Worlds);
+		await settle();
+		expect(list).toHaveBeenCalledWith({ labels: {}, offset: 0, limit: 25 });
+		expect(list.mock.calls[0][0].labels).toEqual({});
+	});
+
+	it('按标签过滤：key=value 提交后带 labels 重取并回到第一页；清除后恢复', async () => {
+		const { container } = render(Worlds);
+		await settle();
+		const input = container.querySelector('input[name="world-label-filter"]') as HTMLInputElement;
+		await fireEvent.input(input, { target: { value: 'env=test, team=x' } });
+		await tick();
+		await fireEvent.click(button(container, '过滤')!);
+		await settle();
+		expect(list).toHaveBeenLastCalledWith({ labels: { env: 'test', team: 'x' }, offset: 0, limit: 25 });
+		await fireEvent.click(button(container, '清除过滤')!);
+		await settle();
+		expect(list).toHaveBeenLastCalledWith({ labels: {}, offset: 0, limit: 25 });
+	});
+
+	it('标签过滤写错（不是 key=value）：提示且「过滤」禁用，不发请求', async () => {
+		const { container } = render(Worlds);
+		await settle();
+		const before = list.mock.calls.length;
+		const input = container.querySelector('input[name="world-label-filter"]') as HTMLInputElement;
+		await fireEvent.input(input, { target: { value: 'env' } });
+		await tick();
+		expect(button(container, '过滤')!.disabled).toBe(true);
+		expect(container.textContent).toContain('每段都要写成 key=value');
+		expect(list.mock.calls.length).toBe(before);
+	});
+
+	it('分页：显示「第 a–b 个，共 N 个」；下一页 offset 前进 25，上一页退回；首/末页按钮禁用', async () => {
+		list.mockReset().mockImplementation(async (o: { offset: number }) => ({
+			...DATA, total: 60, worlds: o.offset === 0 ? DATA.worlds : [DATA.worlds[1]]
+		}));
+		const { container } = render(Worlds);
+		await settle();
+		expect(container.textContent).toContain('第 1–2 个，共 60 个');
+		expect(button(container, '上一页')!.disabled).toBe(true);
+		await fireEvent.click(button(container, '下一页')!);
+		await settle();
+		expect(list).toHaveBeenLastCalledWith({ labels: {}, offset: 25, limit: 25 });
+		expect(container.textContent).toContain('第 26–26 个，共 60 个');
+		expect(button(container, '上一页')!.disabled).toBe(false);
+		await fireEvent.click(button(container, '上一页')!);
+		await settle();
+		expect(list).toHaveBeenLastCalledWith({ labels: {}, offset: 0, limit: 25 });
+	});
+
+	it('最后一页：下一页禁用', async () => {
+		list.mockReset().mockResolvedValue({ ...DATA, total: 2 });
+		const { container } = render(Worlds);
+		await settle();
+		expect(button(container, '下一页')!.disabled).toBe(true);
+	});
+
+	it('过滤后没有匹配：显示空态', async () => {
+		list.mockReset().mockResolvedValue({ ...DATA, total: 0, worlds: [] });
+		const { container } = render(Worlds);
+		await settle();
+		expect(container.textContent).toContain('还没有世界');
 	});
 
 	it('世界名不合法时新建按钮禁用，且不调用 API', async () => {
@@ -123,8 +211,8 @@ describe('/worlds', () => {
 		await tick();
 		await fireEvent.click(button(container, '新建世界')!);
 		await settle();
-		// 新建世界的自动快照默认值:按会话开、定时关(用户裁定 2026-10-28)
-		expect(create).toHaveBeenCalledWith('sim-2', '', { on_session: true, interval_hours: 0 });
+		// 自动快照没改过：不发 auto_snapshot，由后端继承默认世界（spec §8.2）；没写标签就是 {}
+		expect(create).toHaveBeenCalledWith('sim-2', '', undefined, {});
 	});
 
 	it('加载失败显示错误态', async () => {
@@ -146,55 +234,18 @@ const SNAPS = [
 	  world_time: '2026-03-01T00:00:00Z', size_bytes: 1536, sessions_complete: 3, session_id: null }
 ];
 
-describe('/worlds 切换', () => {
-	const reload = vi.fn();
+describe('/worlds 不再有激活', () => {
 	beforeEach(() => {
 		list.mockReset().mockResolvedValue(DATA);
-		activate.mockReset();
-		reload.mockReset();
-		toastError.mockReset();
-		vi.stubGlobal('location', { ...window.location, reload });
-	});
-	afterEach(() => {
-		vi.unstubAllGlobals();
+		detail.mockReset().mockResolvedValue(DEFAULT_DETAIL);
 	});
 
-	it('点「切换到此世界」只弹确认框,不直接切换', async () => {
+	it('没有「切换到此世界」按钮；每行有指向 ?world= 的「查看」链接', async () => {
 		const { container } = render(Worlds);
 		await settle();
-		await fireEvent.click(button(container, '切换到此世界')!);
-		await settle();
-		expect(document.body.textContent).toContain('切换到 sim-1？');
-		expect(document.body.textContent).toContain('切换会停止当前世界的后台维护与摄入，并重建引擎。');
-		expect(activate).not.toHaveBeenCalled();
-		expect(reload).not.toHaveBeenCalled();
-	});
-
-	it('确认后调用 activate,成功则整页刷新', async () => {
-		activate.mockResolvedValue({ active: 'sim-1' });
-		const { container } = render(Worlds);
-		await settle();
-		await fireEvent.click(button(container, '切换到此世界')!);
-		await settle();
-		await fireEvent.click(inBody('切换')!);
-		await settle();
-		expect(activate).toHaveBeenCalledWith('sim-1');
-		expect(reload).toHaveBeenCalledTimes(1);
-	});
-
-	it('切换失败:toast 中文提示,不刷新页面,按钮恢复可点', async () => {
-		activate.mockRejectedValue(apiErr(409, 'ingest_busy'));
-		const { container } = render(Worlds);
-		await settle();
-		await fireEvent.click(button(container, '切换到此世界')!);
-		await settle();
-		await fireEvent.click(inBody('切换')!);
-		await settle();
-		expect(toastError).toHaveBeenCalledWith(
-			'后台任务或在途请求暂时停不下来，未做任何改动，请稍后再试'
-		);
-		expect(reload).not.toHaveBeenCalled();
-		expect(button(container, '切换到此世界')!.disabled).toBe(false);
+		expect(button(container, '切换到此世界')).toBeUndefined();
+		const link = container.querySelector('a[aria-label="查看世界 sim-1"]') as HTMLAnchorElement;
+		expect(link.getAttribute('href')).toBe('/?world=sim-1');
 	});
 });
 
@@ -206,7 +257,7 @@ describe('/worlds 删除', () => {
 		toastSuccess.mockReset();
 	});
 
-	it('默认世界与活动世界没有删除按钮,只有 sim-1 有', async () => {
+	it('默认世界没有删除按钮,只有 sim-1 有', async () => {
 		const { container } = render(Worlds);
 		await settle();
 		const dels = [...container.querySelectorAll('button')].filter(
@@ -266,7 +317,7 @@ describe('/worlds 删除', () => {
 		await tick();
 		await fireEvent.click(inBody('确认删除')!);
 		await settle();
-		expect(toastError).toHaveBeenCalledWith('默认世界和当前活动世界不能删除');
+		expect(toastError).toHaveBeenCalledWith('默认世界不能删除');
 	});
 });
 
@@ -284,7 +335,7 @@ describe('/worlds 新建的错误与 label', () => {
 		await fireEvent.input(input, { target: { value: 'Bad Name' } });
 		await tick();
 		expect(input.getAttribute('aria-invalid')).toBe('true');
-		expect(container.textContent).toContain('世界名只能用小写字母');
+		expect(container.textContent).toContain('世界名以字母或数字开头');
 	});
 
 	it('世界名输入框经 aria-describedby 关联提示；出错时改为关联错误并标 aria-invalid', async () => {
@@ -296,7 +347,9 @@ describe('/worlds 新建的错误与 label', () => {
 				.split(/\s+/)
 				.filter(Boolean)
 				.map((id) => document.getElementById(id)?.textContent?.trim());
-		expect(described()).toEqual(['小写字母或数字开头，可含下划线和连字符，最长 32 个字符']);
+		expect(described()).toEqual([
+			'字母或数字开头，其后可含字母、数字、点、下划线和连字符，最长 128 个字符，区分大小写'
+		]);
 		expect(input.getAttribute('aria-invalid')).toBe('false');
 
 		await fireEvent.input(input, { target: { value: 'Bad Name' } });
@@ -334,7 +387,7 @@ describe('/worlds 新建的错误与 label', () => {
 		await tick();
 		await fireEvent.click(button(container, '新建世界')!);
 		await settle();
-		expect(create).toHaveBeenCalledWith('sim-1', '推演', { on_session: true, interval_hours: 0 });
+		expect(create).toHaveBeenCalledWith('sim-1', '推演', undefined, {});
 		expect(toastError).toHaveBeenCalledWith('同名世界已存在');
 	});
 
@@ -475,7 +528,7 @@ describe('/worlds ws 事件', () => {
 	});
 
 	it.each([
-		['world_switched', { active: 'sim-1' }],
+		['world_changed', { statements: 3 }],
 		['snapshot_created', { world: 'sim-1', id: 's1' }],
 		['world_rolled_back', { world: 'sim-1', snapshot_id: 's1' }],
 		['statement_added', {}]
@@ -483,7 +536,16 @@ describe('/worlds ws 事件', () => {
 		render(Worlds);
 		await settle();
 		const before = list.mock.calls.length;
-		lastWsEvent.set({ type, payload });
+		lastWsEvent.set({ type, world: 'sim-1', payload });
+		await settle();
+		expect(list.mock.calls.length).toBeGreaterThan(before);
+	});
+
+	it('别的世界的消息也触发重取（列表行上的计数属于各个世界）', async () => {
+		render(Worlds);
+		await settle();
+		const before = list.mock.calls.length;
+		lastWsEvent.set({ type: 'world_changed', world: 'whatever', payload: {} });
 		await settle();
 		expect(list.mock.calls.length).toBeGreaterThan(before);
 	});
@@ -492,7 +554,7 @@ describe('/worlds ws 事件', () => {
 		render(Worlds);
 		await settle();
 		const before = list.mock.calls.length;
-		lastWsEvent.set({ type: 'recall', payload: {} });
+		lastWsEvent.set({ type: 'recall', world: 'default', payload: {} });
 		await settle();
 		expect(list.mock.calls.length).toBe(before);
 	});
@@ -562,7 +624,7 @@ describe('/worlds 回滚到快照', () => {
 	});
 
 	it('手输世界名完全一致之前确认键禁用;一致后才调用 rollback(name, snapshotId, confirm)', async () => {
-		rollback.mockResolvedValue({ world: 'sim-1', snapshot_id: 's-man', archived: true, active: false });
+		rollback.mockResolvedValue({ world: 'sim-1', snapshot_id: 's-man', archived: true, reopened: false });
 		const { container } = render(Worlds);
 		await settle();
 		await openRollback(container, 'sim-1');
@@ -621,24 +683,23 @@ describe('/worlds 回滚到快照', () => {
 		expect(rollback).not.toHaveBeenCalled();
 	});
 
-	it('回滚活动世界成功:整页刷新', async () => {
-		rollback.mockResolvedValue({ world: 'default', snapshot_id: 's-man', archived: true, active: true });
+	it('回滚开着的世界成功：提示会重建引擎；成功后不整页刷新（引擎在服务端重建）', async () => {
+		rollback.mockResolvedValue({ world: 'default', snapshot_id: 's-man', archived: true, reopened: true });
 		const { container } = render(Worlds);
 		await settle();
 		await openRollback(container, 'default');
-		expect(document.body.textContent).toContain('完成后页面会自动刷新');
+		expect(document.body.textContent).toContain('这个世界现在开着');
 		await fireEvent.input(confirmInput(), { target: { value: 'default' } });
 		await tick();
 		await fireEvent.click(inBody('确认回滚')!);
 		await settle();
 		expect(rollback).toHaveBeenCalledWith('default', 's-man', 'default');
-		expect(reload).toHaveBeenCalledTimes(1);
-		// 重载前的空档里按钮不复位,免得再点一次
-		expect(inBody('确认回滚')!.disabled).toBe(true);
+		expect(reload).not.toHaveBeenCalled();
+		expect(toastSuccess).toHaveBeenCalledTimes(1);
 	});
 
-	it('回滚非活动世界成功:toast、关确认框、重取列表,不整页刷新', async () => {
-		rollback.mockResolvedValue({ world: 'sim-1', snapshot_id: 's-man', archived: true, active: false });
+	it('回滚没开着的世界成功:toast、关确认框、重取列表,不整页刷新', async () => {
+		rollback.mockResolvedValue({ world: 'sim-1', snapshot_id: 's-man', archived: true, reopened: false });
 		const { container } = render(Worlds);
 		await settle();
 		const before = list.mock.calls.length;
@@ -672,10 +733,9 @@ describe('/worlds 回滚到快照', () => {
 		});
 		expect(rowButtons.length).toBe(4);
 		expect(rowButtons.every((b) => b.disabled)).toBe(true);
-		expect(button(container, '切换到此世界')!.disabled).toBe(true);
 		await fireEvent.click(inBody('确认回滚')!);
 		expect(rollback).toHaveBeenCalledTimes(1);
-		resolve({ world: 'sim-1', snapshot_id: 's-man', archived: true, active: false });
+		resolve({ world: 'sim-1', snapshot_id: 's-man', archived: true, reopened: false });
 		await settle();
 	});
 
@@ -710,7 +770,7 @@ describe('/worlds 回滚到快照', () => {
 		expect(inBody('确认回滚')!.disabled).toBe(true);
 	});
 
-	it('活动世界回滚被拒(ingest_busy)同样不刷新页面', async () => {
+	it('回滚被拒(ingest_busy)不刷新页面', async () => {
 		rollback.mockRejectedValue(apiErr(409, 'ingest_busy'));
 		const { container } = render(Worlds);
 		await settle();
@@ -958,7 +1018,25 @@ describe('/worlds 新建世界带自动快照配置', () => {
 		create.mockReset();
 	});
 
-	it('默认按会话开、间隔 0；改过之后随新建一起提交', async () => {
+	it('初值取默认世界当前的设置；不改就不发 auto_snapshot（后端继承）', async () => {
+		detail.mockReset().mockResolvedValue({
+			...DEFAULT_DETAIL,
+			settings: { background: { auto_snapshot: { on_session: false, interval_hours: 24 } } }
+		});
+		create.mockResolvedValue({ ...DATA.worlds[1], name: 'sim-2' });
+		const { container } = render(Worlds);
+		await settle();
+		expect(detail).toHaveBeenCalledWith('default');
+		expect(checkbox(container, 'world-new-on-session').checked).toBe(false);
+		expect(field(container, 'world-new-interval').value).toBe('24');
+		await fireEvent.input(field(container, 'world-name'), { target: { value: 'sim-2' } });
+		await tick();
+		await fireEvent.click(button(container, '新建世界')!);
+		await settle();
+		expect(create).toHaveBeenCalledWith('sim-2', '', undefined, {});
+	});
+
+	it('改过之后随新建一起提交；成功后表单回到默认世界的设置', async () => {
 		create.mockResolvedValue({ ...DATA.worlds[1], name: 'sim-2' });
 		const { container } = render(Worlds);
 		await settle();
@@ -972,10 +1050,24 @@ describe('/worlds 新建世界带自动快照配置', () => {
 		await tick();
 		await fireEvent.click(button(container, '新建世界')!);
 		await settle();
-		expect(create).toHaveBeenCalledWith('sim-2', '', { on_session: false, interval_hours: 12 });
-		// 成功后表单回到默认值
+		expect(create).toHaveBeenCalledWith('sim-2', '', { on_session: false, interval_hours: 12 }, {});
 		expect(checkbox(container, 'world-new-on-session').checked).toBe(true);
 		expect(field(container, 'world-new-interval').value).toBe('0');
+	});
+
+	it('标签随新建提交；写错的标签禁用新建', async () => {
+		create.mockResolvedValue({ ...DATA.worlds[1], name: 'sim-2' });
+		const { container } = render(Worlds);
+		await settle();
+		await fireEvent.input(field(container, 'world-name'), { target: { value: 'sim-2' } });
+		await fireEvent.input(field(container, 'world-labels'), { target: { value: 'env' } });
+		await tick();
+		expect(button(container, '新建世界')!.disabled).toBe(true);
+		await fireEvent.input(field(container, 'world-labels'), { target: { value: 'env=test, team=x' } });
+		await tick();
+		await fireEvent.click(button(container, '新建世界')!);
+		await settle();
+		expect(create).toHaveBeenCalledWith('sim-2', '', undefined, { env: 'test', team: 'x' });
 	});
 
 	it('间隔不合法时新建禁用，且不调用 create', async () => {
