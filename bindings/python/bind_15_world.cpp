@@ -233,11 +233,23 @@ void bind_15_world(pybind11::module_& m) {
               gov::require_endpoint_unchanged(*parsed.extraction, current_base_url);
           }, py::arg("world_endpoint"), py::arg("current_base_url"));
 
+    // 一份（可能不完整的）设置 dict → C++ 补齐默认值后的完整设置 dict（settings_from_json →
+    // settings_to_json）。默认值只在 C++：引擎池建引擎前用它得到实际生效的设置。非法输入同 settings_from_json。
+    m.def("world_effective_settings", [](const py::dict& settings) {
+        const auto text = from_py(settings);
+        std::string normalized;
+        {
+            const py::gil_scoped_release release;
+            normalized = gov::settings_to_json(gov::settings_from_json(text));
+        }
+        return to_py(normalized);
+    }, py::arg("settings"));
+
     m.def("world_ingest_partition", &gov::ingest_partition, py::arg("is_default"),
           py::arg("tenant"), py::arg("dir_id"));
 
-    // 只读打开，busy_timeout 最长 5 秒，所以释放 GIL。键名见 WorldStats。
-    // 库文件存在但读不出时抛 snapshot_failed；只有文件不存在才是全 0。
+    // 只读打开，busy_timeout 最长 5 秒，所以释放 GIL。键名见 WorldStats（holders / last_write_at 是
+    // 引擎池写统计缓存用的两项）。库文件存在但读不出时抛 snapshot_failed；只有文件不存在才是全 0。
     m.def("world_stats",
           [](const std::string& db_path, const std::string& tenant) {
               gov::WorldStats stats;
@@ -247,7 +259,8 @@ void bind_15_world(pybind11::module_& m) {
               }
               return py::dict("db_bytes"_a = stats.db_bytes, "live_bytes"_a = stats.live_bytes,
                               "statements"_a = stats.statements, "engrams"_a = stats.engrams,
-                              "world_time"_a = stats.world_time);
+                              "world_time"_a = stats.world_time, "holders"_a = stats.holders,
+                              "last_write_at"_a = stats.last_write_at);
           }, py::arg("db_path"), py::arg("tenant"));
 
     // 租户不变式（spec §2.1）：只读扫一遍库，有别的租户的行抛 world_tenant_mismatch。

@@ -560,6 +560,18 @@ std::int64_t count_tenant_rows(sqlite3* dbh, const char* table, const std::strin
     return query.step_row() ? sqlite3_column_int64(query.raw(), 0) : 0;
 }
 
+// 统计缓存的两项（裁定 R18）：该租户 statements 的不同 holder 数与最近一次写入时刻。表不存在时
+// 0 与空串；MAX 在没有行时是 NULL，column_text 给空串。
+void statement_activity_on(sqlite3* dbh, const std::string& tenant, WorldStats& stats) {
+    if (!table_exists(dbh, "statements")) { return; }
+    persistence::Stmt query(dbh,
+        "SELECT COUNT(DISTINCT holder_id), MAX(created_at) FROM statements WHERE tenant_id=?1");
+    query.bind(tenant);
+    if (!query.step_row()) { return; }
+    stats.holders = sqlite3_column_int64(query.raw(), 0);
+    stats.last_write_at = column_text(query.raw(), 1);
+}
+
 // source_unit_meta 在生产库里不存在（迁移停在 36），先查 sqlite_master，不靠 SQL 报错。
 std::string world_time_on(sqlite3* dbh, const std::string& tenant) {
     if (table_exists(dbh, "source_unit_meta")) {
@@ -754,11 +766,15 @@ void validate_registry(const RegistryDb& reg) {
 }
 
 void set_auto_snapshot(RegistryDb& reg, const std::string& world, const AutoSnapshotConfig& config) {
-    const WorldRecord rec = reg.get(world);   // world_not_found
+    (void)reg.get(world);   // world_not_found，先于范围校验（与旧行为同一顺序）
     require_valid_auto_snapshot(config);
-    WorldSettings settings = settings_from_json(rec.settings_json);
-    settings.background.auto_snapshot = config;
-    reg.update_settings(world, settings_to_json(settings));
+    // 经 update_world_settings 合并：读—改—写在注册表锁内一次完成，与并发的设置同步（引擎池保存
+    // config 后的 sync_default_settings）互不丢改动。只覆盖 background.auto_snapshot 这一个子键。
+    const std::string overrides = R"({"background":{"auto_snapshot":{"on_session":)" +
+                                  std::string(config.on_session ? "true" : "false") +
+                                  R"(,"interval_hours":)" + std::to_string(config.interval_hours) +
+                                  "}}}";
+    (void)reg.update_world_settings(world, overrides);
 }
 
 // ---- 世界统计与快照（W2） --------------------------------------------------
@@ -790,6 +806,7 @@ WorldStats world_stats(const std::string& db_path, const std::string& tenant) {
         stats.statements = count_tenant_rows(handle.get(), "statements", tenant);
         stats.engrams = count_tenant_rows(handle.get(), "engrams", tenant);
         stats.world_time = world_time_on(handle.get(), tenant);
+        statement_activity_on(handle.get(), tenant, stats);
     } catch (const WorldStoreError&) {
         throw;
     } catch (const std::exception& ex) {

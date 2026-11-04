@@ -110,6 +110,30 @@ def test_helpers(tmp_path):
     _core.world_import_json(str(tmp_path))   # 无 worlds.json：空操作
 
 
+def test_effective_settings_fills_cpp_defaults(tmp_path):
+    """引擎池建引擎前要拿到实际生效的设置；默认值只在 C++（settings_from_json）。"""
+    full = _core.world_effective_settings({})
+    assert full["vector_backend"] == "sqlite"
+    assert full["background"] == {"tick_interval_s": 30.0, "ingest": True,
+                                  "auto_snapshot": {"on_session": False, "interval_hours": 24}}
+    assert full["source_lane"]["enabled"] is True and "extraction" not in full
+    part = _core.world_effective_settings({"extraction": {"model": "m"}})
+    assert part["extraction"]["model"] == "m" and part["extraction"]["base_url"] == ""
+    with pytest.raises(_core.WorldStoreError) as ei:
+        _core.world_effective_settings({"bogus": 1})
+    assert _code(ei.value) == "invalid_settings"
+
+
+def test_world_stats_reports_holders_and_last_write(tmp_path):
+    reg = _open(tmp_path)
+    rec = reg.create("sim-1", "", {}, None, NOW)
+    missing = _core.world_stats(rec["db_path"], "sim-1")
+    assert (missing["holders"], missing["last_write_at"]) == (0, "")
+    _migrate(rec["db_path"])
+    empty = _core.world_stats(rec["db_path"], "sim-1")
+    assert (empty["holders"], empty["last_write_at"]) == (0, "")
+
+
 def test_snapshot_and_rollback_on_registry(tmp_path):
     reg = _open(tmp_path)
     rec = reg.create("sim-1", "", {}, None, NOW)

@@ -34,6 +34,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2727,6 +2728,28 @@ TEST(WorldAutoConfig, SetAutoSnapshotWritesAndValidates) {
     EXPECT_EQ(auto_of(reg, "sim-1"), (AutoSnapshotConfig{.on_session = true, .interval_hours = 0}));
 }
 
+// 引擎池里改自动快照（PUT …/auto_snapshot）与同步默认世界设置（保存 config 之后）可能同时打到同一个
+// 世界：set_auto_snapshot 必须与 update_world_settings 一样在注册表锁内读—改—写，谁都不丢谁的改动。
+TEST(WorldAutoConfig, SetAutoSnapshotDoesNotLoseConcurrentSettingsMerge) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    constexpr int kRounds = 200;
+    std::atomic<bool> stop{false};
+    std::thread toggler([&] {
+        for (int round = 0; !stop.load(); ++round) {
+            set_auto_snapshot(reg, "default", AutoSnapshotConfig{round % 2 == 0, 24});
+        }
+    });
+    for (int round = 0; round < kRounds; ++round) {
+        (void)reg.update_world_settings(
+            "default", R"({"gist_thresholds":{"k)" + std::to_string(round) + R"(":0.5}})");
+    }
+    stop.store(true);
+    toggler.join();
+    const auto got = settings_from_json(reg.get("default").settings_json);
+    EXPECT_EQ(got.gist_thresholds.size(), static_cast<std::size_t>(kRounds));
+}
+
 // 手改 registry.db 写进越界的 interval_hours（写路径都经 merge_settings，存不进这样的值，裁定 R11）：
 // 自动快照开头的 validate_world 按注册表损坏拒绝（registry_corrupt），什么都不拍。
 TEST(WorldAutoConfig, OutOfRangeStoredIntervalIsRefusedByTheTrigger) {
@@ -2805,19 +2828,21 @@ void insert_units(const std::string& db_path, const std::string& tenant,
     }
 }
 
-// 往已迁移的世界库写一条最小的 statement。
+// 往已迁移的世界库写一条最小的 statement（holder_id 不可原地改，所以由参数给出）。
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 void insert_statement(const std::string& db_path, const std::string& tenant,
-                      const std::string& stmt_id) {
+                      const std::string& stmt_id, const std::string& holder = "self",
+                      const std::string& created_at = "2026-10-28T00:00:00Z") {
     auto adapter = persistence::SqliteAdapter::open(db_path);
     persistence::Stmt ins(adapter->connection().raw(),
         "INSERT INTO statements(id,tenant_id,holder_id,holder_perspective,subject_kind,"
         "subject_id,predicate,object_kind,object_value,canonical_object_hash,"
         "canonical_object_hash_version,modality,polarity,confidence,observed_at,salience,"
         "affect_json,activation,last_accessed,provenance,created_at,updated_at) "
-        "VALUES(?1,?2,'self','first_person','entity','thing','likes','str','x',?3,'v1',"
+        "VALUES(?1,?2,?4,'first_person','entity','thing','likes','str','x',?3,'v1',"
         "'believes','pos',0.5,'2026-10-28T00:00:00Z',0.5,'{}',0.0,'2026-10-28T00:00:00Z',"
-        "'user_input','2026-10-28T00:00:00Z','2026-10-28T00:00:00Z')");
-    ins.bind(stmt_id, tenant, std::string(64, 'a'));
+        "'user_input',?5,'2026-10-28T00:00:00Z')");
+    ins.bind(stmt_id, tenant, std::string(64, 'a'), holder, created_at);
     ins.step_done();
 }
 
@@ -2836,6 +2861,34 @@ void seed_marked_world(const std::string& db_path) {
                                     {0, "c1", "spk-2", "s-a", "2030-01-01T00:01:00Z"},
                                     {1, "c0", "spk-1", "s-b", "2030-01-01T00:02:00Z"}});
     insert_units(db_path, "other", {{100, "c0", "spk-9", "s-z", "2030-01-01T00:00:00Z"}});
+}
+
+// 引擎池的统计缓存（裁定 R18）：holders = 该租户 statements 的不同 holder 数，last_write_at =
+// 该租户 statements 的 MAX(created_at)；没有 statements（或没有表、没有库文件）时 0 与空串。
+TEST(WorldStats, HoldersAndLastWriteAtByTenant) {
+    const TempDir tmp;
+    auto reg = registry_with_world(tmp, "sim-1");
+    const auto world = reg.get("sim-1");
+    const auto missing = world_stats(world.db_path, "sim-1");
+    EXPECT_EQ(missing.holders, 0);
+    EXPECT_EQ(missing.last_write_at, "");
+    seed_world_db(world.db_path, "sim-1", 1);   // 有库、没有 statements
+    const auto bare = world_stats(world.db_path, "sim-1");
+    EXPECT_EQ(bare.holders, 0);
+    EXPECT_EQ(bare.last_write_at, "");
+    insert_statement(world.db_path, "sim-1", "st-1");
+    insert_statement(world.db_path, "sim-1", "st-2", "bob", "2026-10-29T00:00:00Z");
+    insert_statement(world.db_path, "sim-1", "st-3", "bob", "2026-10-27T00:00:00Z");
+    insert_statement(world.db_path, "other", "st-x", "zed", "2031-01-01T00:00:00Z");
+    const auto stats = world_stats(world.db_path, "sim-1");
+    EXPECT_EQ(stats.statements, 3);
+    EXPECT_EQ(stats.holders, 2);                             // self、bob；别的租户的 zed 不算
+    EXPECT_EQ(stats.last_write_at, "2026-10-29T00:00:00Z");  // 别的租户更晚的那条不算
+    const auto legacy_db = (tmp.path() / "legacy.db").string();
+    exec_sql_unmigrated(legacy_db, "CREATE TABLE engrams(id TEXT, tenant_id TEXT, created_at TEXT);");
+    const auto legacy = world_stats(legacy_db, "t1");       // 没有 statements 表
+    EXPECT_EQ(legacy.holders, 0);
+    EXPECT_EQ(legacy.last_write_at, "");
 }
 
 TEST(WorldSnapshotMeta, TakeSnapshotRecordsSessionsCompleteAndContentMark) {

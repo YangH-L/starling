@@ -120,9 +120,10 @@ void validate_world(const RegistryDb& reg, const std::string& world);
 // 对注册表里的每个世界跑 validate_world（按 RegistryDb::list 的顺序，遇到第一个违反就抛）。
 void validate_registry(const RegistryDb& reg);
 
-// 改一个世界的自动快照配置：读 settings_json，只改 background.auto_snapshot，其余设置原样写回
-// （RegistryDb::update_settings）。世界不存在抛 world_not_found，interval_hours 不在 0–8760 抛
-// invalid_auto_snapshot；两种情况注册表都不变。settings_json 解析不了时 settings_from_json 的错误照抛。
+// 改一个世界的自动快照配置：只覆盖 background.auto_snapshot，其余设置原样保留。经
+// RegistryDb::update_world_settings 合并，读—改—写在注册表锁内一次完成，与并发的设置更新互不丢改动。
+// 世界不存在抛 world_not_found，interval_hours 不在 0–8760 抛 invalid_auto_snapshot；两种情况注册表
+// 都不变。settings_json 解析不了时 settings_from_json 的错误照抛。
 void set_auto_snapshot(RegistryDb& reg, const std::string& world, const AutoSnapshotConfig& config);
 
 // ---- 世界统计与快照（W2） --------------------------------------------------
@@ -133,9 +134,12 @@ struct WorldStats {
     std::int64_t statements = 0;      // WHERE tenant_id = tenant
     std::int64_t engrams = 0;         // WHERE tenant_id = tenant
     std::string world_time;           // 见 snapshot_world_time
+    std::int64_t holders = 0;         // statements 里该租户的 COUNT(DISTINCT holder_id)
+    std::string last_write_at;        // statements 里该租户的 MAX(created_at)；没有行时为空串
 };
 // 只读打开 db_path（mode=ro）。库文件不存在时返回全 0 的统计，不抛异常。
-// 表不存在时（库是空的、未迁移），对应计数为 0。
+// 表不存在时（库是空的、未迁移），对应计数为 0、last_write_at 为空串。
+// holders / last_write_at 是注册表统计缓存（registry_db.hpp update_stats）的来源，引擎池按世界调用。
 [[nodiscard]] WorldStats world_stats(const std::string& db_path, const std::string& tenant);
 
 // 租户不变式（spec §2.1）：一个世界库里只允许有该世界自己的租户。只读打开 db_path，
