@@ -1,10 +1,11 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { api, type CascadePreview, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { refetchOnEvent, withWorld } from '$lib/world.svelte';
+	import { refetchOnEvent, withWorld, onWorldChange } from '$lib/world.svelte';
 	import { toast } from '$lib/ui/toast';
 	import { labelFor, glossFor, sectionize } from '$lib/labels';
 	import DataTable from '$lib/components/DataTable.svelte';
@@ -110,6 +111,14 @@
 
 	let detailOpen = $state(false);
 	let detail = $state<Record<string, unknown> | null>(null);
+	// 换世界:抽屉里是上个世界的行,关掉并清空,免得挂在新世界的名字下。
+	onWorldChange(() => {
+		detailOpen = false;
+		detail = null;
+		confirmOpen = false;
+		confirmCfg = null;
+		confirmForId = '';
+	});
 	function openDetail(r: Record<string, unknown>) {
 		detail = r;
 		detailOpen = true;
@@ -192,7 +201,7 @@
 			detailOpen = false;
 			await q.refetch();
 		} catch (e) {
-			toast.error(`${label}失败:${e instanceof Error ? e.message : String(e)}`);
+			toast.error(`${label}失败:${describeError(e)}`);
 		} finally {
 			busy = false;
 		}
@@ -309,7 +318,7 @@
 	<span class="ml-auto pb-1.5 text-xs text-subtle">{rows.length} 条 · 点击行看详情</span>
 </div>
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else}
 	<DataTable
 		{rows}

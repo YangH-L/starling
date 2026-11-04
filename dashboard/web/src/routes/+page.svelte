@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
@@ -52,7 +53,7 @@
 <PageHeader title="总览" subtitle="记忆体状态、关键计数与实时活动。" />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="grid grid-cols-2 gap-3 md:grid-cols-5">
 		{#each Array(5) as _}<Skeleton class="h-24 w-full" />{/each}

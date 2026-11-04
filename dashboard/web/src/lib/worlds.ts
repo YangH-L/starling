@@ -290,6 +290,7 @@ const ERROR_MESSAGES: Record<string, string> = {
 	invalid_world_name: '世界名以字母或数字开头，其后可含字母、数字、点、下划线和连字符，最长 128 个字符',
 	world_exists: '同名世界已存在',
 	world_not_found: '世界不存在',
+	worlds_unavailable: '世界注册表暂时不可用，请稍后再试',
 	world_busy: '世界正在关闭或恢复，请稍后再试',
 	world_not_initialized: '这个世界的库文件不见了',
 	endpoint_changed: '供应商地址改了，这个世界需要重新确认端点',
@@ -298,7 +299,7 @@ const ERROR_MESSAGES: Record<string, string> = {
 	world_protected: '默认世界不能删除',
 	confirm_mismatch: '输入的名称与世界名不一致',
 	ingest_busy: '后台任务或在途请求暂时停不下来，未做任何改动，请稍后再试',
-	world_open_failed: '引擎打开失败，数据库未改动（切换时已留在原世界）；下一次写入、召回或在「队列」页手动 tick 时会自动重建，仍异常请查看服务日志',
+	world_open_failed: '世界打不开，请稍后再试或查看服务日志',
 	snapshot_unsupported_backend: '当前向量后端（zvec）不支持快照',
 	insufficient_disk:
 		'磁盘空间不足：快照需要至少 3 倍于数据量、回滚需要至少 2 倍于快照大小的可用空间',
@@ -338,4 +339,20 @@ export function apiDetail(err: unknown): string {
 		return i === -1 ? err.message : err.message.slice(i + 1);
 	}
 	return String(err);
+}
+
+/** 读页面遇到这些码时显示中文提示,而不是裸的 "404 world_not_found"。 */
+const WORLD_CODES = ['world_not_found', 'world_busy', 'world_not_initialized', 'worlds_unavailable'];
+
+/**
+ * 读页面的错误文案:ApiError 的 detail 是已知的世界错误码就给中文提示,否则原样用 message。
+ * 链接带着 ?world= 被分享出去时,最常见的失败正是世界不存在 / 正在关闭。
+ */
+export function describeError(err: unknown): string {
+	if (err instanceof ApiError) {
+		const d = apiDetail(err);
+		if (WORLD_CODES.includes(d)) return worldErrorMessage(d);
+		return err.message;
+	}
+	return err instanceof Error ? err.message : String(err);
 }

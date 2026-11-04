@@ -3,6 +3,7 @@
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
 	import { shouldRefetch } from '$lib/feed';
+	import { explicitWorld, setWorld } from '$lib/world.svelte';
 	import { toast } from '$lib/ui/toast';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import AutoSnapshotFields from '$lib/components/AutoSnapshotFields.svelte';
@@ -238,6 +239,8 @@
 		try {
 			await worldsApi.remove(name, deleteConfirm);
 			toast.success(`已删除世界「${name}」`);
+			// 删的恰好是顶栏选着的世界:回到默认世界,免得各页对着已删除的世界 404。
+			if (explicitWorld() === name) setWorld(defaultName);
 			deleteOpen = false;
 			deleteConfirm = '';
 			await q.refetch();

@@ -3,7 +3,7 @@ import * as tok from './token';
 import { ApiError } from './api';
 import {
 	worldsApi, isValidWorldName, formatBytes, worldErrorMessage, apiDetail,
-	parseIntervalHours, autoSnapshotLabel, snapshotReasonLabel, shortId, parseLabels
+	parseIntervalHours, describeError, autoSnapshotLabel, snapshotReasonLabel, shortId, parseLabels
 } from './worlds';
 
 let calls: Array<[string, RequestInit]> = [];
@@ -140,7 +140,7 @@ describe('错误文案', () => {
 			'后台任务或在途请求暂时停不下来，未做任何改动，请稍后再试'
 		);
 		expect(worldErrorMessage('world_open_failed')).toBe(
-			'引擎打开失败，数据库未改动（切换时已留在原世界）；下一次写入、召回或在「队列」页手动 tick 时会自动重建，仍异常请查看服务日志'
+			'世界打不开，请稍后再试或查看服务日志'
 		);
 		expect(worldErrorMessage('insufficient_disk')).toBe(
 			'磁盘空间不足：快照需要至少 3 倍于数据量、回滚需要至少 2 倍于快照大小的可用空间'
@@ -323,5 +323,23 @@ describe('parseLabels', () => {
 	});
 	it('不是 key=value 的段返回 null', () => {
 		for (const t of ['env', '=x', 'env=', 'a=b,c']) expect(parseLabels(t)).toBeNull();
+	});
+});
+
+describe('describeError 与 worlds_unavailable', () => {
+	it('worlds_unavailable 有中文文案', () => {
+		expect(worldErrorMessage('worlds_unavailable')).toBe('世界注册表暂时不可用，请稍后再试');
+	});
+	it('已知世界错误码给中文；其他错误保持原 message', () => {
+		for (const [code, text] of [
+			['world_not_found', '世界不存在'],
+			['world_busy', '世界正在关闭或恢复，请稍后再试'],
+			['world_not_initialized', '这个世界的库文件不见了'],
+			['worlds_unavailable', '世界注册表暂时不可用，请稍后再试']
+		])
+			expect(describeError(new ApiError(404, '/x', `404 ${code}`))).toBe(text);
+		expect(describeError(new ApiError(500, '/x', '500 boom'))).toBe('500 boom');
+		expect(describeError(new Error('plain'))).toBe('plain');
+		expect(describeError('str')).toBe('str');
 	});
 });

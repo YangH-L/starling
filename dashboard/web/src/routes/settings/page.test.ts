@@ -9,12 +9,13 @@ vi.mock('$lib/api', async (orig) => {
 	const real = await orig<typeof import('$lib/api')>();
 	return {
 		...real, // worldPath 用真的:危险区的路径改写是被测行为
-		api: { get: (...a: unknown[]) => get(...a), post: (...a: unknown[]) => post(...a), del: vi.fn() },
-		ApiError: class ApiError extends Error {}
+		// ApiError 用真的:worlds.ts 的 apiDetail 靠 instanceof 取错误码
+		api: { get: (...a: unknown[]) => get(...a), post: (...a: unknown[]) => post(...a), del: vi.fn() }
 	};
 });
 
 import Settings from './+page.svelte';
+import { ApiError as RealApiError } from '$lib/api';
 import { page } from '$app/state';
 import { noteDefaultWorld } from '$lib/world.svelte';
 
@@ -224,12 +225,14 @@ describe('设置页:清空记忆随所选世界走', () => {
 
 	it('详情加载失败:清空键与确认输入禁用,不回退到默认世界的租户,绕过 disabled 也不 POST', async () => {
 		at('w1');
+		// 真的 ApiError(404 world_not_found):走 worldsApi.detail → apiDetail → worldErrorMessage 的真实路径
 		route(() => {
-			throw Object.assign(new Error('404 world_not_found'), {});
+			throw new RealApiError(404, '/api/worlds/w1', '404 world_not_found');
 		});
 		const { container } = render(Settings);
 		await settle();
 		expect(container.textContent).toContain('没能取到世界「w1」的租户名');
+		expect(container.textContent).toContain('世界不存在'); // 错误码已译成中文
 		expect(container.textContent).not.toContain('default-tenant');
 		expect(confirmInput(container).disabled).toBe(true);
 		expect(clearBtn(container)!.disabled).toBe(true);

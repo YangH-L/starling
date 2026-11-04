@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import DataTable from '$lib/components/DataTable.svelte';
@@ -31,7 +32,7 @@
 			toast.success(`${mode === 'sleep' ? '睡眠' : '空闲'}回放:采样 ${r.sampled} · 固化 ${r.compressed}`);
 			await q.refetch();
 		} catch (e) {
-			toast.error(`触发失败:${e instanceof Error ? e.message : String(e)}`);
+			toast.error(`触发失败:${describeError(e)}`);
 		} finally {
 			triggering = false;
 		}
@@ -51,7 +52,7 @@
 	subtitle="Replay / Reconsolidation:每次回放批次做了什么(在线随手固化 / 空闲 / 睡眠),以及打开的再巩固窗口。"
 />
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<Skeleton class="h-40 w-full" />
 {:else if q.data}

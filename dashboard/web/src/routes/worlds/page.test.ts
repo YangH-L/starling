@@ -4,6 +4,8 @@ import { render, fireEvent } from '@testing-library/svelte';
 import { ApiError } from '$lib/api';
 import { lastWsEvent } from '$lib/health';
 import { noteDefaultWorld } from '$lib/world.svelte';
+import { page } from '$app/state';
+import { goto } from '$app/navigation';
 
 const toastError = vi.fn();
 const toastSuccess = vi.fn();
@@ -318,6 +320,45 @@ describe('/worlds 删除', () => {
 		await fireEvent.click(inBody('确认删除')!);
 		await settle();
 		expect(toastError).toHaveBeenCalledWith('默认世界不能删除');
+	});
+});
+
+describe('/worlds 删除当前选中的世界', () => {
+	const del = async (container: HTMLElement) => {
+		await fireEvent.click(button(container, '删除')!);
+		await settle();
+		const input = document.body.querySelector('input[name="world-delete-confirm"]') as HTMLInputElement;
+		await fireEvent.input(input, { target: { value: 'sim-1' } });
+		await tick();
+		await fireEvent.click(inBody('确认删除')!);
+		await settle();
+	};
+	beforeEach(() => {
+		list.mockReset().mockResolvedValue(DATA);
+		remove.mockReset().mockResolvedValue({ deleted: 'sim-1' });
+		(goto as unknown as { mockClear: () => void }).mockClear();
+	});
+	afterEach(() => {
+		(page as { url: URL }).url = new URL('http://localhost/worlds'); // 不把 ?world= 带给后面的用例
+	});
+
+	it('删的正是顶栏选着的世界：回到默认世界（去掉 ?world=）', async () => {
+		(page as { url: URL }).url = new URL('http://localhost/worlds?world=sim-1');
+		const { container } = render(Worlds);
+		await settle();
+		await del(container);
+		expect(remove).toHaveBeenCalledWith('sim-1', 'sim-1');
+		expect(goto).toHaveBeenCalledTimes(1);
+		expect((goto as any).mock.calls[0][0]).toBe('/worlds');
+	});
+
+	it('删的不是选着的世界：不动 URL', async () => {
+		(page as { url: URL }).url = new URL('http://localhost/worlds?world=other');
+		const { container } = render(Worlds);
+		await settle();
+		await del(container);
+		expect(remove).toHaveBeenCalled();
+		expect(goto).not.toHaveBeenCalled();
 	});
 });
 

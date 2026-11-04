@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, ApiError, worldPath } from '$lib/api';
 	import { byDeadline, deriveFired, triggersFor, triggerKindLabel, describeTrigger } from '$lib/commitments';
 	import { createQuery } from '$lib/query.svelte';
@@ -114,7 +115,7 @@
 				detailOpen = false;
 				await q.refetch();
 			} else {
-				toast.error(`流转失败:${e instanceof Error ? e.message : String(e)}`);
+				toast.error(`流转失败:${describeError(e)}`);
 			}
 		} finally {
 			busy = false;
@@ -137,7 +138,7 @@
 </div>
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
 		{#each Array(6) as _}<Skeleton class="h-32 w-full" />{/each}

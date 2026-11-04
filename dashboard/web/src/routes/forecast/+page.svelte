@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, type ForecastResponse, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -29,7 +30,7 @@
 	subtitle="按遗忘曲线 S(t)=exp(-Δt/S0) 排出最可能被遗忘的记忆。投影自 C++ forgetting_curve(只读),不改记忆。"
 />
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<Skeleton class="h-40 w-full" />
 {:else if q.data}

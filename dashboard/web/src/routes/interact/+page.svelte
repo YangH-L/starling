@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { withWorld } from '$lib/world.svelte';
 	import { api, type PlannedRecallResponse, worldPath } from '$lib/api';
 	import { toast } from '$lib/ui/toast';
@@ -76,7 +77,7 @@
 			rememberErr = '';
 			toast.success(`outcome: ${r.outcome} · ${r.statement_ids.length} statements`);
 		} catch (e) {
-			rememberErr = e instanceof Error ? e.message : String(e);
+			rememberErr = describeError(e);
 			toast.error(rememberErr);
 		} finally {
 			busyR = false;
@@ -105,7 +106,7 @@
 			recalled = true;
 			recallErr = '';
 		} catch (e) {
-			recallErr = e instanceof Error ? e.message : String(e);
+			recallErr = describeError(e);
 			toast.error(recallErr);
 		} finally {
 			busyQ = false;

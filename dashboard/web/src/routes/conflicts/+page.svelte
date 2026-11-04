@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, type CascadePreview, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
@@ -82,7 +83,7 @@
 			detailOpen = false;
 			await q.refetch();
 		} catch (e) {
-			toast.error(`${verb}失败:${e instanceof Error ? e.message : String(e)}`);
+			toast.error(`${verb}失败:${describeError(e)}`);
 		} finally {
 			busy = false;
 		}
@@ -127,7 +128,7 @@
 <PageHeader title="冲突探针" subtitle="ConflictProbe:互斥语句对,按冲突权重降序。" />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="space-y-2">{#each Array(4) as _}<Skeleton class="h-12 w-full" />{/each}</div>
 {:else}

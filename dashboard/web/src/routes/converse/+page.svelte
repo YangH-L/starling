@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { api, type ConverseResponse } from '$lib/api';
-	import { currentWorld, withWorld } from '$lib/world.svelte';
+	import { explicitWorld, withWorld } from '$lib/world.svelte';
 	import { streamConverse } from '$lib/ws';
 	import { toast } from '$lib/ui/toast';
 	import { worldErrorMessage } from '$lib/worlds';
@@ -48,7 +48,12 @@
 		const idx = turns.length; // assistant turn 的下标(下面紧接 push)
 		turns = [...turns, { role: 'assistant', text: '', streaming: true }];
 		streamConverse(
-			{ message: msg, world: currentWorld(), ...(chatProvider ? { provider: chatProvider } : {}) },
+			{
+				message: msg,
+				// 只在 URL 明确写了 ?world= 时才带 world;否则省略,由服务端取它自己的默认世界。
+				...(explicitWorld() ? { world: explicitWorld()! } : {}),
+				...(chatProvider ? { provider: chatProvider } : {})
+			},
 			{
 				onStatus: (status) => {
 					turns[idx].status = status;

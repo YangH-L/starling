@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { withWorld } from '$lib/world.svelte';
+	import { describeError } from '$lib/worlds';
+	import { withWorld, onWorldChange } from '$lib/world.svelte';
 	import { goto } from '$app/navigation';
 	import { api, type EngramDetail, type EngramListResp, type EngramRow, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
@@ -43,6 +44,15 @@
 	let detailError = $state('');
 	let detailForId = $state(''); // 防陈旧:并发点开时只让最新一次结果落地
 
+	// 换世界:抽屉里是上个世界的 engram,关掉并清空;在途的旧响应因 detailForId 清空而丢弃。
+	onWorldChange(() => {
+		detailOpen = false;
+		detail = null;
+		detailError = '';
+		detailLoading = false;
+		detailForId = '';
+	});
+
 	async function openDetail(row: Record<string, unknown>) {
 		const id = String(row.id ?? '');
 		detailOpen = true;
@@ -54,7 +64,7 @@
 			const res = await api.get<EngramDetail>(worldPath(`/api/engram/${encodeURIComponent(id)}`));
 			if (detailForId === id) detail = res;
 		} catch (e) {
-			if (detailForId === id) detailError = e instanceof Error ? e.message : String(e);
+			if (detailForId === id) detailError = describeError(e);
 		} finally {
 			if (detailForId === id) detailLoading = false;
 		}
@@ -108,7 +118,7 @@
 </div>
 
 {#if listQuery.error}
-	<EmptyState title="加载失败" description={listQuery.error.message} />
+	<EmptyState title="加载失败" description={describeError(listQuery.error)} />
 {:else if listQuery.loading && !listQuery.data}
 	<div class="space-y-2">{#each Array(4) as _}<Skeleton class="h-8 w-full" />{/each}</div>
 {:else if allRows.length === 0}

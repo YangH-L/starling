@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, worldPath } from '$lib/api';
 	import { byDeadline, deriveFired, isOverdue } from '$lib/commitments';
 	import { createQuery } from '$lib/query.svelte';
@@ -38,7 +39,7 @@
 <PageHeader title="承诺提醒" subtitle="待办承诺（active / created），按截止日期升序；逾期与 fired 醒目标注。" />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="space-y-2">{#each Array(3) as _}<Skeleton class="h-16 w-full" />{/each}</div>
 {:else if pending.length === 0}

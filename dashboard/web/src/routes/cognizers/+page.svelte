@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import Graph from '$lib/components/Graph.svelte';
@@ -52,7 +53,7 @@
 <PageHeader title="认知体社会图" subtitle="Cognizer 节点、关系与在场记录。" />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else}
 	<div class="space-y-4">
 		<Card>

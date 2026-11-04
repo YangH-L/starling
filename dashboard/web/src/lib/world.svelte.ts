@@ -68,3 +68,17 @@ export function withWorld(href: string): string {
 export function refetchOnEvent(e: WsEvent | null | undefined): boolean {
 	return shouldRefetch(e, untrack(currentWorld));
 }
+
+/**
+ * 当前世界变了就调 cb(组件初始化时调用)。详情抽屉、确认框这类"属于某个世界的某一行"的状态
+ * 用它在换世界时关掉/清空,免得上一个世界的行挂在新世界的名字下面。首次运行不触发。
+ */
+export function onWorldChange(cb: () => void): void {
+	let last = currentWorld();
+	$effect(() => {
+		const w = currentWorld();
+		if (w === last) return;
+		last = w;
+		untrack(cb);
+	});
+}

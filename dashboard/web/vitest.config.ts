@@ -12,7 +12,7 @@ export default defineConfig({
 		alias: {
 			$lib: fileURLToPath(new URL('./src/lib', import.meta.url)),
 			// $app/* 依赖 SvelteKit 运行时,单测里换成桩(world.svelte.ts 读 URL 查询参数要用)。
-			'$app/state': fileURLToPath(new URL('./src/lib/test/app-state.ts', import.meta.url)),
+			'$app/state': fileURLToPath(new URL('./src/lib/test/app-state.svelte.ts', import.meta.url)),
 			'$app/navigation': fileURLToPath(
 				new URL('./src/lib/test/app-navigation.ts', import.meta.url)
 			)

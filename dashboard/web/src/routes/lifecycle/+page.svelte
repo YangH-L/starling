@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, type LifecycleResponse, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
@@ -45,7 +46,7 @@
 	subtitle="记忆从短期(海马)经固化进入长期(新皮层),再归档或遗忘。当前分布为精确快照,流转为事件派生的累计量。"
 />
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<Skeleton class="h-40 w-full" />
 {:else if q.data}

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, worldPath } from '$lib/api';
 	import { toast } from '$lib/ui/toast';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -26,7 +27,7 @@
 			loadErr = '';
 		} catch (e) {
 			ws = null;
-			loadErr = e instanceof Error ? e.message : String(e);
+			loadErr = describeError(e);
 			toast.error(loadErr);
 		} finally {
 			busy = false;

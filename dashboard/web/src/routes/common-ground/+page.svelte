@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { api, type CommonGroundResponse, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -46,7 +47,7 @@
 <PageHeader title="共识" subtitle="双方共识池(CommonGround)五态。只读快照,状态机在内核。" />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="space-y-2">{#each Array(4) as _}<Skeleton class="h-8 w-full" />{/each}</div>
 {:else if rows.length === 0}
