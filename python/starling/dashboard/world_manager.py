@@ -60,11 +60,16 @@ DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个�
 
   即 pool._lock → pool._world_locks[name] → engine._lock → supervisor。实际代码里 1 在 2 之内只短暂取
   （查表、改表），从不在持 1 时去取 2。
-  持租约的代码不得阻塞地等 _world_locks：关闭、恢复持着世界锁等租约归零，反过来就是死锁。首次建引擎
-  是唯一要在持租约时取世界锁的地方（lease 先登记租约、放开 _lock，再取世界锁建引擎），所以它不阻塞地
-  等：_acquire_for_build 以 50 毫秒为一段轮询，每段之间查该世界的关闭标志，标志已置就放弃
-  （world_busy），租约随之归还，关闭的等待随即结束。关闭先取世界锁、再置标志、再等租约，所以构建的
-  租约要么在关闭取世界锁之前已经建完（关闭等它用完），要么在轮询里看到标志后放弃，不会互等。
+  持租约的代码不得阻塞地等 _world_locks：关闭、恢复持着世界锁等租约归零，反过来就是死锁。持租约时取
+  世界锁的地方只有两处，都不阻塞地等：
+    - 首次建引擎（lease 先登记租约、放开 _lock，再取世界锁建引擎）：_acquire_for_build 以 50 毫秒为一段
+      轮询，每段之间查该世界的关闭标志，标志已置就放弃（world_busy），租约随之归还，关闭的等待随即结束。
+      关闭先取世界锁、再置标志、再等租约，所以构建的租约要么在关闭取世界锁之前已经建完（关闭等它用完），
+      要么在轮询里看到标志后放弃，不会互等。
+    - 补起 workers-lost 世界的后台线程（_retry_lost_workers，裁定 R23）：只试一次 acquire(blocking=False)，
+      取不到这次就不补，下一次租约再试。
+  这两处都可能在事件循环上运行：路由同步调 lease 时，惰性建引擎与补起线程（start_ingest_worker、起不来时的
+  quiesce，最长约 5 秒）就在事件循环线程上做，与旧实现的惰性构建一样。
 
 自动快照（W4）
 --------------
@@ -413,9 +418,16 @@ class WorldPool:
         记日志，标记 workers-lost，返回 False。成功时清掉标记，返回 True。"""
         try:
             self._start_workers(world, engine)
-        except Exception:  # noqa: BLE001 — 线程起不来不能连带租约失败（与旧 _restart_lost_workers 相同）
-            logger.exception("cannot start background workers of world %s; retrying on the next "
-                             "lease", world)
+        except Exception as exc:  # noqa: BLE001 — 线程起不来不能连带租约失败（与旧 _restart_lost_workers 相同）
+            # 只记格式化好的文本：留着 LogRecord 的 handler（caplog、队列、内存 handler）若拿到 exc_info 或
+            # 异常对象本身（在 args 里），就经 __traceback__ 钉住持有引擎的栈帧（正在执行的帧 clear_frames
+            # 清不掉），之后关闭就证明不了 Runtime 已回收（世界一直 world_busy，直到 gc）。
+            detail = f"{type(exc).__name__}: {exc}"
+            traceback.clear_frames(exc.__traceback__)
+            exc.__traceback__ = None
+            exc = None
+            logger.error("cannot start background workers of world %s; retrying on the next "
+                         "lease: %s", world, detail)
             if not engine.quiesce():
                 logger.warning("background threads of world %s did not stop after a failed start: %s",
                                world, "/".join(engine.quiesce_stuck))
@@ -574,12 +586,14 @@ class WorldPool:
     # ───────────────────────── 设置 ─────────────────────────
 
     def sync_default_settings(self) -> None:
-        """registry.update_settings(默认世界, config.world_settings())：启动时与每次 POST /api/config
-        保存后调用。合并在 C++（不带 auto_snapshot，裁定 R16）。开着的默认世界引擎换上新合并的设置
-        （endpoint 核对按新地址做）；适配器由保存配置的路由按改动的角色热换，与改之前一样。"""
+        """registry.replace_settings_sections(默认世界, config.world_settings())：启动时与每次 POST
+        /api/config 保存后调用。config 是默认世界设置的权威来源，所以用整段替换而不是逐叶合并（裁定 R27）：
+        改绑到另一个 provider 之后不留旧 provider 的叶子，gist 少了的键同步后也没了。background 仍逐叶合并，
+        config 不带 auto_snapshot、ingest（裁定 R16）。替换在 C++ 的注册表锁内一次完成。开着的默认世界引擎
+        换上新设置（endpoint 核对按新地址做）；适配器由保存配置的路由按改动的角色热换，与改之前一样。"""
         reg = self._require_registry()
         default = reg.default_world()
-        merged = reg.update_settings(default, self._config.world_settings())
+        merged = reg.replace_settings_sections(default, self._config.world_settings())
         backend = self._config.vector_backend or "sqlite"
         if backend != "sqlite":
             with self._lock:

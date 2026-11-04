@@ -943,3 +943,128 @@ def test_registry_default_world_uses_config_vector_backend(tmp_path, monkeypatch
         assert seen[-1] == ("sqlite", None)
     finally:
         pool.close_all()
+
+
+# ───────────────────────── 修复轮 2 ─────────────────────────
+
+def test_rebinding_a_role_leaves_no_old_provider_leaves(tmp_path, monkeypatch):
+    """裁定 R27（复现 bleed.py）：抽取角色从 a 改绑到 b 之后同步，存着的 endpoint 与 b 的字段完全一致，不留
+    a 的 thinking_type / max_tokens / max_retries / enable_thinking；gist 少了的键同步后也没了；新世界继承
+    的是 b；按 pool.context 建的引擎拿 b 的字段建适配器。"""
+    import starling.dashboard.engine as engmod
+    cfg = _cfg(tmp_path,
+               providers={"a": {"provider": "openai", "model": "ma", "base_url": "http://a",
+                                "api_key": "ka", "thinking_type": "disabled", "max_tokens": 8192,
+                                "max_retries": 5, "enable_thinking": False},
+                          "b": {"provider": "openai", "model": "mb", "base_url": "http://b",
+                                "api_key": "kb"}},
+               roles={"extraction": "a"},
+               gist_thresholds={"min_holders": 4, "min_confidence": 0.7})
+    pool, reg, _c = _pool(tmp_path, cfg=cfg)
+    try:
+        cfg.roles["extraction"] = "b"
+        cfg.gist_thresholds = {"min_holders": 4}
+        pool.sync_default_settings()
+        fresh = _core.world_effective_settings(
+            {"extraction": {"provider": "openai", "provider_name": "b", "model": "mb",
+                            "base_url": "http://b"}})["extraction"]
+        stored = reg.get("default")["settings"]
+        assert stored["extraction"] == fresh
+        assert stored["gist_thresholds"] == {"min_holders": 4.0}
+        pool.create_world("w1", "")
+        assert reg.get("w1")["settings"]["extraction"] == fresh
+        seen = []
+        monkeypatch.setattr(engmod, "_build_chat_adapter",
+                            lambda c: seen.append(dict(c)) or _core.FakeLLMAdapter())
+        eng = DashboardEngine(pool.context("default"), cfg.providers)
+        got = {k: v for k, v in seen[0].items() if k != "api_key"}
+        assert got == {k: fresh[k] for k in got}
+        assert "max_retries" not in got and "enable_thinking" not in got
+        assert got["thinking_type"] == fresh["thinking_type"] != "disabled"
+        eng = None
+    finally:
+        pool.close_all()
+
+
+def test_rebinding_to_a_provider_without_base_url_does_not_brick_the_default_world(tmp_path,
+                                                                                   monkeypatch):
+    """裁定 R27（复现 bleed2.py）：改绑到没有 base_url 的 provider b 之后，存着的不能是「b 的名字 + a 的地址」，
+    否则默认世界的 remember 永远 endpoint_changed。"""
+    import starling.dashboard.engine as engmod
+    cfg = _cfg(tmp_path,
+               providers={"a": {"provider": "openai", "model": "ma", "base_url": "http://a",
+                                "api_key": "ka"},
+                          "b": {"provider": "openai", "model": "mb", "api_key": "kb"}},
+               roles={"extraction": "a"})
+    pool, reg, _c = _pool(tmp_path, cfg=cfg)
+    try:
+        cfg.roles["extraction"] = "b"
+        pool.sync_default_settings()
+        ext = reg.get("default")["settings"]["extraction"]
+        assert (ext["provider_name"], ext["base_url"], ext["model"]) == ("b", "", "mb")
+        monkeypatch.setattr(engmod, "_build_chat_adapter", lambda c: _fake())
+        eng = DashboardEngine(pool.context("default"), cfg.providers)   # 重启后建的就是这个
+        assert eng.remember("Bob owns auth")["outcome"] in ("accepted", "idempotent")
+        eng = None
+    finally:
+        pool.close_all()
+
+
+def test_sync_keeps_stored_auto_snapshot_and_ingest_after_the_replace(tmp_path):
+    """R27 下 background 仍逐叶合并：config 不带 auto_snapshot、ingest，同步不动它们（R16）。"""
+    pool, reg, cfg = _pool(tmp_path)
+    try:
+        pool.set_auto_snapshot("default", True, 6)
+        reg.update_settings("default", {"background": {"ingest": False}})
+        cfg.tick_interval_s = 12.0
+        pool.sync_default_settings()
+        bg = reg.get("default")["settings"]["background"]
+        assert bg == {"tick_interval_s": 12.0, "ingest": False,
+                      "auto_snapshot": {"on_session": True, "interval_hours": 6}}
+    finally:
+        pool.close_all()
+
+
+def test_worker_start_failure_logging_does_not_pin_the_engine(tmp_path, monkeypatch):
+    """修复轮 2 小项 1：起线程失败的日志不能把带引擎栈帧的回溯留在 LogRecord 里。挂一个留着记录的 handler
+    （与 caplog、队列 handler 一样），关闭之后要能证明 Runtime 已回收，重开照常，_leaked 为空。"""
+    import logging
+    import starling.dashboard.world_manager as wm
+    monkeypatch.setattr(wm, "_RUNTIME_RELEASE_GRACE_S", 0.2)
+
+    class Keep(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    keep = Keep()
+    wm.logger.addHandler(keep)
+    pool, _reg, _c = _pool(tmp_path, cfg=_cfg(tmp_path, tick_interval_s=60.0))
+    try:
+        pool.create_world("w1", "")
+        pool.start_background(stats_interval_s=999, scheduler_poll_s=999,
+                              scheduler_first_delay_s=999)
+
+        def boom(self, *args, **kwargs):
+            raise OSError("spool unreadable")
+
+        monkeypatch.setattr(DashboardEngine, "start_ingest_worker", boom)
+        with pool.lease("w1") as eng:
+            rt = weakref.ref(eng._rt)
+        eng = None
+        assert any("spool unreadable" in rec.getMessage() for rec in keep.records)
+        assert all(rec.exc_info is None for rec in keep.records)
+        monkeypatch.undo()
+        monkeypatch.setattr(wm, "_RUNTIME_RELEASE_GRACE_S", 0.2)
+        pool.close_world("w1")
+        gc.collect()
+        assert rt() is None
+        assert pool._leaked == []
+        with pool.lease("w1") as again:
+            assert again is not None
+    finally:
+        wm.logger.removeHandler(keep)
+        pool.close_all()

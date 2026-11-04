@@ -366,7 +366,7 @@ class DashboardEngine:
         return self._ctx.tenant
 
     def _endpoint_cfg(self, role: str) -> dict:
-        """世界设置里 role（extraction / embedding / chat）的 endpoint → _build_*_adapter 读的 provider
+        """世界设置里 role（extraction / embedding / chat / consolidation）的 endpoint → _build_*_adapter 读的 provider
         dict。密钥按 provider_name 从 providers 取；provider_name 为空（客户端显式给的端点）时取服务
         进程的 OPENAI_API_KEY（spec §8.3，与 make_openai_llm 一致）。没有 endpoint 返回 {}。
         建适配器不发请求，所以这里不核对地址：核对在每次调用之前（_require_endpoint_unchanged），
