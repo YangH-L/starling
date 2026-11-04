@@ -434,6 +434,22 @@ class DashboardEngine:
         elif role == "embedding":
             self.rebuild_embedder(self._endpoint_cfg("embedding"), reembed=False)
 
+    def _prepare_role(self, role: str):
+        """用到 role（extraction / chat / consolidation）的世界适配器之前调（持 self._lock），返回此刻该用的适配器
+        （可能为 None：没有可用的密钥）。
+
+        - 适配器建时的 endpoint 与 _settings 的不同（设置换了、没重建）：不论现在的适配器是不是 None，都先按
+          _settings 核对，过了就重建（裁定 R41；修复轮 3 小项 2：从没绑定换成带密钥的 endpoint 时，下一次用到就
+          建出来，而不是报 llm_not_configured）。
+        - 相同：有适配器才核对（没有适配器就没有密钥会被发出去，照旧由调用方报 llm_not_configured）。
+        - 核对失败抛 endpoint_changed，不重建。"""
+        attr = {"extraction": "llm", "chat": "chat_llm", "consolidation": "consolidation_llm"}[role]
+        stale = role in self._built_endpoints and \
+            self._built_endpoints[role] != self._source_endpoint(role)
+        if stale or getattr(self._core, attr) is not None:
+            self._require_endpoint_unchanged(role)
+        return getattr(self._core, attr)
+
     def _require_embedding_unchanged(self) -> None:
         """用到嵌入的调用（召回、tick、工作集、检索规划、对话的召回段）之前调。占位嵌入（没有密钥）不发
         请求，不核对；但设置已换成另一个 endpoint 时照样按新设置核对并重建（裁定 R41）。"""
@@ -756,9 +772,7 @@ class DashboardEngine:
             return _build_chat_adapter(cfg)
         # 用世界自己的抽取适配器：先核对继承来的地址（endpoint_changed）。没有适配器时不核对，由调用方
         # 报 llm_not_configured（没有适配器就没有密钥会被发出去）。
-        if self._core.llm is not None:
-            self._require_endpoint_unchanged("extraction")   # 可能按新设置重建了（裁定 R41）
-        return self._core.llm
+        return self._prepare_role("extraction")              # 可能按新设置重建了（裁定 R41）
 
     def _check_clear_generation(self, generation: int) -> None:
         """代数过期（claim 之后发生了 clear_memory）抛 _TenantCleared。短暂持 self._lock 读代数。"""
@@ -860,20 +874,19 @@ class DashboardEngine:
         """锁内调用:解析本轮 chat 适配器为局部引用(锁外使用)。取代旧
         _role_override('chat_llm', …) 的全局 slot 换入换出——锁外生成期间
         换 slot 会被并发轮读到错误模型。"""
+        # prepare 的召回要嵌入查询词（embedding），回合末的抽取走世界自己的 extraction（converse_commit 用
+        # self._core.llm）：不论本轮选没选别的 provider，这两个都还是世界的适配器，都先核对（裁定 R43：选了
+        # provider 的分支以前直接返回，世界的抽取与嵌入不经核对就被用到）。
+        self._prepare_role("extraction")
+        self._require_embedding_unchanged()
         if provider:
             cfg = self._providers.get(provider)
             if not cfg or not cfg.get("api_key"):
                 raise _LLMNotConfigured(
                     f"selected provider '{provider}' is not configured")
             return _build_chat_adapter(cfg)
-        # 用世界自己的适配器：生成走 chat（没有就回退到抽取），回合末的抽取走 extraction，prepare 的
-        # 召回要嵌入查询词（embedding）。只核对这一轮真会用到的适配器。
-        if self._core.chat_llm is not None:
-            self._require_endpoint_unchanged("chat")
-        if self._core.llm is not None:
-            self._require_endpoint_unchanged("extraction")
-        self._require_embedding_unchanged()
-        return self._core.chat_llm or self._core.llm
+        # 生成走世界的 chat（没有就回退到抽取）。
+        return self._prepare_role("chat") or self._core.llm
 
     def _converse_phased(self, message: str, *, on_token=None, on_status=None,
                          holder=None, interlocutor=None, k: int = 6, now=None,
@@ -990,8 +1003,7 @@ class DashboardEngine:
 
     def run_replay(self, mode: str, *, now=None) -> dict:
         with self._lock:
-            if self._core.consolidation_llm is not None:   # 离线回放用 consolidation 判 gist
-                self._require_endpoint_unchanged("consolidation")
+            self._prepare_role("consolidation")             # 离线回放用 consolidation 判 gist
             if not self._rt.adapter.write_admitted():
                 # host-side gate(P3.c write-gate follow-up):手动 replay 是重 DB 写。
                 # DRAINING/UNREADY 时拒(不跑 ReplayScheduler)。返回带标记 dict —— route

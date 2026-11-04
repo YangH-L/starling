@@ -960,8 +960,8 @@ def test_create_racing_a_config_bind_never_stores_a_provider_name_at_the_client_
                                                                                    monkeypatch):
     """审查探针 test_probe_create_window：建世界时客户端给显式的 embedding（默认世界那一刻没绑 embedding），
     合并之前 POST /api/config 把 embedding 绑到 p。C++ 叶合并会把客户端的 base_url 叠到 p 的 endpoint 上。
-    核对与合并、写在同一次持锁内：要么 409，要么存下来的 endpoint 不带客户端地址；绝不会是 provider_name=p、
-    base_url=客户端地址。用真实的同步插在 C++ 读默认世界设置之前（替换 reg.create，先同步再调真的）。"""
+    核对与合并、写在同一次持锁内，所以 409、世界不存在。用真实的同步插在 C++ 读默认世界设置之前（包一层
+    reg.create，先同步再调真的）。"""
     built: list = []
     cfg, client = _window_client(tmp_path, monkeypatch, built)
     with client:
@@ -986,13 +986,10 @@ def test_create_racing_a_config_bind_never_stores_a_provider_name_at_the_client_
                 "embedding": {"base_url": "http://evil.example", "model": "e", "dim": 8}}})
         finally:
             pool._registry = reg
-        if resp.status_code == 409:
-            assert resp.json() == {"detail": "endpoint_changed"}
-            assert client.get("/api/worlds/w1").status_code == 404
-        else:
-            assert resp.status_code == 200, resp.text
-            ep = reg.get("w1")["settings"]["embedding"]
-            assert ep.get("base_url") != "http://evil.example" or not ep.get("provider_name"), ep
+        # 插入点是确定的（同步一定落在 C++ 合并之前），所以结果也是确定的：叶合并叠出 provider_name=p、
+        # base_url=客户端地址，C++ 在同一次持锁内核对出来，拒绝。
+        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), resp.text
+        assert client.get("/api/worlds/w1").status_code == 404
         assert all(b != ("http://evil.example", "sk-secret-123") for b in built)
 
 
@@ -1047,3 +1044,93 @@ def _core_tick_spy(monkeypatch, pool, uses: list):
         return real(self, now)
     monkeypatch.setattr(engmod.MemoryCore, "tick", _spy)
     return real
+
+
+# ───────────────────────── 裁定 R43：选了 provider 的对话照样核对世界自己的抽取与嵌入 ─────────────────────────
+
+def _converse_client(tmp_path, monkeypatch, origin: dict, used: list):
+    """默认世界的 extraction 绑 p；另有 provider q。每个建出来的对话/抽取适配器记下 (base_url, api_key)；
+    converse_commit 记下它用的世界抽取适配器是按哪个地址建的（审查探针 test_probe_converse_provider）。"""
+    import starling._memory_core as mc
+    import starling.dashboard.engine as engmod
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def _chat(c):
+        llm = make_stub_llm(default_response="[]")
+        origin[id(llm)] = (c.get("base_url"), c.get("api_key"))
+        return llm
+    monkeypatch.setattr(engmod, "_build_chat_adapter", _chat)
+    real_commit = mc.MemoryCore.converse_commit
+
+    def _spy(self, *a, **kw):
+        used.append(origin.get(id(self.llm)))
+        return real_commit(self, *a, **kw)
+    monkeypatch.setattr(mc.MemoryCore, "converse_commit", _spy)
+    cfg = DashboardConfig(db_path=str(tmp_path / "dashboard.db"), token="",
+                          tick_interval_s=600.0, source_lane_enabled=False,
+                          ingest_spool_path=str(tmp_path / "spool"))
+    cfg.providers["p"] = {"provider": "openai", "model": "m1", "base_url": "http://h.example",
+                          "api_key": "sk-secret-123"}
+    cfg.providers["q"] = {"provider": "openai", "model": "m1", "base_url": "http://q.example",
+                          "api_key": "sk-q"}
+    cfg.roles["extraction"] = "p"
+    return cfg, TestClient(create_app(cfg, engine_factory=lambda ctx, prov: DashboardEngine(ctx, prov)))
+
+
+def _ws_converse(client, body: dict) -> dict:
+    with client.websocket_connect("/ws/converse") as ws:
+        ws.send_json(body)
+        while (msg := ws.receive_json())["type"] in ("token", "status"):
+            pass
+    return msg
+
+
+def test_converse_with_a_provider_still_checks_the_worlds_own_endpoints(tmp_path, monkeypatch):
+    """审查探针：w2 继承 p@h.example，随后 p 挪到 h2。不选 provider 的对话 409；选了 q 的对话以前直接 200，回合末的
+    抽取用的是建在 h.example、带着 p 的密钥的世界适配器。现在选了 provider 也先核对世界的抽取与嵌入：HTTP 409、
+    /ws/converse 回 endpoint_changed 错误帧，没有用到建在 p 旧地址的适配器。"""
+    origin: dict = {}
+    used: list = []
+    cfg, client = _converse_client(tmp_path, monkeypatch, origin, used)
+    with client:
+        assert client.post("/api/worlds", json={"name": "w2"}).status_code == 200
+        cfg.providers["p"]["base_url"] = "http://h2.example"      # p 挪了；w2 记的还是 h.example
+        for body in ({"message": "hi"}, {"message": "hi", "provider": "q"}):
+            r = client.post("/api/w/w2/converse", json=body)
+            assert (r.status_code, r.json()) == (409, {"detail": "endpoint_changed"}), body
+            frame = _ws_converse(client, {**body, "world": "w2"})
+            assert frame == {"type": "error", "error": "endpoint_changed"}, (body, frame)
+        assert used == [], "回合末的抽取用到了建在 p 旧地址的适配器"
+
+
+def test_converse_with_a_provider_works_when_nothing_moved(tmp_path, monkeypatch):
+    origin: dict = {}
+    used: list = []
+    _cfg, client = _converse_client(tmp_path, monkeypatch, origin, used)
+    with client:
+        assert client.post("/api/worlds", json={"name": "w2"}).status_code == 200
+        r = client.post("/api/w/w2/converse", json={"message": "hi", "provider": "q"})
+        assert r.status_code == 200, r.text
+        assert _ws_converse(client, {"message": "hi", "provider": "q", "world": "w2"})["type"] == "done"
+        assert used == [("http://h.example", "sk-secret-123")] * 2   # 世界自己的抽取，地址没变
+
+
+def test_provider_base_urls_snapshot_survives_a_concurrent_config_edit(client, monkeypatch):
+    """_provider_base_urls 遍历 cfg.providers 时，/api/config 的另一个线程在改它（setdefault、clear + update）。先拍
+    快照再遍历：不抛「dictionary changed size during iteration」。卡点：读第一个 provider 的 base_url 时（遍历的
+    途中）往同一个 dict 里加一项，就是并发的 setdefault 落在两次迭代之间。"""
+    pool = _pool(client)
+    providers = client.app.state.config.providers
+    providers.clear()
+    inserted: list = []
+
+    class _Prov(dict):
+        def get(self, key, default=None):
+            if key == "base_url" and not inserted:
+                inserted.append(True)
+                providers.setdefault("late", {"base_url": "http://late"})
+            return super().get(key, default)
+    providers["p"] = _Prov(base_url="http://h")
+    providers["q"] = {"base_url": "http://q"}
+    urls = pool._provider_base_urls()
+    assert inserted and urls["p"] == "http://h" and urls["q"] == "http://q"

@@ -400,3 +400,46 @@ def test_adapter_rebuild_and_reembed_refuse_a_changed_inherited_endpoint(tmp_pat
     assert con.execute("SELECT COUNT(*) FROM statement_vectors").fetchone()[0] == vectors
     con.close()
     eng.close()
+
+
+@pytest.mark.parametrize("role", ["extraction", "chat", "consolidation"])
+def test_role_switched_from_unbound_to_a_keyed_endpoint_is_built_on_next_use(tmp_path, monkeypatch,
+                                                                            role):
+    """设置把一个角色从没绑定换成带密钥的 endpoint，却没重建适配器（例如只换了设置引用）。下一次用到它时，建时
+    记下的 endpoint（无）与设置里的不同：先核对、过了就建，照常往下走，不报 llm_not_configured。"""
+    import starling.dashboard.engine as engmod
+    built = []
+
+    def _chat(cfg):
+        built.append(cfg.get("base_url"))
+        return _fake()
+    monkeypatch.setattr(engmod, "_build_chat_adapter", _chat)
+    providers = {"p": {"provider": "openai", "model": "m", "base_url": "http://a", "api_key": "sk"}}
+    eng = DashboardEngine(_ctx(tmp_path), providers)
+    assert eng.llm is None and built == []
+    ep = {"provider": "openai", "provider_name": "p", "base_url": "http://a", "model": "m"}
+    keyed = _core.world_effective_settings({"source_lane": {"enabled": False}, role: ep})
+    eng.set_world_settings(keyed)                     # 只换设置引用，不重建适配器
+    if role == "extraction":
+        assert eng.remember("Bob owns auth")["outcome"] in ("accepted", "idempotent")
+    elif role == "chat":
+        eng.llm = _fake()                             # 回合末的抽取另给一个替身
+        assert "reply" in eng.converse("hi")
+    else:
+        assert eng.run_replay("idle") is not None
+        assert eng._core.consolidation_llm is not None
+    assert built and built[0] == "http://a"
+    # 设置里的地址已不是 provider 的：同样先核对，失败就 endpoint_changed、不建。
+    built.clear()
+    moved = {"p": {**providers["p"], "base_url": "http://b"}}
+    eng2 = DashboardEngine(_ctx(tmp_path, db_path=str(tmp_path / "w2.db")), moved)
+    eng2.set_world_settings(keyed)
+    call = {"extraction": lambda: eng2.remember("Bob owns auth"),
+            "chat": lambda: eng2.converse("hi"),
+            "consolidation": lambda: eng2.run_replay("idle")}[role]
+    with pytest.raises(_core.WorldStoreError) as ei:
+        call()
+    assert _core.world_store_error_code(ei.value) == "endpoint_changed"
+    assert built == []
+    eng.close()
+    eng2.close()

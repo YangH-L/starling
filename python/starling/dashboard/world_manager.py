@@ -956,8 +956,11 @@ class WorldPool:
     def _provider_base_urls(self) -> dict[str, str]:
         """{provider 名: 当前 base_url}（starling.json 的 provider 注册表），交给 C++ 核对客户端写的设置里继承来的
         endpoint（裁定 R40）。provider 没有地址时按空串。"""
+        # 先拍一份快照再遍历：/api/config 的 _post_config（setdefault）与 _restore（clear + update）可能同时在
+        # 改这个 dict，直接遍历会抛「dictionary changed size during iteration」（500）。list(...) 由 C 实现、
+        # 持 GIL 一次拷完，期间别的线程改不了它。
         return {name: (prov or {}).get("base_url") or ""
-                for name, prov in self._config.providers.items()}
+                for name, prov in list(self._config.providers.items())}
 
     def delete_world(self, world: str) -> None:
         """删世界：先关（等租约、停线程、丢引擎），旧 Runtime 回收不了就拒绝（world_busy，什么都不删），

@@ -8,11 +8,13 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -437,6 +439,8 @@ TEST(WorldSettingsCompose, InheritedEndpointMustMatchTheProviderAddress) {
 // （replace_world_sections，即 sync_default_settings）。合并与核对在同一次持锁内：存下来的世界要么是
 // 显式端点（provider_name 为空、客户端地址），要么建世界被拒（endpoint_changed）；绝不会出现
 // provider_name=p、地址却是客户端给的。
+// 两部分：(1) 按步交错（握手）：每一轮先在「已绑定」状态下建一次、再在「已解绑」状态下建一次，两种结果都
+// 必然出现；(2) 真并发：绑定线程不停地绑、解绑，同时连续建世界，只断言不变式（结果不受调度影响）。
 TEST(WorldSettingsCompose, CreateWithAnExplicitEndpointNeverInheritsAProviderNameAtTheClientUrl) {
     const TempDir tmp;
     auto reg = open_db(tmp);
@@ -444,34 +448,70 @@ TEST(WorldSettingsCompose, CreateWithAnExplicitEndpointNeverInheritsAProviderNam
     const std::string bound =
         R"({"embedding":{"provider":"openai","provider_name":"p","base_url":"http://h",)"
         R"("model":"e1","dim":8,"max_tokens":1,"timeout_ms":1000}})";
-    std::atomic<bool> stop{false};
-    std::thread binder([&] {
-        while (!stop.load()) {
-            (void)reg.replace_world_sections("default", bound);
-            (void)reg.replace_world_sections("default", R"({"embedding":null})");
-        }
-    });
+    const std::string unbound = R"({"embedding":null})";
+    const std::string client = R"({"embedding":{"base_url":"http://evil","model":"e","dim":8}})";
     int created = 0;
     int refused = 0;
-    for (int idx = 0; idx < 40; ++idx) {
-        const std::string name = "c" + std::to_string(idx);
+    int index = 0;
+    const auto attempt = [&] {
         try {
-            (void)reg.create_world(
-                name, "", {}, R"({"embedding":{"base_url":"http://evil","model":"e","dim":8}})",
-                kNow, urls);
+            (void)reg.create_world("c" + std::to_string(index++), "", {}, client, kNow, urls);
             ++created;
         } catch (const WorldStoreError& err) {
             ASSERT_EQ(err.code(), "endpoint_changed") << err.what();
             ++refused;
         }
+    };
+
+    // (1) 按步交错：绑定线程每次换状态后交出控制权，建世界线程在那个状态下建一次。
+    {
+        std::mutex step_mutex;
+        std::condition_variable step_cv;
+        int phase = 0;   // 偶数：轮到绑定线程；奇数：轮到建世界线程
+        constexpr int kRounds = 10;
+        std::thread binder([&] {
+            for (int round = 0; round < 2 * kRounds; ++round) {
+                std::unique_lock lock(step_mutex);
+                step_cv.wait(lock, [&] { return phase % 2 == 0; });
+                (void)reg.replace_world_sections("default", round % 2 == 0 ? bound : unbound);
+                ++phase;
+                step_cv.notify_all();
+            }
+        });
+        for (int round = 0; round < 2 * kRounds; ++round) {
+            std::unique_lock lock(step_mutex);
+            step_cv.wait(lock, [&] { return phase % 2 == 1; });
+            attempt();
+            ++phase;
+            step_cv.notify_all();
+        }
+        binder.join();
+        EXPECT_EQ(created, kRounds);    // 解绑状态下建：显式端点照常建
+        EXPECT_EQ(refused, kRounds);    // 绑定状态下建：叶合并会叠出 provider_name=p，被拒
     }
+
+    // (2) 真并发：只断言不变式。
+    std::atomic<bool> stop{false};
+    std::thread binder([&] {
+        while (!stop.load()) {
+            (void)reg.replace_world_sections("default", bound);
+            (void)reg.replace_world_sections("default", unbound);
+        }
+    });
+    for (int round = 0; round < 40; ++round) { attempt(); }
     stop.store(true);
     binder.join();
-    EXPECT_EQ(created + refused, 40);
-    const auto page = reg.list(WorldQuery{.labels = {}, .offset = 0, .limit = 500});
-    for (const auto& rec : page.worlds) {
-        const auto got = settings_from_json(rec.settings_json);
-        if (!got.embedding || got.embedding->provider_name != "p") { continue; }
-        EXPECT_EQ(got.embedding->base_url, "http://h") << rec.name;   // p 的地址，从不是客户端的
+
+    std::int64_t seen = 0;
+    for (std::int64_t offset = 0;; offset += 500) {
+        const auto page = reg.list(WorldQuery{.labels = {}, .offset = offset, .limit = 500});
+        for (const auto& rec : page.worlds) {
+            ++seen;
+            const auto got = settings_from_json(rec.settings_json);
+            if (!got.embedding || got.embedding->provider_name != "p") { continue; }
+            EXPECT_EQ(got.embedding->base_url, "http://h") << rec.name;   // p 的地址，从不是客户端的
+        }
+        if (page.worlds.empty() || offset + 500 >= page.total) { break; }
     }
+    EXPECT_EQ(seen, created + 1);                                         // 建成的世界加默认世界
 }
