@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { api, worldPath } from '$lib/api';
+	import { currentWorld } from '$lib/world.svelte';
+	import { apiDetail, worldErrorMessage, worldsApi } from '$lib/worlds';
 	import { llmConfigured, embedderConfigured } from '$lib/health';
 	import { getToken, setToken } from '$lib/token';
 	import { toast } from '$lib/ui/toast';
@@ -37,9 +39,35 @@
 	let tests = $state<Record<string, TestResult>>({});
 	let testing = $state<Record<string, boolean>>({});
 
-	// 危险区:清空当前租户的全部记忆。tenant 来自 /api/config;手输一致才放行,
-	// 后端再按 confirm === 租户名校验一次(POST /api/clear_memory)。
-	let tenant = $state('');
+	// 危险区:清空「顶栏选中的世界」的全部记忆(与其他命令一样随 ?world= 走,裁定 R47)。
+	// 确认串是该世界自己的租户名,取自 GET /api/worlds/<world> 的 tenant,不再用 /api/config 的
+	// (那是默认世界的租户)。详情没取到就禁用清空,绝不回退到默认世界的租户。
+	// 手输一致才放行,后端再按 confirm === 租户名校验一次(POST /api/clear_memory)。
+	let clearWorld = $derived(currentWorld());
+	let clearInfo = $state<{ world: string; tenant: string } | null>(null);
+	let clearInfoErr = $state('');
+	// 只认与当前世界对应的那份详情:换世界后旧租户名立刻失效,不会串到新世界上。
+	let tenant = $derived(clearInfo && clearInfo.world === clearWorld ? clearInfo.tenant : '');
+	let clearReq = 0; // 防陈旧:换世界后只让最新一次的详情落地
+	async function loadClearInfo(world: string) {
+		const mine = ++clearReq;
+		clearInfoErr = '';
+		try {
+			const d = await worldsApi.detail(world);
+			if (mine !== clearReq) return;
+			clearInfo = typeof d?.tenant === 'string' && d.tenant ? { world, tenant: d.tenant } : null;
+			if (!clearInfo) clearInfoErr = '没有取到这个世界的租户名';
+		} catch (e) {
+			if (mine !== clearReq) return;
+			clearInfo = null;
+			clearInfoErr = worldErrorMessage(apiDetail(e));
+		}
+	}
+	$effect(() => {
+		const w = clearWorld;
+		clearInfo = null;
+		void loadClearInfo(w);
+	});
 	let clearConfirm = $state('');
 	let clearOpen = $state(false);
 	let clearing = $state(false);
@@ -75,7 +103,6 @@
 			entity_gist_enabled: gt.entity_gist_enabled ?? null
 		};
 		keyInputs = Object.fromEntries(Object.keys(providers).map((n) => [n, '']));
-		tenant = c.tenant ?? '';
 	}
 
 	// ── 配置加载门 ────────────────────────────────────────────────────────────
@@ -242,18 +269,16 @@
 		if (!tenant || clearConfirm !== tenant) return;
 		clearing = true;
 		try {
-			// 固定走旧路径 /api/clear_memory(默认世界):这里的租户名取自 /api/config(默认世界的租户),
-			// 确认串与之对应;不随顶栏选中的世界走,免得拿默认世界的租户名去确认另一个世界。
 			const r = await api.post<{ tenant: string; total: number; spool_discarded: number }>(
-				'/api/clear_memory',
+				worldPath('/api/clear_memory'),
 				{ confirm: clearConfirm },
 				{ timeoutMs: 120_000 }
 			);
 			clearConfirm = '';
 			toast.success(
 				r.spool_discarded
-					? `已清空 ${r.total} 行,丢弃 ${r.spool_discarded} 个待摄入会话`
-					: `已清空 ${r.total} 行`
+					? `已清空世界「${clearWorld}」${r.total} 行,丢弃 ${r.spool_discarded} 个待摄入会话`
+					: `已清空世界「${clearWorld}」${r.total} 行`
 			);
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
@@ -412,29 +437,41 @@
 		</div>
 	</Card>
 
-	<!-- 危险区:只在配置加载成功、拿到租户名后渲染——不知道租户名就无从确认。 -->
-	{#if loaded && tenant}
-		<Card
-			title="危险区"
-			class="border-danger"
-			description={`物理删除租户「${tenant}」的全部记忆:engram、语句、事件、向量、承诺、共同基础与认知体(保留 self)。该租户尚未处理的会话摄入任务移到 spool 的 discarded/。不可撤销,其他租户不受影响。`}
-		>
-			<div class="space-y-3">
-				<Field label={`输入租户名「${tenant}」以确认`} for="clear-confirm">
-					<Input
-						id="clear-confirm"
-						bind:value={clearConfirm}
-						placeholder={tenant}
-						autocomplete="off"
-						class="max-w-64"
-					/>
-				</Field>
-				<Button variant="danger" loading={clearing} disabled={!canClear} onclick={() => (clearOpen = true)}
-					>清空记忆</Button
-				>
-			</div>
-		</Card>
-	{/if}
+	<!-- 危险区:清空的是顶栏选中的世界;租户名取自该世界的详情,没取到就禁用。 -->
+	<Card
+		title="危险区"
+		class="border-danger"
+		description={tenant
+			? `将清空世界「${clearWorld}」的全部记忆(租户「${tenant}」):engram、语句、事件、向量、承诺、共同基础与认知体(保留 self)。该租户尚未处理的会话摄入任务移到 spool 的 discarded/。不可撤销,其他世界不受影响。`
+			: `清空世界「${clearWorld}」的全部记忆。需要先取到这个世界的租户名才能确认。`}
+	>
+		<div class="space-y-3">
+			{#if clearInfoErr}
+				<p role="alert" class="text-xs text-danger">
+					没能取到世界「{clearWorld}」的租户名,不能清空:{clearInfoErr}
+					<button type="button" class="underline" onclick={() => void loadClearInfo(clearWorld)}
+						>重试</button
+					>
+				</p>
+			{/if}
+			<Field
+				label={tenant ? `输入租户名「${tenant}」以确认` : '输入租户名以确认'}
+				for="clear-confirm"
+			>
+				<Input
+					id="clear-confirm"
+					bind:value={clearConfirm}
+					placeholder={tenant}
+					disabled={!tenant}
+					autocomplete="off"
+					class="max-w-64"
+				/>
+			</Field>
+			<Button variant="danger" loading={clearing} disabled={!canClear} onclick={() => (clearOpen = true)}
+				>清空世界「{clearWorld}」</Button
+			>
+		</div>
+	</Card>
 </div>
 
 <ConfirmDialog
@@ -448,7 +485,7 @@
 <ConfirmDialog
 	bind:open={clearOpen}
 	title="确认清空记忆?"
-	description={`将物理删除租户「${tenant}」的全部记忆,无法恢复。`}
+	description={`将物理删除世界「${clearWorld}」(租户「${tenant}」)的全部记忆,无法恢复。`}
 	confirmLabel="确认清空"
 	danger
 	onconfirm={doClear}
