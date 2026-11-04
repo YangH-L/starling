@@ -89,8 +89,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
 // （require_endpoint_unchanged，spec §8.3）。表里没有这个 provider（已被删掉）按空串算，同样拒绝。
 // 调用方持注册表锁、在写之前调用：抛 endpoint_changed 时什么都没写。
 void require_inherited_endpoints(const WorldSettings& settings, const ProviderBaseUrls& base_urls) {
-    for (const auto* endpoint : {&settings.extraction, &settings.embedding, &settings.chat,
-                                 &settings.consolidation}) {
+    for (const auto* endpoint : {
+             &settings.extraction,
+             &settings.embedding,
+             &settings.chat,
+             &settings.consolidation,
+         }) {
         if (!endpoint->has_value() || (*endpoint)->provider_name.empty()) { continue; }
         const auto found = base_urls.find((*endpoint)->provider_name);
         require_endpoint_unchanged(**endpoint,
