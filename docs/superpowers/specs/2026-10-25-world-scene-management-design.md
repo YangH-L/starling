@@ -1,6 +1,6 @@
 # 世界/场景管理：完整设计
 
-日期 2026-10-25。状态：**W1+W2 已实现并合入 main（注册表、新建/切换/删除世界、手动快照与保留策略、`/worlds` 页）；W3 回滚语义 A（丢掉后续）与归档已在 `feat/world-rollback` 分支实现（含前端：C++ `rollback_world` / 归档列出与清理、绑定、`WorldManager.rollback`、`POST /api/worlds/{name}/rollback`、`DELETE /api/worlds/{name}/archives`、`/worlds` 页的回滚与清理归档）；W4（会话清单、每个世界各自配置的按会话 / 按时间自动快照、快照元数据 `sessions_complete` / `session_id` / `content_mark`，含 `/sessions` 页）在 `feat/world-sessions` 分支实现；W5（分叉与语义 B）未实现**。承接 `2026-10-19-form-s-source-lane-design.md` §14 的用户裁定。
+日期 2026-10-25。状态：**§8.1 被 `2026-11-03-memory-service-design.md` 取代**；**W1+W2 已实现并合入 main（注册表、新建/切换/删除世界、手动快照与保留策略、`/worlds` 页）；W3 回滚语义 A（丢掉后续）与归档已在 `feat/world-rollback` 分支实现（含前端：C++ `rollback_world` / 归档列出与清理、绑定、`WorldManager.rollback`、`POST /api/worlds/{name}/rollback`、`DELETE /api/worlds/{name}/archives`、`/worlds` 页的回滚与清理归档）；W4（会话清单、每个世界各自配置的按会话 / 按时间自动快照、快照元数据 `sessions_complete` / `session_id` / `content_mark`，含 `/sessions` 页）在 `feat/world-sessions` 分支实现；W5（分叉与语义 B）未实现**。承接 `2026-10-19-form-s-source-lane-design.md` §14 的用户裁定。
 
 **范围**：多世界 Dashboard、快照、回滚（两种语义）、分叉、场景清单。
 
