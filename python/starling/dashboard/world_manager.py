@@ -404,7 +404,10 @@ class WorldPool:
             if not ctx.is_default:
                 self._verify_tenant(ctx)              # 裁定 R36：在打开库之前，拒开时什么都没建
             engine = self._open_engine(world, ctx)
-            self._publish(world, engine)
+            if not self._publish(world, engine):
+                self._discard_unpublished(engine, ctx.db_path)
+                engine = None
+                raise WorldSwitchError("world_busy", "the pool is shutting down")
             return engine
         finally:
             lock.release()
@@ -422,15 +425,34 @@ class WorldPool:
                 else "world_open_failed"
             raise WorldSwitchError(code, str(exc)) from exc
 
-    def _publish(self, world: str, engine) -> None:
+    def _publish(self, world: str, engine) -> bool:
         """持世界锁调用：先把引擎放进表，再按后台开关起线程（裁定 R23）。顺序不能反：起线程失败时引擎若还
         不在表上，它的 Runtime（已打开写连接，起了一半的 tick 线程还引用着它）既没发布也没登记成泄漏，
         下一次租约会在同一个库上再建一条写连接。起线程失败只记日志、标记 workers-lost，下一次租约补起；
-        这个引擎照常服务请求。"""
+        这个引擎照常服务请求。
+
+        池已关停（close_all 置了 _shut）时不放进表、返回 False，由调用方关掉这个引擎（_discard_unpublished）。
+        close_all 只关它列出那一刻表上的世界：一个已经持着世界锁、正在首次打开的世界不在表上，它若在关停之后
+        才发布，写连接就一直开着。判断与放进表在同一次持 _lock 内，所以要么在 close_all 列表之前已经在表上
+        （close_all 取世界锁等它建完再关），要么看到 _shut、不发布。"""
         with self._lock:
+            if self._shut:
+                return False
             self._engines[world] = engine
-        if self._background:
+            background = self._background
+        if background:
             self._start_workers_or_mark_lost(world, engine)
+        return True
+
+    def _discard_unpublished(self, engine, db_path: str) -> None:
+        """关掉一个没能发布的引擎（池已关停）：摘掉池的回调、关引擎、等旧 Runtime 回收（回收不了照常登记成
+        泄漏）。没起过线程（_publish 没走到起线程那一步）。"""
+        rt_ref = weakref.ref(engine._rt)
+        engine.on_commit = None
+        engine.session_snapshot_hook = None
+        engine.close()
+        engine = None
+        self._release_runtime(rt_ref, db_path)
 
     def _start_workers_or_mark_lost(self, world: str, engine) -> bool:
         """持世界锁调用。起 tick / 摄入线程；任一步失败就把已经起来的停掉（不留半套线程，补起时整套重来），
@@ -515,7 +537,8 @@ class WorldPool:
                 self._refuse_leaked(ctx.db_path)
                 engine.set_world_settings(ctx.settings)
                 self._wire(world, engine)
-                self._publish(world, engine)
+                if not self._publish(world, engine):  # 判断与放进表之间池关停了
+                    raise WorldSwitchError("world_busy", world)
         except BaseException:
             # 异常的回溯持有本帧：调用方留着异常时，engine 参数会钉住被拒的引擎（同 _close_engine）。
             engine = None
@@ -713,7 +736,11 @@ class WorldPool:
 
     def stop_background(self, timeout_s: float = 5.0) -> None:
         """停调度与统计线程（任何锁之外 join），再停每个开着的世界的 tick / 摄入线程。此后新建的引擎
-        不起线程。"""
+        不起线程。
+
+        每个世界持它的世界锁 quiesce（与 start_background 一样）：正在首次打开的世界在 _publish 里读到后台
+        开着、放进表之后、起线程之前，世界锁一直在它手里；不取世界锁的话，这里可能先 quiesce 了一个还没有
+        线程的引擎，随后它才把线程起来，关停之后线程还在跑。"""
         with self._lock:
             self._background = False
             threads = list(self._threads.values())
@@ -726,12 +753,13 @@ class WorldPool:
             if thread.is_alive():
                 logger.warning("%s did not stop within %.1fs", thread.name, timeout_s)
         for world in worlds:
-            with self._lock:
-                engine = self._engines.get(world)
-            if engine is not None and not engine.quiesce(timeout_s):
-                logger.warning("background threads of world %s did not stop: %s",
-                               world, "/".join(engine.quiesce_stuck))
-            engine = None
+            with self._world_lock(world):
+                with self._lock:
+                    engine = self._engines.get(world)
+                if engine is not None and not engine.quiesce(timeout_s):
+                    logger.warning("background threads of world %s did not stop: %s",
+                                   world, "/".join(engine.quiesce_stuck))
+                engine = None
 
     def _start_thread(self, name: str, target, poll_s: float, first_delay_s: float) -> None:
         stop = threading.Event()
@@ -780,18 +808,21 @@ class WorldPool:
             except Exception:  # noqa: BLE001 — 关停路径
                 logger.exception("cannot drain world %s at shutdown", world)
 
-    def close_world(self, world: str, timeout_s: float = _LEASE_DRAIN_TIMEOUT_S) -> None:
+    def close_world(self, world: str, timeout_s: float | None = None) -> None:
         """关一个世界：等该世界租约归零、停线程、丢引擎、写统计缓存（Review Focus 2）。之后的 lease 会重新
         建引擎。默认世界不在这里关（world_protected；只在关停时由 close_all 关）。没开着时什么都不做。
-        超时或线程停不下 → world_busy，引擎原样留着。"""
+        超时（缺省 _LEASE_DRAIN_TIMEOUT_S，调用时读，与恢复、删除一致）或线程停不下 → world_busy，引擎
+        原样留着。"""
         if world == self.default_world():
             raise WorldSwitchError("world_protected", "the default world closes only at shutdown")
         self._record(world)
         with self._world_lock(world), _ClosingWindow(self, world):
-            self._close_engine(world, timeout_s)
+            self._close_engine(world, _LEASE_DRAIN_TIMEOUT_S if timeout_s is None else timeout_s)
 
-    def close_all(self, timeout_s: float = _LEASE_DRAIN_TIMEOUT_S) -> None:
+    def close_all(self, timeout_s: float | None = None) -> None:
         """关停：此后 lease 一律 world_busy；停后台线程，逐个关闭全部世界（含默认世界）。幂等。"""
+        if timeout_s is None:
+            timeout_s = _LEASE_DRAIN_TIMEOUT_S
         with self._lock:
             self._shut = True
         self.stop_background()
@@ -1085,7 +1116,11 @@ class WorldPool:
             detail = f"{cause}; reopening the world also failed: {exc}"
             logger.error("world rollback (%s): %s", world, detail)
             raise WorldSwitchError("world_open_failed", detail) from cause
-        self._publish(world, engine)                  # 起线程失败只标记 workers-lost（裁定 R23）
+        # 起线程失败只标记 workers-lost（裁定 R23）。恢复途中池关停了：不发布，关掉它（世界留在关着的状态，
+        # 恢复本身照常算成功或照常抛 cause）。
+        if not self._publish(world, engine):
+            self._discard_unpublished(engine, self.context(world).db_path)
+        engine = None
 
     # ───────────────────────── 自动快照（W4） ─────────────────────────
 
@@ -1146,11 +1181,15 @@ class WorldPool:
             return f"taken:{snap['id']}"
         except Exception as exc:  # noqa: BLE001 — 后台路径：只记录，不外抛（用户裁定）
             # 错误码进状态（GET /api/worlds 外露），全文只进日志：C++ 的 detail 里有服务器路径。
+            # 只把格式化好的文本交给日志：留着 LogRecord 的 handler 拿到异常对象（在 args 里）就经它的回溯钉住
+            # 栈帧，帧的 f_back 一路通到调用钩子的引擎方法（self 就是引擎），之后关闭这个世界就等不到旧
+            # Runtime 回收（同 _start_workers_or_mark_lost）。非领域异常照旧带回溯。
             domain = isinstance(exc, (_core.WorldStoreError, WorldSwitchError))
             code = (exc.code if isinstance(exc, WorldSwitchError)
                     else _store_code(exc) if domain else "internal_error")
-            logger.warning("auto snapshot (%s, %s) failed: %s", world, trigger_kind, exc,
+            logger.warning("auto snapshot (%s, %s) failed: %s", world, trigger_kind, str(exc),
                            exc_info=not domain)
+            exc = None
             self._count_auto_failure(code, now)
             return "failed"
         finally:

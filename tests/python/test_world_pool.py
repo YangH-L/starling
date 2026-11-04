@@ -1137,3 +1137,83 @@ def test_begin_drain_puts_every_open_world_into_draining(tmp_path):
             eng = None
     finally:
         pool.close_all()
+
+
+def test_a_first_open_that_finishes_after_shutdown_is_not_published(tmp_path, monkeypatch):
+    """close_all 只关它列出那一刻表上的世界。一个正卡在首次打开里（已持世界锁、还没发布）的世界不在表上：
+    它在关停之后才发布的话，写连接一直开着。发布时看到池已关停就不放进表、关掉这个引擎，租约回 world_busy。"""
+    pool, _reg, _c = _pool(tmp_path)
+    pool.create_world("w1", "")
+    real = pool._open_engine
+    in_build, proceed = threading.Event(), threading.Event()
+    built: list = []
+
+    def _slow_open(world, ctx):
+        engine = real(world, ctx)
+        built.append(weakref.ref(engine._rt))
+        in_build.set()
+        assert proceed.wait(15)
+        return engine
+    monkeypatch.setattr(pool, "_open_engine", _slow_open)
+    errors: list = []
+
+    def _first_open():
+        try:
+            pool.lease("w1").release()
+        except WorldSwitchError as exc:
+            errors.append(exc.code)
+
+    opener = threading.Thread(target=_first_open)
+    opener.start()
+    try:
+        assert in_build.wait(10)
+        pool.close_all(timeout_s=0.2)               # 首次打开的租约还没归还：等满超时，照常关停
+    finally:
+        proceed.set()
+        opener.join(15)
+    assert errors == ["world_busy"]
+    assert pool.open_worlds() == []
+    gc.collect()
+    assert built and built[0]() is None, "关停之后建好的引擎没关，它的写连接还开着"
+
+
+def test_stop_background_waits_for_a_first_open_that_is_starting_its_workers(tmp_path,
+                                                                           monkeypatch):
+    """首次打开已把引擎放进表、读到后台开着、正要起线程时开始关后台：stop_background 等它起完（世界锁），
+    停掉的正是它刚起的线程，返回之后没有线程还在跑。卡点用 Event。"""
+    pool, _reg, _c = _pool(tmp_path, cfg=_cfg(tmp_path, tick_interval_s=60.0))
+    pool.create_world("w1", "")
+    pool.start_background(stats_interval_s=3600.0, scheduler_poll_s=3600.0,
+                          scheduler_first_delay_s=3600.0)
+    real = pool._start_workers
+    in_start, proceed = threading.Event(), threading.Event()
+    started: list = []
+
+    def _slow_start(world, engine):
+        if world == "w1":
+            in_start.set()
+            assert proceed.wait(15)
+        real(world, engine)
+        started.append((engine._tick_thread, engine._ingest_thread))
+    monkeypatch.setattr(pool, "_start_workers", _slow_start)
+    opener = threading.Thread(target=lambda: pool.lease("w1").release())
+    stopper = None
+    try:
+        opener.start()
+        assert in_start.wait(10)
+        stopper = threading.Thread(target=pool.stop_background)
+        stopper.start()
+        stopper.join(0.3)
+        assert stopper.is_alive(), "stop_background 没等正在起线程的首次打开"
+        proceed.set()
+        opener.join(15)
+        stopper.join(15)
+        assert not stopper.is_alive()
+        assert started and all(t is not None for t in started[0])
+        assert not any(t.is_alive() for t in started[0]), "关后台之后线程还在跑"
+    finally:
+        proceed.set()
+        opener.join(15)
+        if stopper is not None:
+            stopper.join(15)
+        pool.close_all()
