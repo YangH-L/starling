@@ -33,8 +33,8 @@ def _config(data_dir: Path) -> DashboardConfig:
                            ingest_spool_path=str(data_dir / "spool"))
 
 
-def _app(data_dir: Path):
-    return TestClient(create_app(_config(data_dir), engine_factory=_stub_factory))
+def _app(data_dir: Path, factory=_stub_factory):
+    return TestClient(create_app(_config(data_dir), engine_factory=factory))
 
 
 def _create(client, name: str) -> None:
@@ -96,8 +96,29 @@ def test_three_worlds_isolated_through_http(tmp_path):
 def test_rollback_one_world_while_another_writes(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
-    burst = 12
-    with _app(data) as client:
+    entered = threading.Event()      # w2 的一次 remember 已进入引擎
+    release = threading.Event()      # 放行被扣住的那次 remember
+    held_once = threading.Event()
+
+    def holding_factory(ctx, providers):
+        engine = _stub_factory(ctx, providers)
+        if ctx.name == "w2":
+            original = engine.remember
+
+            def remember(*args, **kwargs):
+                if not held_once.is_set():          # 只扣第一次
+                    held_once.set()
+                    entered.set()
+                    assert release.wait(_JOIN_S), "w2 request never released"
+                return original(*args, **kwargs)
+
+            engine.remember = remember
+        return engine
+
+    statuses: list[int] = []
+    errors: list[BaseException] = []
+
+    with _app(data, holding_factory) as client:
         _create(client, "w1")
         _create(client, "w2")
         _remember(client, "/api", "default keeps this")
@@ -106,48 +127,43 @@ def test_rollback_one_world_while_another_writes(tmp_path):
         snap = client.post("/api/worlds/w1/snapshots", json={"note": "e2e"})
         assert snap.status_code == 200, snap.text
         snap_id = snap.json()["id"]
-        _remember(client, "/api/w/w1", "w1 after 1")
-        _remember(client, "/api/w/w1", "w1 after 2")
-        _remember(client, "/api/w/w1", "w1 after 3")
+        for i in range(3):
+            _remember(client, "/api/w/w1", f"w1 after {i}")
         assert _count(client, "/api/w/w1") == 5
-
-        statuses: list[int] = []
-        errors: list[BaseException] = []
-        started = threading.Event()
 
         def writer():
             try:
-                for i in range(burst):
-                    resp = client.post("/api/w/w2/remember", json={"text": f"w2 burst {i}"})
-                    statuses.append(resp.status_code)
-                    started.set()
+                resp = client.post("/api/w/w2/remember", json={"text": "w2 held"})
+                statuses.append(resp.status_code)
             except BaseException as exc:  # noqa: BLE001 — 交给主线程断言
                 errors.append(exc)
-                started.set()
 
-        thread = threading.Thread(target=writer, name="w2-writer")
-        thread.start()
+        thread = threading.Thread(target=writer, name="w2-writer", daemon=True)
         try:
-            # 第一条 w2 写入完成之后再回滚：回滚与写入的其余部分重叠，且不靠 sleep 定时序。
-            assert started.wait(_JOIN_S), "w2 writer never produced a response"
+            thread.start()
+            assert entered.wait(_JOIN_S), "w2 request never reached its engine"
             rolled = client.post("/api/worlds/w1/rollback",
                                  json={"snapshot_id": snap_id, "confirm": "w1",
                                        "mode": "discard_after"})
+            # 回滚返回时 w2 的请求仍被扣在引擎里：两件事确实重叠。
+            assert entered.is_set() and not release.is_set()
+            assert thread.is_alive() and statuses == []
         finally:
+            release.set()
             thread.join(_JOIN_S)
         assert not thread.is_alive(), "w2 writer did not finish"
         assert not errors, errors
         assert rolled.status_code == 200, rolled.text
-        assert "reopened" in rolled.json()
         assert rolled.json()["reopened"] is True
+        assert statuses == [200]
 
-        assert statuses == [200] * burst
-        assert _count(client, "/api/w/w2") == burst
+        for i in range(3):                                       # 放行后再来几条
+            _remember(client, "/api/w/w2", f"w2 after {i}")
+        assert _count(client, "/api/w/w2") == 4
         assert _count(client, "/api/w/w1") == 2                  # 回到快照内容
         assert _count(client, "/api/w/default") == 1             # 默认世界没被动
         assert _subjects(client, "/api/w/w1") == {"w1"}
-        # 回滚后 w1 仍可写。
-        _remember(client, "/api/w/w1", "w1 again")
+        _remember(client, "/api/w/w1", "w1 again")               # 回滚后 w1 仍可写
         assert _count(client, "/api/w/w1") == 3
 
 
@@ -221,10 +237,11 @@ def test_restart_reads_imported_registry(tmp_path):
         assert len(imported) == 1
         assert (data / "registry.db").exists()
         _create(client, "w3")
-        assert "w3" in _world_names(client)
+        before_names = _world_names(client)
+        assert "w3" in before_names
 
     with _app(data) as client:                                   # 第二次启动：复用 registry.db
-        assert {"default", "sim-1", "w3"} <= _world_names(client)
+        assert _world_names(client) == before_names              # 世界行除本测试自己建的 w3 外没变
         assert _snapshot_ids(client, "sim-1") == [snap_id]
         assert _imported_copies(data) == imported
         assert not (data / "worlds.json").exists()

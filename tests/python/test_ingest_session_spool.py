@@ -40,6 +40,7 @@ def test_script_runs_standalone_without_starling_package(tmp_path):
     env = os.environ.copy()
     env["STARLING_DASH_INGEST_SPOOL"] = str(spool)
     env["STARLING_DASH_TENANT"] = "tenant/with spaces"
+    env["HOME"] = str(tmp_path / "home")        # 子进程的 LOG 落在 ~/.starling：不得指向真实 home
 
     result = subprocess.run(
         [sys.executable, "-I", str(script), "--bootstrap", str(transcript)],
