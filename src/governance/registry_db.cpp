@@ -7,6 +7,7 @@
 
 #include "starling/governance/world_settings.hpp"
 #include "starling/persistence/connection.hpp"
+#include "starling/persistence/sqlite_adapter.hpp"
 #include "starling/persistence/sqlite_helpers.hpp"
 #include "starling/persistence/stmt.hpp"
 
@@ -215,10 +216,14 @@ struct RegistryDb::Impl {
         guard.commit();
     }
 
-    // 调用方已持锁，且 name 已过 is_valid_world_name。
+    // 调用方已持锁，且 name 已过 is_valid_world_name。init_db 为真时（create_world，裁定 R34）先在新
+    // 世界目录里经持久层打开一次库文件（迁移建表）再关掉，然后才写注册项：注册项一出现，库与 schema
+    // 就已经在，检视新世界读到的是空表，不是「还没有库」。不建引擎（裁定 R21）。任何一步失败都删掉
+    // 整个世界目录，注册项不写。
     WorldRecord create_row(const std::string& name, const std::string& label,
                            const std::map<std::string, std::string>& labels,
-                           const std::string& settings_json, std::string_view now_iso) const {
+                           const std::string& settings_json, std::string_view now_iso,
+                           bool init_db) const {
     if (find(name)) { throw WorldStoreError("world_exists", "world '" + name + "' exists"); }
     const fs::path worlds_root = data_dir / "worlds";
     internal::require_worlds_root_inside(data_dir, worlds_root);
@@ -234,6 +239,7 @@ struct RegistryDb::Impl {
                               "cannot create " + home.string() + ": " + mkdir_err.message());
     }
     try {
+        if (init_db) { initialise_world_db(home / "world.db"); }
         pst::TransactionGuard guard(*conn);
         pst::Stmt stmt(db(),
                        "INSERT INTO worlds (name, dir_id, tenant, db_path, snapshot_dir, label, "
@@ -249,6 +255,20 @@ struct RegistryDb::Impl {
         throw;
     }
     return require(name);
+    }
+
+    // 经持久层打开 db_file（SqliteAdapter::open 跑迁移到最新），随即关闭（并回 WAL）。失败抛
+    // snapshot_failed（与建目录失败同一个码），由 create_row 删掉世界目录。
+    static void initialise_world_db(const fs::path& db_file) {
+        try {
+            auto adapter = pst::SqliteAdapter::open(db_file);
+            adapter->close();
+        } catch (const WorldStoreError&) {
+            throw;
+        } catch (const std::exception& err) {
+            throw WorldStoreError("snapshot_failed",
+                                  "cannot initialise " + db_file.string() + ": " + err.what());
+        }
     }
 
     void insert_labels(const std::string& name,
@@ -387,7 +407,7 @@ WorldRecord RegistryDb::create(const std::string& name, const std::string& label
                                const std::string& settings_json, std::string_view now_iso) {
     require_valid_name(name);
     const std::scoped_lock lock(impl_->mutex);
-    return impl_->create_row(name, label, labels, settings_json, now_iso);
+    return impl_->create_row(name, label, labels, settings_json, now_iso, false);
 }
 
 WorldRecord RegistryDb::create_world(const std::string& name, const std::string& label,
@@ -398,7 +418,7 @@ WorldRecord RegistryDb::create_world(const std::string& name, const std::string&
     const auto base = settings_from_json(impl_->require(impl_->default_name()).settings_json);
     const auto merged = settings_to_json(
         merge_settings(base, overrides_json.empty() ? "{}" : overrides_json, false));
-    return impl_->create_row(name, label, labels, merged, now_iso);
+    return impl_->create_row(name, label, labels, merged, now_iso, true);
 }
 
 std::string RegistryDb::update_world_settings(const std::string& name,

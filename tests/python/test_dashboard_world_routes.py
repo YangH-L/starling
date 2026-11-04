@@ -150,14 +150,27 @@ def test_world_errors_map_to_http_codes(client, monkeypatch):
     assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"})
 
 
-def test_inspecting_a_world_without_a_database_yet(client):
-    """建了还没写过的世界没有库文件：检视回 409 world_not_initialized，不替它建引擎、不建库。"""
+def test_new_world_reads_as_empty_right_after_creation(client):
+    """裁定 R34：建世界时 C++ 已建好库文件与 schema。经 HTTP 建完立刻检视：200、空列表，不建引擎。"""
     pool = _pool(client)
-    rec = pool.create_world("fresh", "")
+    pool.create_world("fresh", "")
     resp = client.get("/api/w/fresh/statements")
-    assert (resp.status_code, resp.json()) == (409, {"detail": "world_not_initialized"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows"] == []
+    assert client.get("/api/w/fresh/overview").json()["counts"]["statements"] == 0
     assert "fresh" not in pool.open_worlds()
+
+
+def test_inspecting_a_world_whose_database_is_missing(client):
+    """world_not_initialized 只剩一种情形：登记了、库文件却不在（被手工删掉等）。检视回 409，不替它
+    建引擎、不建库。"""
     import os
+    pool = _pool(client)
+    rec = pool.create_world("gone", "")
+    os.remove(rec["db_path"])
+    resp = client.get("/api/w/gone/statements")
+    assert (resp.status_code, resp.json()) == (409, {"detail": "world_not_initialized"})
+    assert "gone" not in pool.open_worlds()
     assert not os.path.exists(rec["db_path"])
 
 

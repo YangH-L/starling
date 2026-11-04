@@ -79,6 +79,9 @@ public:
     // 持锁内完成，并发的 update_world_settings("default", ...) 不会插进中间。新世界的设置是默认世界当时
     // 设置的值拷贝，之后改默认世界不影响它。overrides_json 空串当 "{}"，非法按 settings_from_json 的码抛
     // （invalid_settings 等），此时什么都不写。其余错误同 create。
+    // 与 create 不同，它还初始化新世界的库文件（裁定 R34）：经持久层打开 worlds/<dir_id>/world.db 一次
+    // （迁移建表）、随即关闭，然后才写注册项，所以新世界一登记就能按空库检视。不建引擎。初始化失败抛
+    // snapshot_failed，世界目录删掉、注册项不写。初始化在注册表锁内（约十几毫秒）。
     WorldRecord create_world(const std::string& name, const std::string& label,
                              const std::map<std::string, std::string>& labels,
                              const std::string& overrides_json, std::string_view now_iso);

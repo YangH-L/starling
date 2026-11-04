@@ -120,6 +120,33 @@ TEST(RegistryDb, CreateRejectsDuplicateAndBadName) {
     EXPECT_EQ(reg.list(WorldQuery{}).total, 2);
 }
 
+// 裁定 R34：create_world 经持久层建好新世界的库文件（迁移建表），建完即关；新世界检视起来是空的，
+// 不是「还没有库」。只建注册项的 create 照旧不建库文件。
+TEST(RegistryDb, CreateWorldInitialisesTheWorldDatabase) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    const auto created = reg.create_world("w1", "", {{"run_id", "r1"}}, "", kNow);
+    const fs::path db_file = created.db_path;
+    ASSERT_TRUE(fs::is_regular_file(db_file));
+    // 建完即关：不留 WAL 旁车（没有连接还开着这个库）。在本测试自己打开库之前看。
+    EXPECT_FALSE(fs::exists(db_file.string() + "-wal"));
+    EXPECT_FALSE(fs::exists(db_file.string() + "-shm"));
+    sqlite3* raw = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(("file:" + db_file.string() + "?mode=ro").c_str(), &raw,
+                              SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr), SQLITE_OK);
+    sqlite3_stmt* stmt = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM statements", -1, &stmt, nullptr),
+              SQLITE_OK) << sqlite3_errmsg(raw);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    EXPECT_EQ(sqlite3_column_int64(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(raw);
+    EXPECT_EQ(reg.get("w1").labels.at("run_id"), "r1");
+
+    const auto plain = reg.create("w2", "", {}, "{}", kNow);
+    EXPECT_FALSE(fs::exists(plain.db_path));
+}
+
 TEST(RegistryDb, DefaultWorldCannotBeRemoved) {
     const TempDir tmp;
     auto reg = open_db(tmp);

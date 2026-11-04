@@ -30,8 +30,8 @@ async def _world_db(request: Request, world: str = Depends(world_name)):
     """所有 SQL 检视路由的依赖项：持 world 的一份不建引擎的租约覆盖整个请求，产出该世界的 WorldContext
     （路由只用它的 db_path 与 tenant）。上下文在拿到租约之后才读。
 
-    世界的库文件在它第一次被打开（写入、tick 等命令路由）时才建；还没有库文件的世界回 409
-    world_not_initialized，而不是让只读打开报 500。检视不替它建引擎（裁定 R21）。
+    建世界时 C++ 已建好库文件与 schema（裁定 R34），新世界检视起来是空的。库文件不在（登记之后被删掉等）
+    的世界回 409 world_not_initialized，而不是让只读打开报 500；检视不替它建引擎、不建库（裁定 R21）。
 
     取租约与进入 try 之间没有 await：任务在那里被取消，租约就永远不归还，此后关闭、恢复这个世界都会等满
     超时回 world_busy。"""
