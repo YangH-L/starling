@@ -421,6 +421,14 @@ class DashboardEngine:
         roles = set(roles)
         warnings: list[str] = []
         with self._lock:
+            # 裁定 R38：从设置重建的每个适配器先核对继承来的地址（spec §8.3），任何一个改了就抛
+            # endpoint_changed，什么都不换。建适配器本身不发请求，但嵌入一换就会重嵌入、用这个密钥发出去。
+            # chat 没绑定时用抽取的 endpoint，核对的也是抽取。
+            for role in roles:
+                if role == "chat" and not self._settings.get("chat"):
+                    self._require_endpoint_unchanged("extraction")
+                else:
+                    self._require_endpoint_unchanged(role)
             if "extraction" in roles:
                 self.set_llm(self._endpoint_cfg("extraction"))
             if "chat" in roles:
@@ -448,7 +456,13 @@ class DashboardEngine:
             if "extraction" in changed and not settings.get("chat"):
                 changed.add("chat")
             gist = old.get("gist_thresholds") != settings.get("gist_thresholds")
-            return self.reload_adapters(changed, gist=gist)
+            try:
+                return self.reload_adapters(changed, gist=gist)
+            except _core.WorldStoreError:
+                # 新设置里有继承地址已变的 endpoint（裁定 R38，核对在换任何适配器之前）：换回旧设置，
+                # 引擎原样。池在写注册表之前已预演核对过，这里是纵深防御。
+                self._settings = old
+                raise
 
     def _notify_commit(self) -> None:
         """写方法成功之后通知 WorldPool（统计去抖）。回调异常只记日志：写已经成功了。"""
@@ -656,6 +670,8 @@ class DashboardEngine:
         swallowed, mirroring the background tick's own non-fatal handling — and
         returned as a warning string so the save can surface it (silent success
         with broken embeddings is worse than a clear heads-up)."""
+        # 裁定 R38：在删任何向量之前核对嵌入的继承地址；改了就抛 endpoint_changed，一行不删。
+        self._require_embedding_unchanged()
         if not self._rt.adapter.write_admitted():
             # 前台写门 follow-up(P3.c write-gate):这个 config-save 重嵌是绕过 C++ 核心的
             # 裸 sqlite 写(DELETE statement_vectors + tick_one_batch),核心门管不到 → host-side

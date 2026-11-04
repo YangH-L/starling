@@ -352,3 +352,51 @@ def test_config_adapter_passes_vector_backend_and_path_straight_through(tmp_path
     eng = DashboardEngine(cfg)
     assert seen == [("zvec", str(tmp_path / "vectors"))]
     assert eng._settings["vector_backend"] == "sqlite"       # 设置里永远是 sqlite
+
+
+def test_adapter_rebuild_and_reembed_refuse_a_changed_inherited_endpoint(tmp_path, monkeypatch):
+    """裁定 R38：从设置重建适配器（reload_adapters / apply_world_settings）先核对继承来的地址；重嵌入在删任何
+    向量之前核对。地址改了就抛 endpoint_changed：适配器不换，statement_vectors 一行不删。"""
+    import sqlite3
+    import starling.dashboard.engine as engmod
+    built = []
+
+    def _embed(cfg):
+        built.append(dict(cfg))
+        return _core.StubEmbeddingAdapter(8)
+    monkeypatch.setattr(engmod, "_build_embed_adapter", _embed)
+    monkeypatch.setattr(engmod, "_build_chat_adapter", lambda cfg: _fake())
+    providers = {"p": {"provider": "openai", "model": "e", "base_url": "http://a",
+                       "api_key": "sk-secret"}}
+    ep = {"provider": "openai", "provider_name": "p", "base_url": "http://a", "model": "e", "dim": 8}
+    db = str(tmp_path / "w1.db")
+    eng = DashboardEngine(_ctx(tmp_path, {"embedding": ep, "extraction": ep}), providers)
+    eng.llm = _fake()
+    eng.remember("Bob owns auth")
+    eng.tick("2026-11-04T00:00:00Z")
+    con = sqlite3.connect(db)
+    vectors = con.execute("SELECT COUNT(*) FROM statement_vectors").fetchone()[0]
+    con.close()
+    assert vectors >= 1
+    redirected = _core.world_effective_settings(
+        {"source_lane": {"enabled": False}, "extraction": ep,
+         "embedding": {**ep, "base_url": "http://evil"}})
+    llm_before, built_before, settings_before = eng.llm, len(built), eng._settings
+    with pytest.raises(_core.WorldStoreError) as ei:
+        eng.apply_world_settings(redirected)
+    assert _core.world_store_error_code(ei.value) == "endpoint_changed"
+    assert eng._settings is settings_before                     # 拒绝时换回旧设置
+    # 设置已经指着新地址（例如别的调用方直接换了引用）：重建与重嵌入同样拒绝。
+    eng._settings = redirected
+    for call in (lambda: eng.reload_adapters({"embedding"}), eng._reembed):
+        with pytest.raises(_core.WorldStoreError) as ei:
+            call()
+        assert _core.world_store_error_code(ei.value) == "endpoint_changed"
+        assert "sk-secret" not in str(ei.value)
+    del ei
+    eng._settings = settings_before
+    assert len(built) == built_before and eng.llm is llm_before
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT COUNT(*) FROM statement_vectors").fetchone()[0] == vectors
+    con.close()
+    eng.close()

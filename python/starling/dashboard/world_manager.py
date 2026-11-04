@@ -128,6 +128,8 @@ _SCHEDULER_THREAD = "starling-auto-snapshot"
 _DEFAULT_NAME = "default"
 # 注册表 list 的分页上限（RegistryDb::list 的 limit 1–500）。
 _LIST_PAGE = 500
+# 世界设置里的四个 endpoint（spec §8.1，consolidation 见裁定 R25）。
+_ENDPOINT_ROLES = ("extraction", "embedding", "chat", "consolidation")
 # 默认世界经 PUT /api/worlds/default/settings 能改的设置（裁定 R35）：其余段（endpoint、阈值、来源通道、
 # tick 间隔）归 /api/config，下一次 sync_default_settings 会整段覆盖它们。auto_snapshot 与 ingest 不在
 # config 里（裁定 R16），同步时保留。
@@ -405,8 +407,8 @@ class WorldPool:
                 self._verify_tenant(ctx)              # 裁定 R36：在打开库之前，拒开时什么都没建
             engine = self._open_engine(world, ctx)
             if not self._publish(world, engine):
-                self._discard_unpublished(engine, ctx.db_path)
-                engine = None
+                box, engine = [engine], None          # 交出唯一的引用：回收证明要求本帧不再钉住它
+                self._discard_unpublished(box, ctx.db_path)
                 raise WorldSwitchError("world_busy", "the pool is shutting down")
             return engine
         finally:
@@ -444,15 +446,20 @@ class WorldPool:
             self._start_workers_or_mark_lost(world, engine)
         return True
 
-    def _discard_unpublished(self, engine, db_path: str) -> None:
+    def _discard_unpublished(self, box: list, db_path: str) -> bool:
         """关掉一个没能发布的引擎（池已关停）：摘掉池的回调、关引擎、等旧 Runtime 回收（回收不了照常登记成
-        泄漏）。没起过线程（_publish 没走到起线程那一步）。"""
+        泄漏），返回是否已回收。没起过线程（_publish 没走到起线程那一步）。
+
+        引擎装在 box（只有一个元素的列表）里交进来，这里取出后清空它：调用方的局部变量若还指着引擎，
+        回收证明永远等不到（等满宽限期、登记成泄漏，此后这个库一直 world_busy）。调用方交出之前先把
+        自己的局部变量置 None。"""
+        engine = box.pop()
         rt_ref = weakref.ref(engine._rt)
         engine.on_commit = None
         engine.session_snapshot_hook = None
         engine.close()
         engine = None
-        self._release_runtime(rt_ref, db_path)
+        return self._release_runtime(rt_ref, db_path)
 
     def _start_workers_or_mark_lost(self, world: str, engine) -> bool:
         """持世界锁调用。起 tick / 摄入线程；任一步失败就把已经起来的停掉（不留半套线程，补起时整套重来），
@@ -942,7 +949,26 @@ class WorldPool:
             background["auto_snapshot"] = {"on_session": auto_snapshot["on_session"],
                                            "interval_hours": auto_snapshot["interval_hours"]}
             merged["background"] = background
+        if merged:
+            # 裁定 R38：客户端给的设置先在 C++ 预演合并，继承来的 endpoint 地址都没变才建（spec §8.3）。
+            # 预演与建之间默认世界的设置可能被 /api/config 改掉；那样建出来的世界继承的就是 config 的新
+            # 地址，与 provider 一致，核对照样成立。
+            self._require_inherited_endpoints(reg.preview_new_world_settings(merged))
         return reg.create(name, label, dict(labels or {}), merged or None, self._clock())
+
+    def _require_inherited_endpoints(self, settings: dict) -> None:
+        """settings 里每个继承来的 endpoint（provider_name 非空）对 provider 的当前 base_url 做 C++ 核对
+        （world_require_endpoint_unchanged，spec §8.3）：不同就抛 endpoint_changed。客户端改设置与建世界
+        在写之前调（裁定 R38）：叶合并留着 provider_name，只改 base_url 就会让那个 provider 的密钥发往
+        新地址。provider 已被删掉时当前地址按空串算（与引擎的核对相同）。显式端点（provider_name 为空）
+        用服务级密钥，不核对。"""
+        providers = self._config.providers
+        for role in _ENDPOINT_ROLES:
+            ep = settings.get(role)
+            if not ep or not ep.get("provider_name"):
+                continue
+            current = (providers.get(ep["provider_name"]) or {}).get("base_url") or ""
+            _core.world_require_endpoint_unchanged(ep, current)
 
     def delete_world(self, world: str) -> None:
         """删世界：先关（等租约、停线程、丢引擎），旧 Runtime 回收不了就拒绝（world_busy，什么都不删），
@@ -1014,9 +1040,13 @@ class WorldPool:
         设置、又没被这里看见的引擎。关闭同样持世界锁，持锁期间表上的引擎不会被丢。这里不持租约（持租约的
         代码不得阻塞地等世界锁）。"""
         reg = self._require_registry()
+        self._record(world)                           # world_not_found：未知世界名不建世界锁
         if world == reg.default_world():
             self._require_default_world_editable(overrides)
         with self._world_lock(world):
+            # 裁定 R38：先在 C++ 预演合并，继承来的 endpoint 地址都没变才写。持世界锁，预演与写之间同一
+            # 世界的设置不会被别的 update_settings 改掉。
+            self._require_inherited_endpoints(reg.preview_settings(world, overrides))
             merged = reg.update_settings(world, overrides)
             settings = _core.world_effective_settings(merged)
             with self._lock:
@@ -1095,17 +1125,18 @@ class WorldPool:
             except Exception as exc:
                 self._reopen_after_rollback(world, was_open, exc)   # C++ 保证库未动；原样抛出
                 raise
-            self._reopen_after_rollback(world, was_open, None)
+            reopened = self._reopen_after_rollback(world, was_open, None)
         return {"world": world, "snapshot_id": snapshot_id,
-                "archived": bool(result["archive_path"]), "reopened": was_open}
+                "archived": bool(result["archive_path"]), "reopened": reopened}
 
-    def _reopen_after_rollback(self, world: str, was_open: bool, cause: Exception | None) -> None:
+    def _reopen_after_rollback(self, world: str, was_open: bool, cause: Exception | None) -> bool:
         """恢复的每个出口（持世界锁、在关闭窗口内）：恢复前开着就按注册表重建引擎、起线程（打开时会跑
-        迁移，旧 schema 的快照会补齐）。重建失败：引擎不在表上，下一次 lease 重新建。码按库有没有被替换来分：
-        cause 为 None（替换成功之后）→ rollback_reopen_failed；其余出口 → world_open_failed（链到 cause）。
-        重建成功则返回，由调用方抛 cause 或返回结果。"""
+        迁移，旧 schema 的快照会补齐）。返回世界此刻是否开着（按实际结果，不按恢复前的状态）：恢复前关着、
+        或恢复途中池关停了（建好的引擎不发布、关掉），都是 False。重建失败：引擎不在表上，下一次 lease
+        重新建。码按库有没有被替换来分：cause 为 None（替换成功之后）→ rollback_reopen_failed；其余出口 →
+        world_open_failed（链到 cause）。重建成功则返回，由调用方抛 cause 或返回结果。"""
         if not was_open:
-            return
+            return False
         try:
             engine = self._open_engine(world, self.context(world))
         except Exception as exc:
@@ -1118,9 +1149,12 @@ class WorldPool:
             raise WorldSwitchError("world_open_failed", detail) from cause
         # 起线程失败只标记 workers-lost（裁定 R23）。恢复途中池关停了：不发布，关掉它（世界留在关着的状态，
         # 恢复本身照常算成功或照常抛 cause）。
-        if not self._publish(world, engine):
-            self._discard_unpublished(engine, self.context(world).db_path)
-        engine = None
+        if self._publish(world, engine):
+            engine = None
+            return True
+        box, engine = [engine], None
+        self._discard_unpublished(box, self.context(world).db_path)
+        return False
 
     # ───────────────────────── 自动快照（W4） ─────────────────────────
 

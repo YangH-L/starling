@@ -392,3 +392,34 @@ TEST(WorldSettingsCompose, CreateWhileDefaultIsUpdatedSeesOneCompleteSnapshot) {
     stop.store(true);
     updater.join();
 }
+
+// 裁定 R38：预演与写走同一套合并，结果相同，预演什么都不写；错误码与写方法相同。
+TEST(WorldSettingsCompose, PreviewMergesLikeTheWriteAndWritesNothing) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    reg.update_world_settings(
+        "default", R"({"embedding":{"provider":"openai","provider_name":"p","base_url":"http://h",)"
+                   R"("model":"e1","dim":8,"max_tokens":1,"timeout_ms":1000}})");
+    reg.create_world("w1", "", {}, "", kNow);
+    const auto before = reg.get("w1").settings_json;
+    const std::string overrides = R"({"embedding":{"base_url":"http://evil"}})";
+    const auto preview = reg.preview_world_settings("w1", overrides);
+    EXPECT_EQ(reg.get("w1").settings_json, before);                    // 什么都没写
+    const auto parsed = settings_from_json(preview);
+    ASSERT_TRUE(parsed.embedding.has_value());
+    EXPECT_EQ(parsed.embedding->base_url, "http://evil");
+    EXPECT_EQ(parsed.embedding->provider_name, "p");                   // 叶合并留着 provider_name
+    EXPECT_EQ(reg.update_world_settings("w1", overrides), preview);     // 与真写的结果相同
+
+    const auto fresh = settings_from_json(reg.preview_new_world_settings(overrides));
+    ASSERT_TRUE(fresh.embedding.has_value());
+    EXPECT_EQ(fresh.embedding->base_url, "http://evil");
+    EXPECT_EQ(fresh.embedding->provider_name, "p");
+    EXPECT_EQ(reg.list(WorldQuery{}).total, 2);                        // 没有建世界
+
+    EXPECT_EQ(code_of([&] { (void)reg.preview_world_settings("nope", "{}"); }), "world_not_found");
+    EXPECT_EQ(code_of([&] { (void)reg.preview_world_settings("w1", R"({"x":1})"); }),
+              "invalid_settings");
+    EXPECT_EQ(code_of([&] { (void)reg.preview_new_world_settings(R"({"x":1})"); }),
+              "invalid_settings");
+}

@@ -1173,6 +1173,7 @@ def test_a_first_open_that_finishes_after_shutdown_is_not_published(tmp_path, mo
         opener.join(15)
     assert errors == ["world_busy"]
     assert pool.open_worlds() == []
+    assert pool._leaked == [], "丢弃的引擎没能证明已回收（本帧还钉着它）"
     gc.collect()
     assert built and built[0]() is None, "关停之后建好的引擎没关，它的写连接还开着"
 
@@ -1216,4 +1217,71 @@ def test_stop_background_waits_for_a_first_open_that_is_starting_its_workers(tmp
         opener.join(15)
         if stopper is not None:
             stopper.join(15)
+        pool.close_all()
+
+
+def test_rollback_reports_reopened_from_the_actual_outcome(tmp_path, monkeypatch):
+    """恢复途中池关停了：重建好的引擎不发布、关掉，世界关着。返回的 reopened 按实际结果是 False，而不是按恢复前
+    开着就报 True；丢弃的引擎证明已回收，不进 _leaked。"""
+    pool, _reg, _c = _pool(tmp_path)
+    pool.create_world("w1", "")
+    _remember(pool, "w1", "Alice owns auth", subject="Alice")
+    snap = pool.take_snapshot("w1", "")
+    with pool.lease("w1"):
+        pass
+    real = pool._open_engine
+
+    def _open_then_shut(world, ctx):
+        engine = real(world, ctx)
+        with pool._lock:
+            pool._shut = True                      # 重建期间池关停（close_all 置的标志）
+        return engine
+    monkeypatch.setattr(pool, "_open_engine", _open_then_shut)
+    out = pool.rollback("w1", snap["id"])
+    assert out["reopened"] is False and out["archived"] is True
+    assert pool.open_worlds() == [] and pool._leaked == []
+    pool.close_all()
+
+
+def test_update_settings_of_an_unknown_world_creates_no_world_lock(tmp_path):
+    pool, _reg, _c = _pool(tmp_path)
+    try:
+        with pytest.raises(WorldSwitchError) as ei:
+            pool.update_settings("nope", {})
+        assert ei.value.code == "world_not_found"
+        assert "nope" not in pool._world_locks
+    finally:
+        pool.close_all()
+
+
+def test_stop_background_stops_the_scheduler_before_taking_any_world_lock(tmp_path, monkeypatch):
+    """stop_background 先停调度与统计线程、join 它们，再逐个世界取世界锁停引擎线程。反过来的话，调度线程正卡在
+    某个世界的自动快照里（持着它的世界锁）时，关后台会在世界锁上等，而调度线程自己又在等关后台放行。
+    记下事件顺序：调度线程退出在先，第一次取世界锁在后。"""
+    pool, _reg, _c = _pool(tmp_path, cfg=_cfg(tmp_path, tick_interval_s=60.0))
+    events: list = []
+    real_loop = pool._scheduler_loop
+
+    def _tracked_loop(stop, poll_s, first_delay_s):
+        try:
+            real_loop(stop, poll_s, first_delay_s)
+        finally:
+            events.append("scheduler_exited")
+    monkeypatch.setattr(pool, "_scheduler_loop", _tracked_loop)
+    with pool.lease("default"):
+        pass
+    pool.start_background(stats_interval_s=3600.0, scheduler_poll_s=3600.0,
+                          scheduler_first_delay_s=3600.0)
+    real_lock = pool._world_lock
+
+    def _tracked_lock(world):
+        events.append(f"world_lock:{world}")
+        return real_lock(world)
+    monkeypatch.setattr(pool, "_world_lock", _tracked_lock)
+    try:
+        pool.stop_background()
+        assert "scheduler_exited" in events and "world_lock:default" in events, events
+        assert events.index("scheduler_exited") < events.index("world_lock:default"), events
+    finally:
+        monkeypatch.undo()
         pool.close_all()

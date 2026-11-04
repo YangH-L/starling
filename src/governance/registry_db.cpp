@@ -432,6 +432,22 @@ std::string RegistryDb::update_world_settings(const std::string& name,
     return merged;
 }
 
+std::string RegistryDb::preview_world_settings(const std::string& name,
+                                               const std::string& overrides_json) const {
+    const std::scoped_lock lock(impl_->mutex);
+    const auto rec = impl_->require(name);
+    return settings_to_json(merge_settings(settings_from_json(rec.settings_json),
+                                           overrides_json.empty() ? "{}" : overrides_json,
+                                           rec.read_only));
+}
+
+std::string RegistryDb::preview_new_world_settings(const std::string& overrides_json) const {
+    const std::scoped_lock lock(impl_->mutex);
+    const auto base = settings_from_json(impl_->require(impl_->default_name()).settings_json);
+    return settings_to_json(
+        merge_settings(base, overrides_json.empty() ? "{}" : overrides_json, false));
+}
+
 std::string RegistryDb::replace_world_sections(const std::string& name,
                                                const std::string& sections_json) {
     const std::scoped_lock lock(impl_->mutex);

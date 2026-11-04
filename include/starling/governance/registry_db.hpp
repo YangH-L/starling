@@ -88,6 +88,14 @@ public:
     // 把 overrides 合并到世界当前设置上（只读世界后台强制关）并写回，读—合并—写在一次持锁内，
     // 并发更新同一世界不会丢合并。返回合并后的 settings_json。world_not_found；overrides 非法时什么都不写。
     std::string update_world_settings(const std::string& name, const std::string& overrides_json);
+    // update_world_settings / create_world 的预演（裁定 R38）：同一套合并（merge_settings，只读世界后台强制关；
+    // 建世界时以默认世界当前设置为底），返回合并结果的 settings_json，什么都不写。调用方据此在写之前做
+    // 额外核对（例如继承来的 endpoint 地址没变，spec §8.3）。错误码与对应的写方法相同（world_not_found、
+    // invalid_settings 等）。预演与随后的写不在同一次持锁内：调用方要求结果不变时自己串行化（WorldPool 持
+    // 该世界的世界锁）。
+    std::string preview_world_settings(const std::string& name,
+                                       const std::string& overrides_json) const;
+    std::string preview_new_world_settings(const std::string& overrides_json) const;
     // 权威来源同步（裁定 R27）：world_settings.hpp replace_sections（出现的段整段替换、background 逐叶合并、
     // null 清除），读—替换—写在一次持锁内。只读世界同样强制关后台。返回新的 settings_json。world_not_found；
     // sections 非法时什么都不写。

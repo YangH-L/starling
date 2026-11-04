@@ -195,6 +195,27 @@ void bind_15_world(pybind11::module_& m) {
                  }
                  return to_py(merged);
              }, py::arg("name"), py::arg("overrides"))
+        // 改设置 / 建世界的预演（裁定 R38）：同一套 C++ 合并，返回合并结果的 dict，什么都不写。
+        .def("preview_settings",
+             [](const gov::RegistryDb& reg, const std::string& name, const py::object& overrides) {
+                 const auto overrides_text = overrides_in(overrides);
+                 std::string merged;
+                 {
+                     const py::gil_scoped_release release;
+                     merged = reg.preview_world_settings(name, overrides_text);
+                 }
+                 return to_py(merged);
+             }, py::arg("name"), py::arg("overrides"))
+        .def("preview_new_world_settings",
+             [](const gov::RegistryDb& reg, const py::object& overrides) {
+                 const auto overrides_text = overrides_in(overrides);
+                 std::string merged;
+                 {
+                     const py::gil_scoped_release release;
+                     merged = reg.preview_new_world_settings(overrides_text);
+                 }
+                 return to_py(merged);
+             }, py::arg("overrides"))
         // 权威来源同步（裁定 R27）：出现的段整段替换、background 逐叶合并、null 清除。返回新的设置 dict。
         .def("replace_settings_sections",
              [](gov::RegistryDb& reg, const std::string& name, const py::object& sections) {

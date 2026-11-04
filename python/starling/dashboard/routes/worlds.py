@@ -228,10 +228,19 @@ def _list_worlds(pool, labels: dict, offset: int, limit: int) -> dict:
     reg = pool.registry
     page = pool.list_worlds(labels, offset, limit)
     open_worlds = set(pool.open_worlds())
+    rows = []
+    for rec in page["worlds"]:
+        try:
+            rows.append(_world_row(pool, rec, open_worlds))
+        except (WorldSwitchError, _core.WorldStoreError) as exc:
+            # 列出之后、建这一行之前被删掉的世界：跳过这一行，不让整张列表 404。别的错照常抛。
+            code = exc.code if isinstance(exc, WorldSwitchError) else _core.world_store_error_code(exc)
+            if code != "world_not_found":
+                raise
     return {"default": pool.default_world(), "total": page["total"],
             "snapshot_retention": reg.snapshot_retention(),
             "auto_snapshot_status": pool.auto_snapshot_status(),
-            "worlds": [_world_row(pool, rec, open_worlds) for rec in page["worlds"]]}
+            "worlds": rows}
 
 
 def _world_detail(pool, providers: dict, name: str) -> dict:

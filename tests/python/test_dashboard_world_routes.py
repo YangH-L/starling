@@ -3,10 +3,12 @@
 建世界的 HTTP 路由（POST /api/worlds）、列表、设置、关闭的用例属于 Task 6b；这里的用例直接经引擎池
 建世界、关世界，只测检视与命令路由的寻址和广播。
 """
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 
-from starling import make_stub_llm
+from starling import _core, make_stub_llm
 from starling.dashboard import DashboardConfig, create_app
 from starling.dashboard.engine import DashboardEngine
 
@@ -623,3 +625,311 @@ def test_first_build_of_a_world_with_foreign_tenant_rows_is_refused(client):
     # 检视（只读、不建引擎）照常；默认世界不核对（与旧的启动时一致）。
     assert client.get("/api/w/w1/statements").status_code == 200
     assert client.post("/api/tick", json={}).status_code == 200
+
+
+# ───────────────────────── 裁定 R38：客户端写设置之前核对继承来的地址 ─────────────────────────
+
+def _embedding_client(tmp_path, monkeypatch, built: list):
+    """默认世界的 extraction 与 embedding 都绑 provider p（带密钥）；新世界继承它们，provider_name 指着 p。
+    嵌入适配器换成记录配置的占位，不发网络请求。"""
+    import starling.dashboard.engine as engmod
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(engmod, "_build_chat_adapter", lambda c: make_stub_llm(default_response=_STUB))
+
+    def _embed(cfg):
+        built.append(dict(cfg))
+        return _core.StubEmbeddingAdapter(8)
+    monkeypatch.setattr(engmod, "_build_embed_adapter", _embed)
+    cfg = DashboardConfig(db_path=str(tmp_path / "dashboard.db"), token="",
+                          tick_interval_s=600.0, source_lane_enabled=False,
+                          ingest_spool_path=str(tmp_path / "spool"))
+    cfg.providers["p"] = {"provider": "openai", "model": "m1", "base_url": "http://h.example",
+                          "api_key": "sk-secret-123"}
+    cfg.roles["extraction"] = "p"
+    cfg.roles["embedding"] = "p"
+    return TestClient(create_app(cfg, engine_factory=_stub_factory))
+
+
+def _vector_rows(db_path: str) -> int:
+    import sqlite3
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return con.execute("SELECT COUNT(*) FROM statement_vectors").fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_put_settings_cannot_redirect_an_inherited_endpoint(tmp_path, monkeypatch):
+    """审查探针：继承来的 embedding（provider_name=p）只改 base_url，C++ 叶合并留着 provider_name。若照写，
+    重建嵌入适配器会带着 p 的密钥指向新地址并立刻重嵌入（先删光向量）。写之前核对：409 endpoint_changed，
+    注册表、引擎、向量都不动，也没有用存着的密钥建过适配器。"""
+    built: list = []
+    with _embedding_client(tmp_path, monkeypatch, built) as client:
+        pool = _pool(client)
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+        assert client.post("/api/w/w1/tick", json={}).status_code == 200      # 嵌入向量
+        db = pool.registry.get("w1")["db_path"]
+        vectors = _vector_rows(db)
+        assert vectors >= 1
+        before = pool.registry.get("w1")["settings"]
+        built.clear()
+        for body in ({"embedding": {"base_url": "http://evil.example"}},
+                     {"extraction": {"base_url": "http://evil.example"}},
+                     {"chat": {"provider_name": "p", "base_url": "http://evil.example",
+                               "provider": "openai", "model": "m"}}):
+            resp = client.put("/api/worlds/w1/settings", json=body)
+            assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), body
+        assert pool.registry.get("w1")["settings"] == before
+        assert built == [], "用存着的密钥建了指向新地址的适配器"
+        assert _vector_rows(db) == vectors
+        with pool.lease("w1", build=False) as eng:
+            assert eng._settings["embedding"]["base_url"] == "http://h.example"
+        eng = None
+        assert client.post("/api/w/w1/tick", json={}).status_code == 200      # 世界照常可用
+        # 解绑（null）与改别的叶子（同一地址）照常放行。
+        resp = client.put("/api/worlds/w1/settings", json={"embedding": {"model": "e2"}})
+        assert resp.status_code == 200, resp.text
+        assert built and built[-1]["base_url"] == "http://h.example"
+
+
+def test_create_world_cannot_point_an_inherited_endpoint_elsewhere(tmp_path, monkeypatch):
+    built: list = []
+    with _embedding_client(tmp_path, monkeypatch, built) as client:
+        pool = _pool(client)
+        for body in ({"name": "w1", "settings": {"embedding": {"base_url": "http://evil.example"}}},
+                     {"name": "w1", "settings": {"extraction": {"base_url": "http://evil.example"}},
+                      "auto_snapshot": {"on_session": True, "interval_hours": 0}}):
+            resp = client.post("/api/worlds", json=body)
+            assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), body
+        assert client.get("/api/worlds/w1").status_code == 404
+        assert [w["name"] for w in client.get("/api/worlds").json()["worlds"]] == ["default"]
+        resp = client.post("/api/worlds", json={"name": "w1",
+                                                "auto_snapshot": {"on_session": True,
+                                                                  "interval_hours": 0}})
+        assert resp.status_code == 200, resp.text                # 只带旧字段：照常建
+        assert pool.registry.get("w1")["settings"]["embedding"]["base_url"] == "http://h.example"
+
+
+def test_put_settings_with_an_explicit_endpoint_uses_only_the_service_key(tmp_path, monkeypatch):
+    """provider_name 为空的显式端点指向自定义地址照常放行：适配器只带服务级密钥（裁定 R22），不带 p 的密钥。"""
+    built: list = []
+    with _embedding_client(tmp_path, monkeypatch, built) as client:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-service")
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        assert client.post("/api/w/w1/tick", json={}).status_code == 200
+        built.clear()
+        resp = client.put("/api/worlds/w1/settings", json={"embedding": {
+            "provider_name": "", "provider": "openai", "base_url": "http://mine.example",
+            "model": "e-mine", "dim": 8}})
+        assert resp.status_code == 200, resp.text
+        assert built and built[-1]["base_url"] == "http://mine.example"
+        assert built[-1]["api_key"] == "sk-service"
+        assert all(cfg.get("api_key") != "sk-secret-123" for cfg in built)
+        assert "sk-" not in resp.text
+
+
+def test_list_skips_a_world_deleted_between_listing_and_building_its_row(client, monkeypatch):
+    """注册表列出之后、建某一行之前那个世界被删掉：跳过这一行，列表照常 200，不是整张 404。"""
+    pool = _pool(client)
+    for name in ("w1", "w2"):
+        assert client.post("/api/worlds", json={"name": name}).status_code == 200
+    real = pool.snapshots
+    deleted: list = []
+
+    def _delete_w1_first(world):
+        if world == "w1" and not deleted:
+            deleted.append(world)
+            pool.delete_world("w1")                 # 恰好落在列出与建行之间
+        return real(world)
+    monkeypatch.setattr(pool, "snapshots", _delete_w1_first)
+    resp = client.get("/api/worlds")
+    assert resp.status_code == 200, resp.text
+    names = [w["name"] for w in resp.json()["worlds"]]
+    assert deleted == ["w1"] and "w1" not in names and {"w2", "default"} <= set(names)
+
+
+# ───────────────────────── 裁定 R39：路由的租约覆盖锁外阶段，关闭与恢复等它 ─────────────────────────
+
+def _until(predicate, timeout: float = 5.0) -> bool:
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def _runtime_refs(pool, monkeypatch) -> list:
+    """记下池此后建的每个引擎的 Runtime（弱引用）。"""
+    import weakref
+    refs: list = []
+    real = pool._open_engine
+
+    def _track(world, ctx):
+        engine = real(world, ctx)
+        refs.append(weakref.ref(engine._rt))
+        return engine
+    monkeypatch.setattr(pool, "_open_engine", _track)
+    return refs
+
+
+def _paused_extraction(monkeypatch):
+    """remember 的锁外抽取段（remember_extract）卡在 Event 上：返回 (进入了, 放行)。"""
+    from starling.dashboard import engine as engmod
+    entered, release = threading.Event(), threading.Event()
+    real = engmod.MemoryCore.remember_extract
+
+    def _paused(self, bundle, **kwargs):
+        entered.set()
+        assert release.wait(15), "测试没有放行抽取"
+        return real(self, bundle, **kwargs)
+    monkeypatch.setattr(engmod.MemoryCore, "remember_extract", _paused)
+    return entered, release
+
+
+@pytest.mark.parametrize("operation", ["close", "rollback"])
+def test_close_and_rollback_wait_for_a_remember_paused_in_extraction(client, monkeypatch, operation):
+    """remember 的抽取段在引擎锁外。命令路由的租约要覆盖整条请求：关闭或恢复这个世界在抽取被卡住时一直等，
+    放行之后请求先在原引擎上提交、关闭或恢复后完成；之后只剩一个 Runtime 活着（同一个库上没有第二条写连接）。"""
+    import gc
+    pool = _pool(client)
+    pool.create_world("w1", "")
+    refs = _runtime_refs(pool, monkeypatch)
+    _remember(client, "/api/w/w1", "Alice owns ops")
+    snap = pool.take_snapshot("w1", "") if operation == "rollback" else None
+    entered, release = _paused_extraction(monkeypatch)
+    responses: list = []
+    req = threading.Thread(target=lambda: responses.append(
+        client.post("/api/w/w1/remember", json={"text": "Bob owns auth"})), daemon=True)
+    req.start()
+    assert entered.wait(10), "remember 没走到锁外抽取段"
+    done = threading.Event()
+    run = (lambda: pool.close_world("w1")) if operation == "close" \
+        else (lambda: pool.rollback("w1", snap["id"]))
+    worker = threading.Thread(target=lambda: (run(), done.set()), daemon=True)
+    worker.start()
+    try:
+        assert _until(lambda: "w1" in pool.closing_worlds()), f"{operation} 没开始"
+        assert not done.wait(0.3), f"remember 还在飞，{operation} 不该完成"
+        assert "w1" in pool.open_worlds(), "请求还持着租约，引擎却已被丢"
+    finally:
+        release.set()
+    req.join(15)
+    assert done.wait(15), f"{operation} 在请求结束之后没完成"
+    worker.join(5)
+    assert responses and responses[0].status_code == 200, responses
+    gc.collect()
+    alive = [ref for ref in refs if ref() is not None]
+    if operation == "close":
+        assert alive == [] and "w1" not in pool.open_worlds()
+        assert pool.registry.get("w1")["statements"] == 2        # 请求在关闭之前提交了
+    else:
+        assert len(alive) == 1 and "w1" in pool.open_worlds()    # 恢复后重开的那一个
+        with pool.lease("w1", build=False) as eng:
+            assert alive[0]() is eng._rt
+        eng = None
+    assert pool._leaked == []
+
+
+def test_close_waits_for_an_in_flight_converse_turn(client, monkeypatch):
+    """/ws/converse 的生成段在引擎锁外；run_blocking 持着本轮的租约直到用完引擎。生成被卡住时关闭在等，放行后
+    这一轮先 done，关闭随后完成，旧 Runtime 随之释放。"""
+    import gc
+    pool = _pool(client)
+    pool.create_world("w1", "")
+    refs = _runtime_refs(pool, monkeypatch)
+    generating, release = threading.Event(), threading.Event()
+
+    def _blocked_stream(self, message, **kwargs):
+        generating.set()
+        assert release.wait(15), "测试没有放行这一轮"
+        return {"reply": "ok", "statement_ids": [], "remember_ok": True}
+    monkeypatch.setattr(DashboardEngine, "converse_stream", _blocked_stream)
+    frames: list = []
+
+    def _turn():
+        with client.websocket_connect("/ws/converse") as ws:
+            ws.send_json({"message": "who owns auth?", "world": "w1"})
+            while (msg := ws.receive_json())["type"] not in ("done", "error"):
+                frames.append(msg)
+            frames.append(msg)
+    turn = threading.Thread(target=_turn, daemon=True)
+    turn.start()
+    assert generating.wait(10), "这一轮没走到生成段"
+    closed = threading.Event()
+    closer = threading.Thread(target=lambda: (pool.close_world("w1"), closed.set()), daemon=True)
+    closer.start()
+    try:
+        assert _until(lambda: "w1" in pool.closing_worlds()), "关闭没开始"
+        assert not closed.wait(0.3), "这一轮还在生成，关闭不该完成"
+        assert "w1" in pool.open_worlds()
+    finally:
+        release.set()
+    turn.join(15)
+    assert closed.wait(15)
+    closer.join(5)
+    assert frames and frames[-1]["type"] == "done", frames
+    monkeypatch.undo()
+    gc.collect()
+    assert refs and all(ref() is None for ref in refs), "这一轮结束、世界关了，旧 Runtime 必须已释放"
+
+
+def test_rollback_of_the_default_world_waits_for_a_config_hot_swap(client, monkeypatch):
+    """POST /api/config 在工作线程里持默认世界的一份租约做完整段热换（_write_config）。热换被卡住时恢复默认世界
+    一直等；放行之后配置请求先 200，恢复随后完成。"""
+    from starling.dashboard import engine as engmod
+    pool = _pool(client)
+    monkeypatch.setattr(engmod, "_build_chat_adapter", lambda cfg: make_stub_llm(default_response=_STUB))
+    snap = pool.take_snapshot("default", "")
+    applying, release = threading.Event(), threading.Event()
+    real_reload = DashboardEngine.reload_adapters
+
+    def _blocked_reload(self, roles, **kwargs):
+        applying.set()
+        assert release.wait(15), "测试没有放行热换"
+        return real_reload(self, roles, **kwargs)
+    monkeypatch.setattr(DashboardEngine, "reload_adapters", _blocked_reload)
+    responses: list = []
+    body = {"providers": {"p": {"provider": "openai", "model": "m", "api_key": "sk-x"}},
+            "roles": {"extraction": "p"}}
+    req = threading.Thread(target=lambda: responses.append(client.post("/api/config", json=body)),
+                           daemon=True)
+    req.start()
+    assert applying.wait(10), "热换没走到重建适配器"
+    done = threading.Event()
+    results: list = []
+    roller = threading.Thread(target=lambda: (results.append(pool.rollback("default", snap["id"])),
+                                              done.set()), daemon=True)
+    roller.start()
+    try:
+        assert _until(lambda: "default" in pool.closing_worlds()), "恢复没开始"
+        assert not done.wait(0.3), "热换还持着默认世界的租约，恢复不该完成"
+    finally:
+        release.set()
+    req.join(15)
+    assert done.wait(15)
+    roller.join(5)
+    assert responses and responses[0].status_code == 200, responses[0].text
+    assert results and results[0]["reopened"] is True
+
+
+def test_ws_converse_against_a_closing_world_gets_a_world_busy_frame(client):
+    pool = _pool(client)
+    pool.create_world("w1", "")
+    with pool._lock:
+        pool._closing.add("w1")
+    try:
+        with client.websocket_connect("/ws/converse") as ws:
+            ws.send_json({"message": "who owns auth?", "world": "w1"})
+            assert ws.receive_json() == {"type": "error", "error": "world_busy"}
+    finally:
+        with pool._lock:
+            pool._closing.discard("w1")
+    assert "w1" not in pool.open_worlds()                   # 被拒的这一轮没建引擎
+    with client.websocket_connect("/ws/converse") as ws:      # 关闭窗口一过照常对话
+        ws.send_json({"message": "who owns auth?", "world": "w1"})
+        while (msg := ws.receive_json())["type"] in ("token", "status"):
+            pass
+        assert msg["type"] == "done", msg
