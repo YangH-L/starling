@@ -19,11 +19,15 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace starling::governance {
+
+// {provider 名: 当前 base_url}：客户端写设置时核对继承来的 endpoint 用（裁定 R40）。
+using ProviderBaseUrls = std::map<std::string, std::string>;
 
 struct WorldRecord {
     std::string name, dir_id, tenant, db_path, snapshot_dir, label, created_at;
@@ -82,20 +86,23 @@ public:
     // 与 create 不同，它还初始化新世界的库文件（裁定 R34）：经持久层打开 worlds/<dir_id>/world.db 一次
     // （迁移建表）、随即关闭，然后才写注册项，所以新世界一登记就能按空库检视。不建引擎。初始化失败抛
     // snapshot_failed，世界目录删掉、注册项不写。初始化在注册表锁内（约十几毫秒）。
+    //
+    // provider_base_urls（裁定 R40）：客户端写设置时给出 {provider 名: 当前 base_url}（starling.json 的
+    // provider 注册表）。给出时，合并结果里每个 provider_name 非空的 endpoint 都按 require_endpoint_unchanged
+    // 对表里该 provider 的地址核对（表里没有这个名字按空串算，同样拒绝），任何一个不同就抛 endpoint_changed、
+    // 什么都不写。合并、核对、写在同一次持锁内：同步默认世界设置（replace_world_sections）取同一把锁，插不进
+    // 中间。不给（nullopt）时不核对：内部调用方（自动快照配置等）用，它们不改 endpoint。
     WorldRecord create_world(const std::string& name, const std::string& label,
                              const std::map<std::string, std::string>& labels,
-                             const std::string& overrides_json, std::string_view now_iso);
+                             const std::string& overrides_json, std::string_view now_iso,
+                             const std::optional<ProviderBaseUrls>& provider_base_urls = std::nullopt);
     // 把 overrides 合并到世界当前设置上（只读世界后台强制关）并写回，读—合并—写在一次持锁内，
     // 并发更新同一世界不会丢合并。返回合并后的 settings_json。world_not_found；overrides 非法时什么都不写。
-    std::string update_world_settings(const std::string& name, const std::string& overrides_json);
-    // update_world_settings / create_world 的预演（裁定 R38）：同一套合并（merge_settings，只读世界后台强制关；
-    // 建世界时以默认世界当前设置为底），返回合并结果的 settings_json，什么都不写。调用方据此在写之前做
-    // 额外核对（例如继承来的 endpoint 地址没变，spec §8.3）。错误码与对应的写方法相同（world_not_found、
-    // invalid_settings 等）。预演与随后的写不在同一次持锁内：调用方要求结果不变时自己串行化（WorldPool 持
-    // 该世界的世界锁）。
-    [[nodiscard]] std::string preview_world_settings(const std::string& name,
-                                                     const std::string& overrides_json) const;
-    [[nodiscard]] std::string preview_new_world_settings(const std::string& overrides_json) const;
+    // provider_base_urls 同 create_world（裁定 R40）：给出时在写之前于同一次持锁内核对，endpoint_changed 时
+    // 什么都不写。
+    std::string update_world_settings(
+        const std::string& name, const std::string& overrides_json,
+        const std::optional<ProviderBaseUrls>& provider_base_urls = std::nullopt);
     // 权威来源同步（裁定 R27）：world_settings.hpp replace_sections（出现的段整段替换、background 逐叶合并、
     // null 清除），读—替换—写在一次持锁内。只读世界同样强制关后台。返回新的 settings_json。world_not_found；
     // sections 非法时什么都不写。

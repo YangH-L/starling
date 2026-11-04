@@ -1285,3 +1285,44 @@ def test_stop_background_stops_the_scheduler_before_taking_any_world_lock(tmp_pa
     finally:
         monkeypatch.undo()
         pool.close_all()
+
+
+def test_set_auto_snapshot_serializes_with_update_settings(tmp_path, monkeypatch):
+    """裁定 R42：set_auto_snapshot 持世界锁，与 update_settings 串行：update_settings 写完注册表、还没把新设置
+    交给引擎时，set_auto_snapshot 不能插进来（插进来就会先把合并后的设置换上引擎，apply_world_settings 随后
+    看不出 endpoint 变了、不重建适配器）。卡点：update_settings 调 apply_world_settings 时停住。"""
+    pool, _reg, _c = _pool(tmp_path)
+    try:
+        pool.create_world("w1", "")
+        with pool.lease("w1"):
+            pass
+        from starling.dashboard.engine import DashboardEngine
+        in_apply, proceed = threading.Event(), threading.Event()
+        real_apply = DashboardEngine.apply_world_settings
+
+        def _paused_apply(self, settings):
+            in_apply.set()
+            assert proceed.wait(15)
+            return real_apply(self, settings)
+        monkeypatch.setattr(DashboardEngine, "apply_world_settings", _paused_apply)
+        updater = threading.Thread(
+            target=lambda: pool.update_settings("w1", {"gist_thresholds": {"min_holders": 4}}))
+        updater.start()
+        assert in_apply.wait(10)
+        done = threading.Event()
+        setter = threading.Thread(target=lambda: (pool.set_auto_snapshot("w1", True, 6), done.set()))
+        setter.start()
+        try:
+            assert not done.wait(0.3), "set_auto_snapshot 没等 update_settings 交完设置"
+        finally:
+            proceed.set()
+        updater.join(10)
+        assert done.wait(10)
+        setter.join(5)
+        with pool.lease("w1", build=False) as eng:
+            assert eng._settings["background"]["auto_snapshot"] == {"on_session": True,
+                                                                    "interval_hours": 6}
+            assert eng._settings["gist_thresholds"] == {"min_holders": 4.0}
+        eng = None
+    finally:
+        pool.close_all()

@@ -166,56 +166,40 @@ void bind_15_world(pybind11::module_& m) {
                  return py::dict("worlds"_a = worlds, "total"_a = page.total);
              }, py::arg("labels") = py::none(), py::arg("offset") = 0, py::arg("limit") = 50)
         // 新世界设置 = 默认世界当前设置 + overrides 的值拷贝（C++ create_world，一次持锁）。
+        // provider_base_urls（裁定 R40）：{provider 名: 当前 base_url}。给出时 C++ 在同一次持锁内合并、核对
+        // 继承来的 endpoint、再写；endpoint_changed 时什么都不写。None：不核对。
         .def("create",
              // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
              [](gov::RegistryDb& reg, const std::string& name, const std::string& label,
                 const std::map<std::string, std::string>& labels, const py::object& overrides,
-                const std::string& now_iso) {
+                const std::string& now_iso,
+                const std::optional<gov::ProviderBaseUrls>& provider_base_urls) {
                  const auto overrides_text = overrides_in(overrides);
                  gov::WorldRecord rec;
                  {
                      const py::gil_scoped_release release;
-                     rec = reg.create_world(name, label, labels, overrides_text, now_iso);
+                     rec = reg.create_world(name, label, labels, overrides_text, now_iso,
+                                            provider_base_urls);
                  }
                  return record_out(rec);
              }, py::arg("name"), py::arg("label"), py::arg("labels"), py::arg("overrides"),
-             py::arg("now_iso"))
+             py::arg("now_iso"), py::arg("provider_base_urls") = py::none())
         // 递归删世界目录可能很大，释放 GIL。
         .def("remove", [](gov::RegistryDb& reg, const std::string& name) {
             const py::gil_scoped_release release;
             reg.remove(name);
         }, py::arg("name"))
         .def("update_settings",
-             [](gov::RegistryDb& reg, const std::string& name, const py::object& overrides) {
+             [](gov::RegistryDb& reg, const std::string& name, const py::object& overrides,
+                const std::optional<gov::ProviderBaseUrls>& provider_base_urls) {
                  const auto overrides_text = overrides_in(overrides);
                  std::string merged;
                  {
                      const py::gil_scoped_release release;
-                     merged = reg.update_world_settings(name, overrides_text);
+                     merged = reg.update_world_settings(name, overrides_text, provider_base_urls);
                  }
                  return to_py(merged);
-             }, py::arg("name"), py::arg("overrides"))
-        // 改设置 / 建世界的预演（裁定 R38）：同一套 C++ 合并，返回合并结果的 dict，什么都不写。
-        .def("preview_settings",
-             [](const gov::RegistryDb& reg, const std::string& name, const py::object& overrides) {
-                 const auto overrides_text = overrides_in(overrides);
-                 std::string merged;
-                 {
-                     const py::gil_scoped_release release;
-                     merged = reg.preview_world_settings(name, overrides_text);
-                 }
-                 return to_py(merged);
-             }, py::arg("name"), py::arg("overrides"))
-        .def("preview_new_world_settings",
-             [](const gov::RegistryDb& reg, const py::object& overrides) {
-                 const auto overrides_text = overrides_in(overrides);
-                 std::string merged;
-                 {
-                     const py::gil_scoped_release release;
-                     merged = reg.preview_new_world_settings(overrides_text);
-                 }
-                 return to_py(merged);
-             }, py::arg("overrides"))
+             }, py::arg("name"), py::arg("overrides"), py::arg("provider_base_urls") = py::none())
         // 权威来源同步（裁定 R27）：出现的段整段替换、background 逐叶合并、null 清除。返回新的设置 dict。
         .def("replace_settings_sections",
              [](gov::RegistryDb& reg, const std::string& name, const py::object& sections) {

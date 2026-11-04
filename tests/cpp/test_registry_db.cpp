@@ -393,33 +393,85 @@ TEST(WorldSettingsCompose, CreateWhileDefaultIsUpdatedSeesOneCompleteSnapshot) {
     updater.join();
 }
 
-// 裁定 R38：预演与写走同一套合并，结果相同，预演什么都不写；错误码与写方法相同。
-TEST(WorldSettingsCompose, PreviewMergesLikeTheWriteAndWritesNothing) {
+// 裁定 R40：给出 provider 地址表时，合并结果里继承来的 endpoint（provider_name 非空）在同一次持锁内核对，
+// 地址与表不同（或表里没有这个 provider）就 endpoint_changed，什么都不写。
+TEST(WorldSettingsCompose, InheritedEndpointMustMatchTheProviderAddress) {
     const TempDir tmp;
     auto reg = open_db(tmp);
     reg.update_world_settings(
         "default", R"({"embedding":{"provider":"openai","provider_name":"p","base_url":"http://h",)"
                    R"("model":"e1","dim":8,"max_tokens":1,"timeout_ms":1000}})");
-    reg.create_world("w1", "", {}, "", kNow);
+    const ProviderBaseUrls urls{{"p", "http://h"}};
+    reg.create_world("w1", "", {}, "", kNow, urls);
     const auto before = reg.get("w1").settings_json;
-    const std::string overrides = R"({"embedding":{"base_url":"http://evil"}})";
-    const auto preview = reg.preview_world_settings("w1", overrides);
+    const std::string evil = R"({"embedding":{"base_url":"http://evil"}})";
+
+    EXPECT_EQ(code_of([&] { (void)reg.update_world_settings("w1", evil, urls); }),
+              "endpoint_changed");
     EXPECT_EQ(reg.get("w1").settings_json, before);                    // 什么都没写
-    const auto parsed = settings_from_json(preview);
-    ASSERT_TRUE(parsed.embedding.has_value());
-    EXPECT_EQ(parsed.embedding->base_url, "http://evil");
-    EXPECT_EQ(parsed.embedding->provider_name, "p");                   // 叶合并留着 provider_name
-    EXPECT_EQ(reg.update_world_settings("w1", overrides), preview);     // 与真写的结果相同
+    EXPECT_EQ(code_of([&] { (void)reg.create_world("w2", "", {}, evil, kNow, urls); }),
+              "endpoint_changed");
+    EXPECT_EQ(code_of([&] { (void)reg.get("w2"); }), "world_not_found");
+    std::vector<std::string> dirs;                                     // 没留下 w2 的目录
+    for (const auto& entry : fs::directory_iterator(tmp.path() / "worlds")) {
+        dirs.push_back(entry.path().filename().string());
+    }
+    EXPECT_EQ(dirs, std::vector<std::string>{reg.get("w1").dir_id});    // 默认世界的库在原地
+    // 表里没有这个 provider（已被删掉）：同样拒绝。
+    EXPECT_EQ(code_of([&] { (void)reg.update_world_settings("w1", "{}", ProviderBaseUrls{}); }),
+              "endpoint_changed");
+    // 地址不变的改动照常写；显式端点（provider_name 为空）不核对。
+    const auto ok = settings_from_json(
+        reg.update_world_settings("w1", R"({"embedding":{"model":"e2"}})", urls));
+    EXPECT_EQ(ok.embedding->model, "e2");
+    const auto mine = settings_from_json(reg.update_world_settings(
+        "w1", R"({"embedding":{"provider_name":"","base_url":"http://mine"}})", urls));
+    EXPECT_EQ(mine.embedding->base_url, "http://mine");
+    EXPECT_TRUE(mine.embedding->provider_name.empty());
+    // 不给地址表：不核对（内部调用方，例如自动快照配置）。
+    (void)reg.update_world_settings("w1", R"({"embedding":{"provider_name":"p"}})");
+    EXPECT_EQ(settings_from_json(reg.get("w1").settings_json).embedding->provider_name, "p");
+}
 
-    const auto fresh = settings_from_json(reg.preview_new_world_settings(overrides));
-    ASSERT_TRUE(fresh.embedding.has_value());
-    EXPECT_EQ(fresh.embedding->base_url, "http://evil");
-    EXPECT_EQ(fresh.embedding->provider_name, "p");
-    EXPECT_EQ(reg.list(WorldQuery{}).total, 2);                        // 没有建世界
-
-    EXPECT_EQ(code_of([&] { (void)reg.preview_world_settings("nope", "{}"); }), "world_not_found");
-    EXPECT_EQ(code_of([&] { (void)reg.preview_world_settings("w1", R"({"x":1})"); }),
-              "invalid_settings");
-    EXPECT_EQ(code_of([&] { (void)reg.preview_new_world_settings(R"({"x":1})"); }),
-              "invalid_settings");
+// 裁定 R40：客户端显式给的 endpoint 建世界，同时另一个线程反复把默认世界的这个角色绑到 p 再解绑
+// （replace_world_sections，即 sync_default_settings）。合并与核对在同一次持锁内：存下来的世界要么是
+// 显式端点（provider_name 为空、客户端地址），要么建世界被拒（endpoint_changed）；绝不会出现
+// provider_name=p、地址却是客户端给的。
+TEST(WorldSettingsCompose, CreateWithAnExplicitEndpointNeverInheritsAProviderNameAtTheClientUrl) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    const ProviderBaseUrls urls{{"p", "http://h"}};
+    const std::string bound =
+        R"({"embedding":{"provider":"openai","provider_name":"p","base_url":"http://h",)"
+        R"("model":"e1","dim":8,"max_tokens":1,"timeout_ms":1000}})";
+    std::atomic<bool> stop{false};
+    std::thread binder([&] {
+        while (!stop.load()) {
+            (void)reg.replace_world_sections("default", bound);
+            (void)reg.replace_world_sections("default", R"({"embedding":null})");
+        }
+    });
+    int created = 0;
+    int refused = 0;
+    for (int idx = 0; idx < 40; ++idx) {
+        const std::string name = "c" + std::to_string(idx);
+        try {
+            (void)reg.create_world(
+                name, "", {}, R"({"embedding":{"base_url":"http://evil","model":"e","dim":8}})",
+                kNow, urls);
+            ++created;
+        } catch (const WorldStoreError& err) {
+            ASSERT_EQ(err.code(), "endpoint_changed") << err.what();
+            ++refused;
+        }
+    }
+    stop.store(true);
+    binder.join();
+    EXPECT_EQ(created + refused, 40);
+    const auto page = reg.list(WorldQuery{.labels = {}, .offset = 0, .limit = 500});
+    for (const auto& rec : page.worlds) {
+        const auto got = settings_from_json(rec.settings_json);
+        if (!got.embedding || got.embedding->provider_name != "p") { continue; }
+        EXPECT_EQ(got.embedding->base_url, "http://h") << rec.name;   // p 的地址，从不是客户端的
+    }
 }

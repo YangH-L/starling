@@ -286,6 +286,10 @@ class DashboardEngine:
         # 写方法成功之后调用一次（WorldPool 设置，用于统计去抖广播）。在引擎锁之外调用。
         self.on_commit = None
         self._embedder_live = False             # rebuild_embedder 设置
+        # 裁定 R41：每个角色的适配器是按哪个 endpoint 建的（建与重建时记下；None = 不是从设置建的，例如测试
+        # 直接 eng.llm = fake，或角色没有 endpoint）。用到适配器之前核对的是这个，不是 _settings 里的：设置
+        # 被换了却没重建适配器时，按旧 endpoint 建的适配器（带着密钥指着旧地址）不能被新设置的核对放行。
+        self._built_endpoints: dict[str, dict | None] = {}
         rt = _runtime._build_local_store_sqlite_runtime(Path(ctx.db_path))
         try:
             rt.start()
@@ -390,20 +394,52 @@ class DashboardEngine:
             cfg["api_key"] = key
         return cfg
 
-    def _require_endpoint_unchanged(self, role: str) -> None:
-        """继承来的 endpoint（provider_name 非空）对 provider 的当前 base_url 做 C++ 核对
-        （world_require_endpoint_unchanged）：不同就抛 WorldStoreError("endpoint_changed")。provider
-        已被删掉时当前地址按空串算（与记下的地址不同就同样拒绝）。规则全在 C++，这里只取当前地址。"""
-        ep = self._settings.get(role)
+    def _check_endpoint(self, ep: dict | None) -> None:
+        """一个 endpoint（provider_name 非空时）对 provider 的当前 base_url 做 C++ 核对
+        （world_require_endpoint_unchanged）：不同就抛 WorldStoreError("endpoint_changed")。provider 已被删掉时
+        当前地址按空串算（与记下的地址不同就同样拒绝）。规则全在 C++，这里只取当前地址。"""
         if not ep or not ep.get("provider_name"):
             return
         current = (self._providers.get(ep["provider_name"]) or {}).get("base_url") or ""
         _core.world_require_endpoint_unchanged(ep, current)
 
+    def _source_endpoint(self, role: str) -> dict | None:
+        """role 的适配器此刻该按哪个 endpoint 建：_settings[role]；chat 没绑定时回退到抽取的（与构造时一致）。"""
+        if role == "chat":
+            return self._settings.get("chat") or self._settings.get("extraction")
+        return self._settings.get(role)
+
+    def _require_endpoint_unchanged(self, role: str) -> None:
+        """用到 role 的适配器之前调（持 self._lock）。裁定 R41：核对的是这个适配器建时的 endpoint，不是 _settings
+        里的。两者不同（设置被换了、适配器没重建）时，先按 _settings 的 endpoint 核对，过了就按它重建适配器，
+        然后照常往下走；没过就 endpoint_changed，不重建。两者相同时只核对一次。适配器不是从设置建的（测试直接
+        装的替身，见 llm 的 setter）时按 _settings 核对，与之前相同。调用方在这之后再读适配器（可能刚换过）。"""
+        ep = self._source_endpoint(role)
+        if role in self._built_endpoints and self._built_endpoints[role] != ep:
+            self._check_endpoint(ep)                  # 新设置的地址也得对，才按它重建
+            self._rebuild_role(role)
+            return
+        self._check_endpoint(self._built_endpoints.get(role, ep))
+
+    def _rebuild_role(self, role: str) -> None:
+        """按 _settings 重建 role 的适配器（持 self._lock，地址已核对过）。chat 跟着重建：它可能回退到抽取的
+        endpoint。嵌入不在这里重嵌入：重嵌入只在设置主动换嵌入时做（reload_adapters），用到嵌入的调用只需要
+        一个按当前设置建的适配器。"""
+        if role == "extraction":
+            self.set_llm(self._endpoint_cfg("extraction"))
+        elif role == "chat":
+            self.set_chat(self._endpoint_cfg("chat") or self._endpoint_cfg("extraction"))
+        elif role == "consolidation":
+            self.set_consolidation(self._endpoint_cfg("consolidation"))
+        elif role == "embedding":
+            self.rebuild_embedder(self._endpoint_cfg("embedding"), reembed=False)
+
     def _require_embedding_unchanged(self) -> None:
         """用到嵌入的调用（召回、tick、工作集、检索规划、对话的召回段）之前调。占位嵌入（没有密钥）不发
-        请求，不核对。"""
-        if self._embedder_live:
+        请求，不核对；但设置已换成另一个 endpoint 时照样按新设置核对并重建（裁定 R41）。"""
+        stale = ("embedding" in self._built_endpoints
+                 and self._built_endpoints["embedding"] != self._settings.get("embedding"))
+        if self._embedder_live or stale:
             self._require_endpoint_unchanged("embedding")
 
     def set_world_settings(self, settings: dict) -> None:
@@ -421,14 +457,11 @@ class DashboardEngine:
         roles = set(roles)
         warnings: list[str] = []
         with self._lock:
-            # 裁定 R38：从设置重建的每个适配器先核对继承来的地址（spec §8.3），任何一个改了就抛
-            # endpoint_changed，什么都不换。建适配器本身不发请求，但嵌入一换就会重嵌入、用这个密钥发出去。
-            # chat 没绑定时用抽取的 endpoint，核对的也是抽取。
+            # 裁定 R38：从设置重建的每个适配器先核对它将按哪个 endpoint 建（_source_endpoint；chat 没绑定时是
+            # 抽取的），任何一个地址改了就抛 endpoint_changed，什么都不换。建适配器本身不发请求，但嵌入一换就会
+            # 重嵌入、用这个密钥发出去。
             for role in roles:
-                if role == "chat" and not self._settings.get("chat"):
-                    self._require_endpoint_unchanged("extraction")
-                else:
-                    self._require_endpoint_unchanged(role)
+                self._check_endpoint(self._source_endpoint(role))
             if "extraction" in roles:
                 self.set_llm(self._endpoint_cfg("extraction"))
             if "chat" in roles:
@@ -460,7 +493,7 @@ class DashboardEngine:
                 return self.reload_adapters(changed, gist=gist)
             except _core.WorldStoreError:
                 # 新设置里有继承地址已变的 endpoint（裁定 R38，核对在换任何适配器之前）：换回旧设置，
-                # 引擎原样。池在写注册表之前已预演核对过，这里是纵深防御。
+                # 引擎原样。C++ 在写注册表时已于同一次持锁内核对过（裁定 R40），这里是纵深防御。
                 self._settings = old
                 raise
 
@@ -482,12 +515,20 @@ class DashboardEngine:
 
     @llm.setter
     def llm(self, value) -> None:
-        self._core.llm = value
+        # 直接装进来的适配器（测试替身）不是从设置建的：不记 endpoint，核对按 _settings 做（裁定 R41）。
+        with self._lock:
+            self._core.llm = value
+            self._built_endpoints.pop("extraction", None)
+
+    def _record_built(self, role: str) -> None:
+        """记下 role 的适配器刚按哪个 endpoint 建（_source_endpoint 的此刻值），见 _built_endpoints。"""
+        self._built_endpoints[role] = self._source_endpoint(role)
 
     def set_llm(self, llm_cfg: dict) -> None:
         with self._lock:
             self._core.llm = (_build_chat_adapter(llm_cfg)
                               if llm_cfg.get("api_key") else None)
+            self._record_built("extraction")
 
     def set_chat(self, chat_cfg: dict) -> None:
         """Build the chat-role adapter (converse). Unbound chat falls back to
@@ -496,6 +537,7 @@ class DashboardEngine:
         with self._lock:
             self._core.chat_llm = (_build_chat_adapter(chat_cfg)
                                    if chat_cfg.get("api_key") else None)
+            self._record_built("chat")                 # 没绑 chat 时记下的是抽取的 endpoint
 
     def set_consolidation(self, cons_cfg: dict) -> None:
         """#38-C: build the consolidation-role adapter that judges NORM gists in
@@ -505,6 +547,7 @@ class DashboardEngine:
         with self._lock:
             self._core.consolidation_llm = (_build_chat_adapter(cons_cfg)
                                             if cons_cfg.get("api_key") else None)
+            self._record_built("consolidation")
 
     def set_gist_thresholds(self, thresholds: dict) -> None:
         """#38-C v2 threshold surface: override the NORM-gist K / T / confidence floor /
@@ -536,6 +579,7 @@ class DashboardEngine:
             emb = (_build_embed_adapter(emb_cfg) if emb_cfg.get("api_key")
                    else _core.StubEmbeddingAdapter(8))
             self._core.set_embedder(emb)
+            self._record_built("embedding")
             if reembed:
                 return self._reembed()
         return None
@@ -712,10 +756,9 @@ class DashboardEngine:
             return _build_chat_adapter(cfg)
         # 用世界自己的抽取适配器：先核对继承来的地址（endpoint_changed）。没有适配器时不核对，由调用方
         # 报 llm_not_configured（没有适配器就没有密钥会被发出去）。
-        llm = self._core.llm
-        if llm is not None:
-            self._require_endpoint_unchanged("extraction")
-        return llm
+        if self._core.llm is not None:
+            self._require_endpoint_unchanged("extraction")   # 可能按新设置重建了（裁定 R41）
+        return self._core.llm
 
     def _check_clear_generation(self, generation: int) -> None:
         """代数过期（claim 之后发生了 clear_memory）抛 _TenantCleared。短暂持 self._lock 读代数。"""

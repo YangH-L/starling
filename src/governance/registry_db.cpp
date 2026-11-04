@@ -85,6 +85,19 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 )sql";
 
+// 裁定 R40：合并结果里每个继承来的 endpoint（provider_name 非空）对 provider 的当前地址核对
+// （require_endpoint_unchanged，spec §8.3）。表里没有这个 provider（已被删掉）按空串算，同样拒绝。
+// 调用方持注册表锁、在写之前调用：抛 endpoint_changed 时什么都没写。
+void require_inherited_endpoints(const WorldSettings& settings, const ProviderBaseUrls& base_urls) {
+    for (const auto* endpoint : {&settings.extraction, &settings.embedding, &settings.chat,
+                                 &settings.consolidation}) {
+        if (!endpoint->has_value() || (*endpoint)->provider_name.empty()) { continue; }
+        const auto found = base_urls.find((*endpoint)->provider_name);
+        require_endpoint_unchanged(**endpoint,
+                                   found == base_urls.end() ? std::string() : found->second);
+    }
+}
+
 constexpr const char* kWorldColumns =
     "name, dir_id, tenant, db_path, snapshot_dir, label, created_at, seed, read_only, "
     "reclaimable, retention_group, fork_of_world, fork_of_snapshot, settings_json, holders, "
@@ -410,42 +423,32 @@ WorldRecord RegistryDb::create(const std::string& name, const std::string& label
     return impl_->create_row(name, label, labels, settings_json, now_iso, false);
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 WorldRecord RegistryDb::create_world(const std::string& name, const std::string& label,
                                      const std::map<std::string, std::string>& labels,
-                                     const std::string& overrides_json, std::string_view now_iso) {
+                                     const std::string& overrides_json, std::string_view now_iso,
+                                     const std::optional<ProviderBaseUrls>& provider_base_urls) {
     require_valid_name(name);
     const std::scoped_lock lock(impl_->mutex);
     const auto base = settings_from_json(impl_->require(impl_->default_name()).settings_json);
-    const auto merged = settings_to_json(
-        merge_settings(base, overrides_json.empty() ? "{}" : overrides_json, false));
-    return impl_->create_row(name, label, labels, merged, now_iso, true);
+    const auto merged =
+        merge_settings(base, overrides_json.empty() ? "{}" : overrides_json, false);
+    if (provider_base_urls) { require_inherited_endpoints(merged, *provider_base_urls); }
+    return impl_->create_row(name, label, labels, settings_to_json(merged), now_iso, true);
 }
 
-std::string RegistryDb::update_world_settings(const std::string& name,
-                                              const std::string& overrides_json) {
+std::string RegistryDb::update_world_settings(
+    const std::string& name, const std::string& overrides_json,
+    const std::optional<ProviderBaseUrls>& provider_base_urls) {
     const std::scoped_lock lock(impl_->mutex);
     const auto rec = impl_->require(name);
-    const auto merged = settings_to_json(merge_settings(
-        settings_from_json(rec.settings_json), overrides_json.empty() ? "{}" : overrides_json,
-        rec.read_only));
-    impl_->set_settings(name, merged);
-    return merged;
-}
-
-std::string RegistryDb::preview_world_settings(const std::string& name,
-                                               const std::string& overrides_json) const {
-    const std::scoped_lock lock(impl_->mutex);
-    const auto rec = impl_->require(name);
-    return settings_to_json(merge_settings(settings_from_json(rec.settings_json),
-                                           overrides_json.empty() ? "{}" : overrides_json,
-                                           rec.read_only));
-}
-
-std::string RegistryDb::preview_new_world_settings(const std::string& overrides_json) const {
-    const std::scoped_lock lock(impl_->mutex);
-    const auto base = settings_from_json(impl_->require(impl_->default_name()).settings_json);
-    return settings_to_json(
-        merge_settings(base, overrides_json.empty() ? "{}" : overrides_json, false));
+    const auto merged =
+        merge_settings(settings_from_json(rec.settings_json),
+                       overrides_json.empty() ? "{}" : overrides_json, rec.read_only);
+    if (provider_base_urls) { require_inherited_endpoints(merged, *provider_base_urls); }
+    const auto text = settings_to_json(merged);
+    impl_->set_settings(name, text);
+    return text;
 }
 
 std::string RegistryDb::replace_world_sections(const std::string& name,

@@ -128,8 +128,6 @@ _SCHEDULER_THREAD = "starling-auto-snapshot"
 _DEFAULT_NAME = "default"
 # 注册表 list 的分页上限（RegistryDb::list 的 limit 1–500）。
 _LIST_PAGE = 500
-# 世界设置里的四个 endpoint（spec §8.1，consolidation 见裁定 R25）。
-_ENDPOINT_ROLES = ("extraction", "embedding", "chat", "consolidation")
 # 默认世界经 PUT /api/worlds/default/settings 能改的设置（裁定 R35）：其余段（endpoint、阈值、来源通道、
 # tick 间隔）归 /api/config，下一次 sync_default_settings 会整段覆盖它们。auto_snapshot 与 ingest 不在
 # config 里（裁定 R16），同步时保留。
@@ -949,26 +947,17 @@ class WorldPool:
             background["auto_snapshot"] = {"on_session": auto_snapshot["on_session"],
                                            "interval_hours": auto_snapshot["interval_hours"]}
             merged["background"] = background
-        if merged:
-            # 裁定 R38：客户端给的设置先在 C++ 预演合并，继承来的 endpoint 地址都没变才建（spec §8.3）。
-            # 预演与建之间默认世界的设置可能被 /api/config 改掉；那样建出来的世界继承的就是 config 的新
-            # 地址，与 provider 一致，核对照样成立。
-            self._require_inherited_endpoints(reg.preview_new_world_settings(merged))
-        return reg.create(name, label, dict(labels or {}), merged or None, self._clock())
+        # 裁定 R40：客户端给了设置（或旧字段 auto_snapshot）时，provider 地址表交给 C++，合并、核对继承来的
+        # endpoint、写在同一次持注册表锁内完成（spec §8.3）；地址不同就 endpoint_changed、什么都不写。同步默认
+        # 世界设置取同一把锁，插不进中间。没给设置时照旧只继承默认世界（它由同步与 config 保持一致）。
+        return reg.create(name, label, dict(labels or {}), merged or None, self._clock(),
+                          provider_base_urls=self._provider_base_urls() if merged else None)
 
-    def _require_inherited_endpoints(self, settings: dict) -> None:
-        """settings 里每个继承来的 endpoint（provider_name 非空）对 provider 的当前 base_url 做 C++ 核对
-        （world_require_endpoint_unchanged，spec §8.3）：不同就抛 endpoint_changed。客户端改设置与建世界
-        在写之前调（裁定 R38）：叶合并留着 provider_name，只改 base_url 就会让那个 provider 的密钥发往
-        新地址。provider 已被删掉时当前地址按空串算（与引擎的核对相同）。显式端点（provider_name 为空）
-        用服务级密钥，不核对。"""
-        providers = self._config.providers
-        for role in _ENDPOINT_ROLES:
-            ep = settings.get(role)
-            if not ep or not ep.get("provider_name"):
-                continue
-            current = (providers.get(ep["provider_name"]) or {}).get("base_url") or ""
-            _core.world_require_endpoint_unchanged(ep, current)
+    def _provider_base_urls(self) -> dict[str, str]:
+        """{provider 名: 当前 base_url}（starling.json 的 provider 注册表），交给 C++ 核对客户端写的设置里继承来的
+        endpoint（裁定 R40）。provider 没有地址时按空串。"""
+        return {name: (prov or {}).get("base_url") or ""
+                for name, prov in self._config.providers.items()}
 
     def delete_world(self, world: str) -> None:
         """删世界：先关（等租约、停线程、丢引擎），旧 Runtime 回收不了就拒绝（world_busy，什么都不删），
@@ -1028,8 +1017,9 @@ class WorldPool:
             return _core.world_purge_archives(reg, world)
 
     def update_settings(self, world: str, overrides: dict) -> tuple[dict, list[str]]:
-        """把部分设置 overrides 合并进 world 的设置（C++ update_world_settings：逐叶合并、null 清除、校验，
-        读—合并—写在注册表锁内；非法时什么都不写），返回 (实际生效的完整设置, 重嵌入提示)。世界开着时引擎
+        """把部分设置 overrides 合并进 world 的设置（C++ update_world_settings：逐叶合并、null 清除、校验、核对
+        继承来的 endpoint 地址（裁定 R40），读—合并—核对—写在注册表锁内；非法或 endpoint_changed 时什么都不写），
+        返回 (实际生效的完整设置, 重嵌入提示)。世界开着时引擎
         换上新设置，并按变了的 endpoint 段重建适配器（engine.apply_world_settings，裁定 R35）。
 
         默认世界只收 _DEFAULT_WORLD_EDITABLE 里的键，其余 → invalid_settings，什么都不写：那些段归 config，
@@ -1044,10 +1034,9 @@ class WorldPool:
         if world == reg.default_world():
             self._require_default_world_editable(overrides)
         with self._world_lock(world):
-            # 裁定 R38：先在 C++ 预演合并，继承来的 endpoint 地址都没变才写。持世界锁，预演与写之间同一
-            # 世界的设置不会被别的 update_settings 改掉。
-            self._require_inherited_endpoints(reg.preview_settings(world, overrides))
-            merged = reg.update_settings(world, overrides)
+            # 裁定 R40：合并、核对继承来的 endpoint、写都在 C++ 的同一次持锁内；endpoint_changed 时什么都不写。
+            merged = reg.update_settings(world, overrides,
+                                         provider_base_urls=self._provider_base_urls())
             settings = _core.world_effective_settings(merged)
             with self._lock:
                 engine = self._engines.get(world)
@@ -1070,12 +1059,18 @@ class WorldPool:
         """改一个世界的自动快照配置（C++ 在注册表锁内合并），返回新配置 {"on_session", "interval_hours"}。
         world_not_found / invalid_auto_snapshot 由 C++ 抛。开着的引擎换上新的设置引用。"""
         reg = self._require_registry()
-        _core.world_set_auto_snapshot(reg, world, on_session, interval_hours)
-        settings = _core.world_effective_settings(reg.get(world)["settings"])
-        with self._lock:
-            engine = self._engines.get(world)
-        if engine is not None:
-            engine.set_world_settings(settings)
+        self._record(world)                           # world_not_found：未知世界名不建世界锁
+        # 裁定 R42：持世界锁，与 update_settings 串行。否则它可能落在 update_settings 写完注册表、还没把新设置
+        # 交给引擎之间，先把合并后的设置（含新 endpoint）换上引擎，apply_world_settings 随后看不出变化、不重建
+        # 适配器。路由在工作线程里调，不持租约，按锁顺序可以等世界锁。
+        with self._world_lock(world):
+            _core.world_set_auto_snapshot(reg, world, on_session, interval_hours)
+            settings = _core.world_effective_settings(reg.get(world)["settings"])
+            with self._lock:
+                engine = self._engines.get(world)
+            if engine is not None:
+                engine.set_world_settings(settings)
+            engine = None
         return dict(settings["background"]["auto_snapshot"])
 
     def auto_snapshot_status(self) -> dict:

@@ -933,3 +933,117 @@ def test_ws_converse_against_a_closing_world_gets_a_world_busy_frame(client):
         while (msg := ws.receive_json())["type"] in ("token", "status"):
             pass
         assert msg["type"] == "done", msg
+
+
+# ───────────────────────── 裁定 R40、R41：核对与写原子；引擎按建适配器时的 endpoint 核对 ─────────────────────────
+
+def _window_client(tmp_path, monkeypatch, built: list):
+    """默认世界只绑 extraction 到 p（embedding 没绑）。嵌入适配器换成记录 (base_url, api_key) 的占位。"""
+    import starling.dashboard.engine as engmod
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(engmod, "_build_chat_adapter", lambda c: make_stub_llm(default_response=_STUB))
+
+    def _embed(cfg):
+        built.append((cfg.get("base_url"), cfg.get("api_key")))
+        return _core.StubEmbeddingAdapter(8)
+    monkeypatch.setattr(engmod, "_build_embed_adapter", _embed)
+    cfg = DashboardConfig(db_path=str(tmp_path / "dashboard.db"), token="",
+                          tick_interval_s=600.0, source_lane_enabled=False,
+                          ingest_spool_path=str(tmp_path / "spool"))
+    cfg.providers["p"] = {"provider": "openai", "model": "m1", "base_url": "http://h.example",
+                          "api_key": "sk-secret-123"}
+    cfg.roles["extraction"] = "p"
+    return cfg, TestClient(create_app(cfg, engine_factory=_stub_factory))
+
+
+def test_create_racing_a_config_bind_never_stores_a_provider_name_at_the_client_url(tmp_path,
+                                                                                   monkeypatch):
+    """审查探针 test_probe_create_window：建世界时客户端给显式的 embedding（默认世界那一刻没绑 embedding），
+    合并之前 POST /api/config 把 embedding 绑到 p。C++ 叶合并会把客户端的 base_url 叠到 p 的 endpoint 上。
+    核对与合并、写在同一次持锁内：要么 409，要么存下来的 endpoint 不带客户端地址；绝不会是 provider_name=p、
+    base_url=客户端地址。用真实的同步插在 C++ 读默认世界设置之前（替换 reg.create，先同步再调真的）。"""
+    built: list = []
+    cfg, client = _window_client(tmp_path, monkeypatch, built)
+    with client:
+        pool = _pool(client)
+        reg = pool.registry
+
+        class _RacingRegistry:
+            """把 create 包一层：调 C++ 之前先做一次 config 绑定与同步（模拟并发的 POST /api/config）。"""
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def create(self, *args, **kwargs):
+                cfg.roles["embedding"] = "p"
+                pool.sync_default_settings()
+                return self._inner.create(*args, **kwargs)
+        pool._registry = _RacingRegistry(reg)
+        try:
+            resp = client.post("/api/worlds", json={"name": "w1", "settings": {
+                "embedding": {"base_url": "http://evil.example", "model": "e", "dim": 8}}})
+        finally:
+            pool._registry = reg
+        if resp.status_code == 409:
+            assert resp.json() == {"detail": "endpoint_changed"}
+            assert client.get("/api/worlds/w1").status_code == 404
+        else:
+            assert resp.status_code == 200, resp.text
+            ep = reg.get("w1")["settings"]["embedding"]
+            assert ep.get("base_url") != "http://evil.example" or not ep.get("provider_name"), ep
+        assert all(b != ("http://evil.example", "sk-secret-123") for b in built)
+
+
+def test_settings_swapped_without_rebuild_never_leave_an_adapter_built_elsewhere(tmp_path,
+                                                                                 monkeypatch):
+    """审查探针 test_probe_chain（R41）：引擎的嵌入适配器是按某个 endpoint 建的；设置被换成另一个 endpoint 却没
+    重建适配器（例如 set_auto_snapshot 落在 update_settings 与 apply_world_settings 之间，apply 看不出变化）。
+    下一次用到嵌入时，核对的是适配器建时的 endpoint，不是 _settings 里的；两者不同就先按 _settings 核对并重建。
+    这里直接造出这种状态：引擎的嵌入适配器建在客户端地址、带着 p 的密钥（R40 之前的建世界窗口能造出来），
+    然后把 _settings 换成 p 的真实地址。tick 要么 409，要么 200 且嵌入适配器已按 p 的真实地址重建；
+    之后不再用建在客户端地址的那个。"""
+    built: list = []
+    cfg, client = _window_client(tmp_path, monkeypatch, built)
+    with client:
+        pool = _pool(client)
+        cfg.roles["embedding"] = "p"
+        pool.sync_default_settings()
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        evil = {"provider": "openai", "provider_name": "p", "base_url": "http://evil.example",
+                "model": "e", "dim": 8}
+        with pool.lease("w1") as eng:
+            good_settings = eng._settings
+            eng._settings = {**good_settings, "embedding": {**good_settings["embedding"], **evil}}
+            eng.rebuild_embedder(eng._endpoint_cfg("embedding"), reembed=False)   # 建在 evil
+            assert built[-1] == ("http://evil.example", "sk-secret-123")
+            eng._settings = good_settings                      # 设置换回 p 的地址，适配器没重建
+        eng = None
+        built.clear()
+        uses: list = []
+        real_tick = _core_tick_spy(monkeypatch, pool, uses)
+        resp = client.post("/api/w/w1/tick", json={})
+        assert resp.status_code in (200, 409), resp.text
+        if resp.status_code == 409:
+            assert resp.json() == {"detail": "endpoint_changed"}
+            assert uses == []
+        else:
+            assert built and built[0] == ("http://h.example", "sk-secret-123"), built
+            assert uses and all(url == "http://h.example" for url in uses), uses
+        del real_tick
+
+
+def _core_tick_spy(monkeypatch, pool, uses: list):
+    """记下每次 MemoryCore.tick 时引擎嵌入适配器建时的地址（DashboardEngine._built_endpoints）。"""
+    from starling.dashboard import engine as engmod
+    real = engmod.MemoryCore.tick
+
+    def _spy(self, now):
+        with pool.lease("w1", build=False) as eng:
+            built = getattr(eng, "_built_endpoints", {}).get("embedding") or {}
+            uses.append(built.get("base_url"))
+        eng = None
+        return real(self, now)
+    monkeypatch.setattr(engmod.MemoryCore, "tick", _spy)
+    return real
