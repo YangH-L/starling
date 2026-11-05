@@ -253,16 +253,28 @@ def _key_fingerprint(api_key: str | None) -> str | None:
 def endpoint_api_key(endpoint: dict, providers: dict) -> str | None:
     """一个世界 endpoint 调用时用的密钥（spec §8.3）：provider_name 非空时取 providers 里该 provider 当前
     保存的密钥，为空（客户端显式给的端点）时取服务进程的 OPENAI_API_KEY。引擎建适配器与世界详情的
-    key_set 都经这里，规则只有一处。"""
+    key_set 都经这里（引擎经 endpoint_key_from，传的是 provider 的快照），规则只有一处。"""
     name = endpoint.get("provider_name") or ""
-    if name:
-        return (providers.get(name) or {}).get("api_key")
+    return endpoint_key_from(endpoint, providers.get(name) if name else None)
+
+
+def endpoint_key_from(endpoint: dict, prov: dict | None) -> str | None:
+    """同 endpoint_api_key，但 provider 条目由调用方给（引擎给的是 dict(prov) 快照，裁定 R57；None = provider 已删掉）。"""
+    if endpoint.get("provider_name"):
+        return (prov or {}).get("api_key")
     return _service_openai_key()
 
 
 # 世界设置里 endpoint 与 _build_chat_adapter / _build_embed_adapter 读的 provider dict 同名的字段。
 _ADAPTER_KEYS = ("provider", "model", "base_url", "dim", "max_tokens", "timeout_ms",
                  "max_retries", "enable_thinking", "thinking_type")
+# 三个对话类角色的适配器在 MemoryCore 上的属性名（嵌入另走 set_embedder）。
+_ROLE_ATTR = {"extraction": "llm", "chat": "chat_llm", "consolidation": "consolidation_llm"}
+# 打开世界时核对没过的角色（裁定 R57）：适配器不建，_built_endpoints 记这个哨兵。它与任何 endpoint 都不等，所以下一次
+# 用到该角色时走「建时的 endpoint 与设置不同」那条路：重新拍快照、核对，过了才建，没过就 endpoint_changed。只读，不改。
+_REFUSED_ENDPOINT = {"refused_at_open": True}
+# _key_stale 的 snap 缺省值：自己拍一份快照。
+_FRESH = object()
 # NORM-gist 阈值里绑定层要整数的几项（ReplayScheduler.run_sleep / run_idle 的签名）。世界设置把阈值
 # 存成 double（C++ map<string,double>），所以 4.0 要还原成 4 才能传进去。
 _INT_GIST_KEYS = ("min_holders", "min_replay_count", "entity_gist_enabled")
@@ -364,11 +376,12 @@ class DashboardEngine:
         # No endpoint in the settings → {} → no api_key → None / stub, the same as
         # an unbound role today (裁定 R15: no fallback to the default world).
         # consolidation 是世界设置的第四个 endpoint（裁定 R25），与另外三个同样建、同样核对地址。
-        self.set_llm(self._endpoint_cfg("extraction"))
-        self.set_chat(self._endpoint_cfg("chat") or self._endpoint_cfg("extraction"))
-        self.set_consolidation(self._endpoint_cfg("consolidation"))          # #38-C role consumer
+        # 裁定 R57：每个角色按一份 provider 快照建，建之前对这份快照核对；没过的角色不建（_open_role）。
+        self._open_role("extraction")
+        self._open_role("chat")                       # 没绑 chat 时按抽取的 endpoint 建
+        self._open_role("consolidation")                                     # #38-C role consumer
         self.set_gist_thresholds(self._settings.get("gist_thresholds") or {})  # #38-C v2 threshold surface
-        self.rebuild_embedder(self._endpoint_cfg("embedding"), reembed=False)
+        self._open_role("embedding")
         # dogfood sub-project A (Task 3): spool ingest worker — drains this
         # world's partition (WorldContext.ingest_spool_dir; jobs written by the
         # SessionEnd hook via scripts/ingest_session.py) into remember() calls.
@@ -406,28 +419,41 @@ class DashboardEngine:
     def tenant(self) -> str:
         return self._ctx.tenant
 
-    def _endpoint_cfg(self, role: str) -> dict:
-        """世界设置里 role（extraction / embedding / chat / consolidation）的 endpoint → _build_*_adapter 读的 provider
-        dict。密钥按 provider_name 从 providers 取；provider_name 为空（客户端显式给的端点）时取服务
-        进程的 OPENAI_API_KEY（spec §8.3，与 make_openai_llm 一致）。没有 endpoint 返回 {}。
-        建适配器不发请求，所以这里不核对地址：核对在每次调用之前（_require_endpoint_unchanged），
-        地址改了的世界照样打开、照样能检视，只是用到那个端点的调用一律拒绝。"""
-        ep = self._settings.get(role)
+    def _provider_snapshot(self, ep: dict | None) -> dict | None:
+        """裁定 R57：ep 引用的 provider 条目此刻的一份拷贝（dict(prov)）；ep 不引用 provider（客户端显式给的端点、没有
+        endpoint）或 provider 已删掉时 None。POST /api/config 原地改 provider 条目（依次写种类、地址、密钥，只持
+        config_lock，不持引擎锁），所以一次建 / 重建里的地址核对、密钥指纹、适配器配置一律读这一份，不各自去读共享的
+        dict：否则核对读到旧种类、密钥读到新密钥，新密钥就按旧种类建出来，发到旧种类的默认地址。dict(...) 在 C 里持
+        GIL 一次拷完。"""
+        name = (ep or {}).get("provider_name") or ""
+        if not name:
+            return None
+        prov = self._providers.get(name)
+        return dict(prov) if prov is not None else None
+
+    def _endpoint_cfg(self, role: str, prov=_FRESH) -> dict:
+        """role（extraction / embedding / chat / consolidation）的适配器该按的 endpoint（_source_endpoint：chat 没绑定时是
+        抽取的）→ _build_*_adapter 读的 provider dict。密钥取 prov（provider 条目的快照，缺省现拍一份，见
+        _provider_snapshot）里的；provider_name 为空（客户端显式给的端点）时取服务进程的 OPENAI_API_KEY（spec §8.3，
+        与 make_openai_llm 一致）。没有 endpoint 返回 {}。这里不核对：核对在 _build_role（建之前，对同一份快照）与
+        每次调用之前（_require_endpoint_unchanged）。"""
+        ep = self._source_endpoint(role)
         if not ep:
             return {}
+        if prov is _FRESH:
+            prov = self._provider_snapshot(ep)
         cfg = {key: ep[key] for key in _ADAPTER_KEYS if key in ep}
-        key = endpoint_api_key(ep, self._providers)
+        key = endpoint_key_from(ep, prov)
         if key:
             cfg["api_key"] = key
         return cfg
 
-    def _check_endpoint(self, ep: dict | None, role: str) -> None:
-        """一个 endpoint（provider_name 非空时）对 provider 此刻的种类与 base_url 做 C++ 核对
-        （world_require_endpoint_unchanged，裁定 R51）：provider 已被删掉、或种类与地址任一不同就抛
-        WorldStoreError("endpoint_changed")。规则全在 C++，这里只取 provider 当前的值。"""
+    def _check_endpoint(self, ep: dict | None, role: str, prov: dict | None) -> None:
+        """一个 endpoint（provider_name 非空时）对 provider 条目的快照 prov（_provider_snapshot；None = provider 已删掉）
+        的种类与 base_url 做 C++ 核对（world_require_endpoint_unchanged，裁定 R51）：provider 不在、或种类与地址任一
+        不同就抛 WorldStoreError("endpoint_changed")。比较全在 C++，这里只把快照归一成 {provider, base_url}。"""
         if not ep or not ep.get("provider_name"):
             return
-        prov = self._providers.get(ep["provider_name"])
         current = provider_endpoint(prov) if prov is not None else None
         _core.world_require_endpoint_unchanged(ep, current, role)
 
@@ -437,69 +463,105 @@ class DashboardEngine:
             return self._settings.get("chat") or self._settings.get("extraction")
         return self._settings.get(role)
 
-    def _require_endpoint_unchanged(self, role: str) -> None:
-        """用到 role 的适配器之前调（持 self._lock）。裁定 R41：核对的是这个适配器建时的 endpoint，不是 _settings
-        里的。两者不同（设置被换了、适配器没重建）时，先按 _settings 的 endpoint 核对，过了就按它重建适配器，
-        然后照常往下走；没过就 endpoint_changed，不重建。两者相同时只核对一次。适配器不是从设置建的（测试直接
-        装的替身，见 llm 的 setter）时按 _settings 核对，与之前相同。调用方在这之后再读适配器（可能刚换过）。"""
-        ep = self._source_endpoint(role)
-        if role in self._built_endpoints and self._built_endpoints[role] != ep:
-            self._check_endpoint(ep, role)            # 新设置的地址也得对，才按它重建
-            self._rebuild_role(role)
-            return
-        self._check_endpoint(self._built_endpoints.get(role, ep), role)
-        # 裁定 R52（spec §8.3「调用时用该 provider 当前保存的密钥」）：地址没变，但密钥换了或删了，就按当前密钥重建。
-        # 删了密钥时重建出来的是 None（嵌入是占位），调用方照常报 llm_not_configured。
-        if self._key_stale(role):
-            self._rebuild_role(role)
+    def _require_endpoint_unchanged(self, role: str, prov=_FRESH) -> None:
+        """用到 role 的适配器之前调（持 self._lock）。prov 是调用方已拍的 provider 快照（缺省现拍一份）；下面的核对、
+        密钥指纹、重建都用这一份（裁定 R57）。
 
-    def _key_stale(self, role: str) -> bool:
-        """role 的适配器建时的密钥指纹与 provider 此刻的密钥指纹不同（裁定 R52）。不是从设置建的适配器（测试替身）
-        没有记录，永不算过期。"""
+        裁定 R41：核对的是这个适配器建时的 endpoint，不是 _settings 里的。两者不同（设置被换了、适配器没重建，或打开
+        世界时核对没过、没建）时按 _settings 的 endpoint 重建（_build_role：先对快照核对，过了才建）；没过就
+        endpoint_changed，不重建。两者相同时核对一次。适配器不是从设置建的（测试直接装的替身，见 llm 的 setter）时按
+        _settings 核对。调用方在这之后再读适配器（可能刚换过）。"""
+        ep = self._source_endpoint(role)
+        if prov is _FRESH:
+            prov = self._provider_snapshot(ep)
+        if role in self._built_endpoints and self._built_endpoints[role] != ep:
+            self._build_role(role, prov)             # 新设置的地址也得对，才按它重建
+            return
+        self._check_endpoint(ep, role, prov)
+        # 裁定 R52（spec §8.3「调用时用该 provider 当前保存的密钥」）：地址没变，但密钥换了或删了，就按快照里的密钥重建。
+        # 删了密钥时重建出来的是 None（嵌入是占位），调用方照常报 llm_not_configured。
+        if self._key_stale(role, prov):
+            self._build_role(role, prov)
+
+    def _key_stale(self, role: str, prov=_FRESH) -> bool:
+        """role 的适配器建时的密钥指纹与 provider 快照 prov（缺省现拍一份）里密钥的指纹不同（裁定 R52）。不是从设置建的
+        适配器（测试替身）没有记录，永不算过期。"""
         if role not in self._built_key_fps:
             return False
         ep = self._source_endpoint(role)
         # 与 _endpoint_cfg 同一取法：没有 endpoint 的角色不带密钥（不取服务进程的 OPENAI_API_KEY）。
-        current = endpoint_api_key(ep, self._providers) if ep else None
+        if not ep:
+            current = None
+        else:
+            if prov is _FRESH:
+                prov = self._provider_snapshot(ep)
+            current = endpoint_key_from(ep, prov)
         return self._built_key_fps[role] != _key_fingerprint(current)
 
-    def _rebuild_role(self, role: str) -> None:
-        """按 _settings 重建 role 的适配器（持 self._lock，地址已核对过）。chat 跟着重建：它可能回退到抽取的
-        endpoint。嵌入不在这里重嵌入：重嵌入只在设置主动换嵌入时做（reload_adapters），用到嵌入的调用只需要
-        一个按当前设置建的适配器。"""
+    def _build_role(self, role: str, prov=_FRESH, *, reembed: bool = False) -> str | None:
+        """按 _settings 建 / 重建 role 的适配器（持 self._lock）。全部建法（构造、用到时重建、reload_adapters、
+        apply_world_settings、重嵌入之前）都经这里（裁定 R57）：provider 条目只拍一份快照（prov，缺省现拍），适配器
+        配置与密钥指纹都从它来，紧挨着建适配器之前再对这同一份快照做一次 C++ 核对，没过就 endpoint_changed、什么都
+        不换。chat 没绑定时按抽取的 endpoint 建。reembed 只对嵌入有意义（rebuild_embedder），返回它的提示。"""
+        ep = self._source_endpoint(role)
+        if prov is _FRESH:
+            prov = self._provider_snapshot(ep)
+        cfg = self._endpoint_cfg(role, prov)
+        self._check_endpoint(ep, role, prov)
         if role == "extraction":
-            self.set_llm(self._endpoint_cfg("extraction"))
+            self.set_llm(cfg)
         elif role == "chat":
-            self.set_chat(self._endpoint_cfg("chat") or self._endpoint_cfg("extraction"))
+            self.set_chat(cfg)
         elif role == "consolidation":
-            self.set_consolidation(self._endpoint_cfg("consolidation"))
-        elif role == "embedding":
-            self.rebuild_embedder(self._endpoint_cfg("embedding"), reembed=False)
+            self.set_consolidation(cfg)
+        else:
+            return self.rebuild_embedder(cfg, reembed=reembed)
+        return None
+
+    def _open_role(self, role: str) -> None:
+        """构造时建 role 的适配器（_build_role）。核对没过（provider 在世界关着时换了种类或地址、或被删掉）就不建：
+        世界照样打开、照样能检视，抽取类角色为 None、嵌入用占位，建时的 endpoint 记成 _REFUSED_ENDPOINT，下一次用到
+        时按 _settings 重新核对（还是没过就 endpoint_changed，tick 只跳过嵌入阶段）。"""
+        try:
+            self._build_role(role)
+        except _core.WorldStoreError as exc:
+            if _core.world_store_error_code(exc) != "endpoint_changed":
+                raise
+            if role == "embedding":
+                self._embedder_live = False
+                self._core.set_embedder(_core.StubEmbeddingAdapter(8))
+            else:
+                setattr(self._core, _ROLE_ATTR[role], None)
+            self._built_endpoints[role] = _REFUSED_ENDPOINT
+            self._built_key_fps[role] = None
 
     def _prepare_role(self, role: str):
         """用到 role（extraction / chat / consolidation）的世界适配器之前调（持 self._lock），返回此刻该用的适配器
-        （可能为 None：没有可用的密钥）。
+        （可能为 None：没有可用的密钥）。provider 快照只拍一份，判断与核对、重建都用它（裁定 R57）。
 
         - 适配器建时的 endpoint 与 _settings 的不同（设置换了、没重建）：不论现在的适配器是不是 None，都先按
           _settings 核对，过了就重建（裁定 R41；修复轮 3 小项 2：从没绑定换成带密钥的 endpoint 时，下一次用到就
           建出来，而不是报 llm_not_configured）。
         - 相同：有适配器才核对（没有适配器就没有密钥会被发出去，照旧由调用方报 llm_not_configured）。
         - 核对失败抛 endpoint_changed，不重建。"""
-        attr = {"extraction": "llm", "chat": "chat_llm", "consolidation": "consolidation_llm"}[role]
-        stale = role in self._built_endpoints and \
-            self._built_endpoints[role] != self._source_endpoint(role)
+        attr = _ROLE_ATTR[role]
+        ep = self._source_endpoint(role)
+        prov = self._provider_snapshot(ep)
+        stale = role in self._built_endpoints and self._built_endpoints[role] != ep
         # 密钥指纹变了（裁定 R52）也要走一遍：没有适配器、provider 刚加上密钥时，按新密钥建出来。
-        if stale or getattr(self._core, attr) is not None or self._key_stale(role):
-            self._require_endpoint_unchanged(role)
+        if stale or getattr(self._core, attr) is not None or self._key_stale(role, prov):
+            self._require_endpoint_unchanged(role, prov)
         return getattr(self._core, attr)
 
     def _require_embedding_unchanged(self) -> None:
         """用到嵌入的调用（召回、tick、工作集、检索规划、对话的召回段）之前调。占位嵌入（没有密钥）不发
-        请求，不核对；但设置已换成另一个 endpoint 时照样按新设置核对并重建（裁定 R41）。"""
+        请求，不核对；但设置已换成另一个 endpoint 时照样按新设置核对并重建（裁定 R41）。快照只拍一份（裁定 R57）。"""
+        ep = self._settings.get("embedding")
+        prov = self._provider_snapshot(ep)
         stale = ("embedding" in self._built_endpoints
-                 and self._built_endpoints["embedding"] != self._settings.get("embedding"))
-        if self._embedder_live or stale or self._key_stale("embedding"):
-            self._require_endpoint_unchanged("embedding")
+                 and self._built_endpoints["embedding"] != ep)
+        if self._embedder_live or stale or self._key_stale("embedding", prov):
+            self._require_endpoint_unchanged("embedding", prov)
 
     def set_world_settings(self, settings: dict) -> None:
         """WorldPool.sync_default_settings 之后换上新合并的设置（默认世界）。只换引用；适配器由
@@ -510,28 +572,25 @@ class DashboardEngine:
 
     def reload_adapters(self, roles, *, gist: bool = False) -> list[str]:
         """按当前设置（self._settings）与 provider 注册表重建 roles 里的适配器（extraction / chat /
-        consolidation / embedding），gist 为真时重新装上阈值；与构造时（_init_core）同一套取法。POST
+        consolidation / embedding），gist 为真时重新装上阈值；与构造时（_init_core）同一套取法（_build_role）。POST
         /api/config（按改动的角色，含只改了密钥的 provider）与 PUT /api/worlds/{name}/settings
         （apply_world_settings，按改动的段）都经这里。返回重嵌入的提示（嵌入 provider 拒绝时，非致命）。"""
         roles = set(roles)
         warnings: list[str] = []
         with self._lock:
+            # 裁定 R57：每个角色只拍一份 provider 快照，下面的核对与建都用它。
+            snaps = {role: self._provider_snapshot(self._source_endpoint(role)) for role in roles}
             # 裁定 R38：从设置重建的每个适配器先核对它将按哪个 endpoint 建（_source_endpoint；chat 没绑定时是
             # 抽取的），任何一个地址改了就抛 endpoint_changed，什么都不换。建适配器本身不发请求，但嵌入一换就会
             # 重嵌入、用这个密钥发出去。
             for role in roles:
-                self._check_endpoint(self._source_endpoint(role), role)
-            if "extraction" in roles:
-                self.set_llm(self._endpoint_cfg("extraction"))
-            if "chat" in roles:
-                # 没绑 chat 的世界用抽取的 endpoint 对话（与构造时一致）。
-                self.set_chat(self._endpoint_cfg("chat") or self._endpoint_cfg("extraction"))
-            if "consolidation" in roles:
-                self.set_consolidation(self._endpoint_cfg("consolidation"))
-            if "embedding" in roles:
-                warn = self.rebuild_embedder(self._endpoint_cfg("embedding"))
-                if warn:
-                    warnings.append(warn)
+                self._check_endpoint(self._source_endpoint(role), role, snaps[role])
+            # 没绑 chat 的世界用抽取的 endpoint 对话（与构造时一致，_source_endpoint）。
+            for role in ("extraction", "chat", "consolidation", "embedding"):
+                if role in roles:
+                    warn = self._build_role(role, snaps[role], reembed=True)
+                    if warn:
+                        warnings.append(warn)
             if gist:
                 self.set_gist_thresholds(self._settings.get("gist_thresholds") or {})
         return warnings
@@ -811,8 +870,9 @@ class DashboardEngine:
         取代旧 _role_override('llm', …) 的全局 slot 换入换出——拆锁后换全局
         slot 会被并发轮/后台 tick 读到错误模型(同 _resolve_chat)。"""
         if provider:
-            cfg = self._providers.get(provider)
-            if not cfg or not cfg.get("api_key"):
+            # 裁定 R57：一份快照，种类、地址、密钥出自同一时刻（POST /api/config 原地改这个条目）。
+            cfg = dict(self._providers.get(provider) or {})
+            if not cfg.get("api_key"):
                 raise _LLMNotConfigured(
                     f"selected provider '{provider}' is not configured")
             return _build_chat_adapter(cfg)
@@ -926,8 +986,9 @@ class DashboardEngine:
         self._prepare_role("extraction")
         self._require_embedding_unchanged()
         if provider:
-            cfg = self._providers.get(provider)
-            if not cfg or not cfg.get("api_key"):
+            # 裁定 R57：一份快照，种类、地址、密钥出自同一时刻（POST /api/config 原地改这个条目）。
+            cfg = dict(self._providers.get(provider) or {})
+            if not cfg.get("api_key"):
                 raise _LLMNotConfigured(
                     f"selected provider '{provider}' is not configured")
             return _build_chat_adapter(cfg)

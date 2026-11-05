@@ -142,7 +142,7 @@ def test_world_errors_map_to_http_codes(client, monkeypatch):
 
     from starling import _core
 
-    def changed(self, role):
+    def changed(self, role, *_snapshot):
         _core.world_require_endpoint_unchanged(
             {"provider_name": "p", "provider": "openai", "base_url": "https://old.example"},
             {"provider": "openai", "base_url": "https://new.example"}, role)
@@ -1226,6 +1226,73 @@ def test_removed_key_makes_an_open_world_refuse_like_an_unconfigured_role(tmp_pa
         with _pool(client).lease("w1", build=False) as eng:
             assert eng.llm is None
         eng = None
+
+
+def _mutate_inside_the_check(monkeypatch, provider: dict):
+    """把引擎核对用的 provider_endpoint 包一层：第一次调用先按传进来的条目算出（旧的）身份，再原地改共享的 provider
+    条目（种类 → anthropic、密钥 → sk-new，同 POST /api/config 的 _merge_provider 先写种类后写密钥），最后返回旧身份。
+    就是审查 N-1 的交错：核对读到旧种类、放行，保存随后改了种类与密钥，之后再读密钥就读到新的。"""
+    import starling.dashboard.engine as engmod
+    real = engmod.provider_endpoint
+    fired: list = []
+
+    def _racing(prov):
+        out = real(prov)
+        if not fired:
+            fired.append(True)
+            provider["provider"] = "anthropic"
+            provider["api_key"] = "sk-new"
+        return out
+    monkeypatch.setattr(engmod, "provider_endpoint", _racing)
+    return fired
+
+
+def test_config_save_racing_a_key_rotation_rebuild_never_pairs_the_old_kind_with_the_new_key(
+        tmp_path, monkeypatch):
+    """审查 N-1（裁定 R57）：w1 继承 p，适配器按 sk-old 建。先只换 p 的密钥（sk-mid），w1 的下一次用到要按新密钥重建
+    （R52）。这次重建的核对与读密钥之间，POST /api/config 把 p 改成 anthropic、密钥 sk-new。以前核对读旧种类放行、重建
+    读到 sk-new，按世界记的 openai 建出 (openai, sk-new)：Anthropic 的密钥发到 OpenAI 兼容的地址。现在一次重建只读一份
+    provider 快照：要么整份是改之前的（按 openai + sk-mid 建），要么整份是改之后的（endpoint_changed），从不混搭。快照在
+    保存之前拍的，所以这一次照常完成；下一次用到 p 时核对出种类变了，endpoint_changed。"""
+    built: list = []
+    cfg, client = _recording_client(tmp_path, monkeypatch, built,
+                                    {"provider": "openai", "model": "m1",
+                                     "base_url": "http://h.example", "api_key": "sk-old"})
+    with client:
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+        resp = client.post("/api/config", json={"providers": {"p": {"api_key": "sk-mid"}}})
+        assert resp.status_code == 200, resp.text
+        built.clear()                                   # 默认世界的热换已在上面完成
+        fired = _mutate_inside_the_check(monkeypatch, cfg.providers["p"])
+        resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 2"})
+        assert fired, "the provider entry was never mutated mid-check"
+        assert resp.status_code in (200, 409), resp.text
+        assert ("openai", "http://h.example", "sk-new") not in built, built
+        assert all(key != "sk-new" for _kind, _url, key in built), built
+        assert all(build == ("openai", "http://h.example", "sk-mid") for build in built), built
+        resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 3"})
+        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), resp.text
+        assert all(key != "sk-new" for _kind, _url, key in built), built
+
+
+def test_config_save_racing_a_settings_reload_builds_from_one_snapshot(tmp_path, monkeypatch):
+    """裁定 R57 的另一条建法（reload_adapters，PUT 设置 / POST /api/config / 重新确认都经它）：核对与建适配器读同一份
+    快照。核对途中 provider 被改成 anthropic + sk-new，建出来的仍是快照里的 openai + sk-old，不是 (openai, sk-new)。"""
+    built: list = []
+    cfg, client = _recording_client(tmp_path, monkeypatch, built,
+                                    {"provider": "openai", "model": "m1",
+                                     "base_url": "http://h.example", "api_key": "sk-old"})
+    with client:
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        with _pool(client).lease("w1") as eng:
+            built.clear()
+            fired = _mutate_inside_the_check(monkeypatch, cfg.providers["p"])
+            eng.reload_adapters({"extraction"})
+            assert fired
+        eng = None
+        assert built and all(key != "sk-new" for _kind, _url, key in built), built
+        assert ("openai", "http://h.example", "sk-old") in built, built
 
 
 # ───────────────────────── 裁定 R53：重新确认端点 ─────────────────────────
