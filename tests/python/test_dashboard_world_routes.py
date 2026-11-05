@@ -1226,3 +1226,60 @@ def test_removed_key_makes_an_open_world_refuse_like_an_unconfigured_role(tmp_pa
         with _pool(client).lease("w1", build=False) as eng:
             assert eng.llm is None
         eng = None
+
+
+# ───────────────────────── 裁定 R53：重新确认端点 ─────────────────────────
+
+def test_reconfirm_endpoints_repairs_a_world_after_a_provider_address_change(tmp_path, monkeypatch):
+    """p 的 base_url 改了：w1 remember → 409；POST /settings/reconfirm → 200（详情，不含密钥）；remember → 200，适配器
+    建在 p 的新地址。默认世界拒绝（invalid_settings，同 PUT 改它的 endpoint）。"""
+    built: list = []
+    cfg, client = _recording_client(tmp_path, monkeypatch, built,
+                                    {"provider": "openai", "model": "m1",
+                                     "base_url": "http://h.example", "api_key": "sk-secret-123"})
+    with client:
+        pool = _pool(client)
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+        resp = client.post("/api/config", json={"providers": {"p": {"base_url": "http://h2.example"}}})
+        assert resp.status_code == 200, resp.text
+        resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 2"})
+        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"})
+        built.clear()
+        resp = client.post("/api/worlds/w1/settings/reconfirm")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["name"] == "w1"
+        assert body["settings"]["extraction"]["provider_name"] == "p"
+        assert body["settings"]["extraction"]["base_url"] == "http://h2.example"
+        assert body["settings"]["extraction"]["key_set"] is True
+        assert "sk-" not in resp.text and "api_key" not in resp.text
+        assert pool.registry.get("w1")["settings"]["extraction"]["base_url"] == "http://h2.example"
+        assert "api_key" not in str(pool.registry.get("w1")["settings"])
+        resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 3"})
+        assert resp.status_code == 200, resp.text
+        assert built and all(url == "http://h2.example" for _kind, url, _key in built), built
+        resp = client.post("/api/worlds/default/settings/reconfirm")
+        assert (resp.status_code, resp.json()) == (400, {"detail": "invalid_settings"})
+        resp = client.post("/api/worlds/nope/settings/reconfirm")
+        assert (resp.status_code, resp.json()) == (404, {"detail": "world_not_found"})
+
+
+def test_reconfirm_unbinds_a_role_whose_provider_was_deleted(tmp_path, monkeypatch):
+    built: list = []
+    cfg, client = _recording_client(tmp_path, monkeypatch, built,
+                                    {"provider": "openai", "model": "m1",
+                                     "base_url": "http://h.example", "api_key": "sk-secret-123"})
+    with client:
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        # 先开着 w1（适配器带着 p 的密钥），再删 p：下一次用到时核对出 provider 不在了。
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+        assert client.delete("/api/config/provider/p").status_code == 200
+        resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 2"})
+        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"})
+        assert _pool(client).registry.get("w1")["settings"]["extraction"]["provider_name"] == "p"
+        resp = client.post("/api/worlds/w1/settings/reconfirm")
+        assert resp.status_code == 200, resp.text
+        assert "extraction" not in resp.json()["settings"]
+        resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth"})
+        assert (resp.status_code, resp.json()) == (409, {"detail": "llm_not_configured"})

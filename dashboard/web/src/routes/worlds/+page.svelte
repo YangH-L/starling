@@ -212,6 +212,33 @@
 		}
 	}
 
+	// ── 重新确认端点(裁定 R53,ConfirmDialog) ─────────────────────────────
+	// 供应商的地址或种类改了之后,继承它的世界一律 endpoint_changed;这一步把默认配置里各供应商此刻的地址
+	// 复制进该世界引用它们的角色(供应商已删除的角色解绑)。默认世界的端点跟着配置走,不给入口。
+	let reconfirmOpen = $state(false);
+	let reconfirmTarget = $state('');
+	let reconfirming = $state<string | null>(null);
+
+	function askReconfirm(name: string) {
+		reconfirmTarget = name;
+		reconfirmOpen = true;
+	}
+
+	async function doReconfirm() {
+		const name = reconfirmTarget;
+		if (!name || reconfirming !== null) return;
+		reconfirming = name;
+		try {
+			await worldsApi.reconfirm(name);
+			toast.success(`已为「${name}」重新确认端点`);
+			await q.refetch();
+		} catch (e) {
+			toast.error(errText(e));
+		} finally {
+			reconfirming = null;
+		}
+	}
+
 	// ── 删除(抽屉 + 手输世界名) ─────────────────────────────────────────
 	let deleteOpen = $state(false);
 	let deleteTarget = $state('');
@@ -500,6 +527,15 @@
 							onclick={() => askPurge(w.name)}>清理归档</Button
 						>
 					{/if}
+					{#if w.name !== defaultName}
+						<Button
+							variant="secondary"
+							aria-label={`重新确认端点 ${w.name}`}
+							loading={reconfirming === w.name}
+							disabled={reconfirming !== null || worldBusy}
+							onclick={() => askReconfirm(w.name)}>重新确认端点</Button
+						>
+					{/if}
 					{#if isDeletable(w)}
 						<Button
 							variant="secondary"
@@ -723,6 +759,14 @@
 	confirmLabel="确认删除"
 	danger
 	onconfirm={doRemoveSnap}
+/>
+
+<ConfirmDialog
+	bind:open={reconfirmOpen}
+	title={`重新确认「${reconfirmTarget}」的端点？`}
+	description={`将把默认配置里各供应商当前的地址复制到世界「${reconfirmTarget}」引用它们的角色上；已删除的供应商对应的角色会解绑。客户端单独指定的端点不受影响。`}
+	confirmLabel="确认"
+	onconfirm={doReconfirm}
 />
 
 <WorldRollbackDrawer

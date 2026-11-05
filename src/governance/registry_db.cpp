@@ -460,6 +460,30 @@ std::string RegistryDb::update_world_settings(
     return text;
 }
 
+std::string RegistryDb::reconfirm_world_endpoints(
+    const std::string& name, const std::map<std::string, EndpointSettings>& current) {
+    const std::scoped_lock lock(impl_->mutex);
+    const auto rec = impl_->require(name);
+    WorldSettings settings = settings_from_json(rec.settings_json);
+    for (auto* role : {&settings.extraction, &settings.embedding, &settings.chat,
+                       &settings.consolidation,}) {
+        if (!role->has_value() || (*role)->provider_name.empty()) { continue; }
+        const std::string provider_name = (*role)->provider_name;
+        const auto found = current.find(provider_name);
+        if (found == current.end()) {
+            role->reset();                       // provider 已被删掉：解绑
+            continue;
+        }
+        EndpointSettings fresh = found->second;
+        fresh.provider_name = provider_name;     // 名字保持不变
+        *role = std::move(fresh);
+    }
+    settings = merge_settings(settings, "{}", rec.read_only);   // 只读世界的后台恒关
+    const auto text = settings_to_json(settings);
+    impl_->set_settings(name, text);
+    return text;
+}
+
 std::string RegistryDb::replace_world_sections(const std::string& name,
                                                const std::string& sections_json) {
     const std::scoped_lock lock(impl_->mutex);

@@ -102,7 +102,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from starling import _core
-from starling.dashboard.config import provider_endpoints
+from starling.dashboard.config import provider_endpoint_settings, provider_endpoints
 from starling.dashboard.engine import (DashboardEngine, SessionSnapshotDeferred,
                                        WorldContext)
 
@@ -1038,6 +1038,32 @@ class WorldPool:
             # 裁定 R40：合并、核对继承来的 endpoint、写都在 C++ 的同一次持锁内；endpoint_changed 时什么都不写。
             merged = reg.update_settings(world, overrides,
                                          provider_endpoints=self._provider_endpoints())
+            settings = _core.world_effective_settings(merged)
+            with self._lock:
+                engine = self._engines.get(world)
+            warnings: list[str] = []
+            if engine is not None:
+                warnings = engine.apply_world_settings(settings)
+            engine = None
+        return settings, warnings
+
+    def reconfirm_endpoints(self, world: str) -> tuple[dict, list[str]]:
+        """重新确认端点（裁定 R53）：把 starling.json 里各 provider 此刻的 endpoint（不含密钥，与 world_settings 同一套
+        字段规则）交给 C++ reconfirm_world_endpoints，世界里引用某个 provider 的角色整段换成它此刻的 endpoint，
+        provider 已被删掉的角色解绑。返回 (实际生效的完整设置, 重嵌入提示)。开着的世界按变了的角色热换适配器
+        （apply_world_settings，与 PUT 设置同一条路，裁定 R35）。
+
+        默认世界拒绝，码与 PUT 改它的 endpoint 相同（invalid_settings）：它的端点归 config，同步时自动跟上。
+        持世界锁，理由同 update_settings。"""
+        reg = self._require_registry()
+        self._record(world)                           # world_not_found
+        if world == reg.default_world():
+            raise WorldSwitchError(
+                "invalid_settings", "the default world's endpoints come from the dashboard config")
+        current = {name: provider_endpoint_settings(name, prov or {})
+                   for name, prov in list(self._config.providers.items())}
+        with self._world_lock(world):
+            merged = reg.reconfirm_endpoints(world, current)
             settings = _core.world_effective_settings(merged)
             with self._lock:
                 engine = self._engines.get(world)

@@ -247,6 +247,10 @@ export const worldsApi = {
 	// 部分设置,没给的键保持不变;默认世界只接受 background 段。
 	updateSettings: (name: string, settings: WorldSettings) =>
 		api.put<WorldSettings>(`${base(name)}/settings`, settings, { timeoutMs: 120_000 }),
+	// 重新确认端点(裁定 R53):把各供应商此刻的地址复制进这个世界引用它们的角色,回世界详情。
+	// 开着的世界要热换适配器、等世界锁,与 updateSettings 一样放宽到 120s。
+	reconfirm: (name: string) =>
+		api.post<WorldRow>(`${base(name)}/settings/reconfirm`, {}, { timeoutMs: 120_000 }),
 	// 关闭要等该世界的在途请求结束并停线程。
 	close: (name: string) =>
 		api.post<{ closed: string }>(`${base(name)}/close`, {}, { timeoutMs: 60_000 }),
@@ -293,7 +297,7 @@ const ERROR_MESSAGES: Record<string, string> = {
 	worlds_unavailable: '世界注册表暂时不可用，请稍后再试',
 	world_busy: '世界正在关闭或恢复，请稍后再试',
 	world_not_initialized: '这个世界的库文件不见了',
-	endpoint_changed: '供应商地址改了，这个世界需要重新确认端点',
+	endpoint_changed: '供应商地址改了，到「世界」页对这个世界点「重新确认端点」',
 	labels_immutable: '标签建好后不能改',
 	invalid_settings: '设置不合法',
 	world_protected: '默认世界不能删除',

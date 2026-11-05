@@ -76,7 +76,7 @@ public:
 
     [[nodiscard]] std::string default_world() const;
     [[nodiscard]] WorldRecord get(const std::string& name) const;   // world_not_found
-    [[nodiscard]] WorldPage list(const WorldQuery& query) const;    // 按 created_at 降序
+    [[nodiscard]] WorldPage list(const WorldQuery& query) const;    // 顺序见 registry_db.cpp list
     // invalid_world_name / world_exists。建 worlds/<dir_id>/ 与 snapshots/，不建库文件。
     WorldRecord create(const std::string& name, const std::string& label,
                        const std::map<std::string, std::string>& labels,
@@ -105,6 +105,14 @@ public:
     std::string update_world_settings(
         const std::string& name, const std::string& overrides_json,
         const std::optional<ProviderEndpoints>& provider_endpoints = std::nullopt);
+    // 重新确认端点（裁定 R53）：current 是 {provider 名: 该 provider 此刻的 endpoint}（与 config.world_settings()
+    // 建 endpoint 同一套字段，不含密钥）。在一次持锁内，世界设置里每个 provider_name 非空的角色（extraction /
+    // embedding / chat / consolidation）整段换成 current 里同名 provider 的 endpoint，provider_name 保持不变；
+    // current 里没有这个名字（provider 已被删掉）的角色删掉（null，与默认世界删 provider 时一致）。provider_name
+    // 为空的角色（客户端显式给的）与没设的角色不动。只读世界照样强制关后台。返回新的 settings_json。
+    // world_not_found。不核对地址（这一步就是认下 provider 此刻的地址）；默认世界由调用方拒绝（它的端点归 config）。
+    std::string reconfirm_world_endpoints(const std::string& name,
+                                          const std::map<std::string, EndpointSettings>& current);
     // 权威来源同步（裁定 R27）：world_settings.hpp replace_sections（出现的段整段替换、background 逐叶合并、
     // null 清除），读—替换—写在一次持锁内。只读世界同样强制关后台。返回新的 settings_json。world_not_found；
     // sections 非法时什么都不写。

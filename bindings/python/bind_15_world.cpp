@@ -224,6 +224,28 @@ void bind_15_world(pybind11::module_& m) {
                  }
                  return to_py(merged);
              }, py::arg("name"), py::arg("overrides"), py::arg("provider_endpoints") = py::none())
+        // 重新确认端点（裁定 R53）：current 是 {provider 名: endpoint dict（不含密钥，config.provider_endpoint_settings）}，
+        // 每个 dict 经 C++ settings_from_json 的同一套字段规则解析（带 api_key 等未知键 → invalid_settings）。
+        // 替换规则全在 C++ RegistryDb::reconfirm_world_endpoints。返回新的设置 dict。
+        .def("reconfirm_endpoints",
+             [](gov::RegistryDb& reg, const std::string& name, const py::dict& current) {
+                 std::map<std::string, gov::EndpointSettings> endpoints;
+                 for (const auto& [provider, endpoint] : current) {
+                     const auto parsed = gov::settings_from_json(
+                         from_py(py::dict("extraction"_a = endpoint)));
+                     if (!parsed.extraction) {
+                         throw gov::WorldStoreError("invalid_settings",
+                                                    "provider endpoint must be an object");
+                     }
+                     endpoints.emplace(provider.cast<std::string>(), *parsed.extraction);
+                 }
+                 std::string text;
+                 {
+                     const py::gil_scoped_release release;
+                     text = reg.reconfirm_world_endpoints(name, endpoints);
+                 }
+                 return to_py(text);
+             }, py::arg("name"), py::arg("current"))
         // 权威来源同步（裁定 R27）：出现的段整段替换、background 逐叶合并、null 清除。返回新的设置 dict。
         .def("replace_settings_sections",
              [](gov::RegistryDb& reg, const std::string& name, const py::object& sections) {

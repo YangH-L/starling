@@ -28,6 +28,7 @@ const rollback = vi.fn();
 const purgeArchives = vi.fn();
 const setAutoSnapshot = vi.fn();
 const listSessions = vi.fn();
+const reconfirm = vi.fn();
 vi.mock('$lib/worlds', async (orig) => {
 	const real = await orig<typeof import('$lib/worlds')>();
 	return {
@@ -43,7 +44,8 @@ vi.mock('$lib/worlds', async (orig) => {
 			rollback: (...a: unknown[]) => rollback(...a),
 			purgeArchives: (...a: unknown[]) => purgeArchives(...a),
 			setAutoSnapshot: (...a: unknown[]) => setAutoSnapshot(...a),
-			listSessions: (...a: unknown[]) => listSessions(...a)
+			listSessions: (...a: unknown[]) => listSessions(...a),
+			reconfirm: (...a: unknown[]) => reconfirm(...a)
 		}
 	};
 });
@@ -1217,5 +1219,55 @@ describe('/worlds 自动快照失败提示', () => {
 		const { container } = render(Worlds);
 		await settle();
 		expect(container.textContent).not.toContain('自动快照失败');
+	});
+});
+
+describe('/worlds 重新确认端点（裁定 R53）', () => {
+	beforeEach(() => {
+		list.mockReset().mockResolvedValue(DATA);
+		detail.mockReset().mockResolvedValue(DEFAULT_DETAIL);
+		reconfirm.mockReset().mockResolvedValue({ ...DATA.worlds[1] });
+		toastError.mockReset();
+		toastSuccess.mockReset();
+		noteDefaultWorld('default');
+	});
+
+	const rowButton = (label: string) =>
+		[...document.body.querySelectorAll('button')].find(
+			(b) => b.getAttribute('aria-label') === label
+		) as HTMLButtonElement | undefined;
+
+	it('非默认世界有按钮，默认世界没有', async () => {
+		render(Worlds);
+		await settle();
+		expect(rowButton('重新确认端点 sim-1')).toBeTruthy();
+		expect(rowButton('重新确认端点 default')).toBeUndefined();
+	});
+
+	it('经确认框点名世界、说明复制默认配置里的供应商地址，确认后才调接口并刷新', async () => {
+		render(Worlds);
+		await settle();
+		await fireEvent.click(rowButton('重新确认端点 sim-1')!);
+		await settle();
+		expect(reconfirm).not.toHaveBeenCalled();
+		expect(document.body.textContent).toContain('重新确认「sim-1」的端点？');
+		expect(document.body.textContent).toContain('默认配置里各供应商当前的地址');
+		const calls = list.mock.calls.length;
+		await fireEvent.click(inBody('确认')!);
+		await settle();
+		expect(reconfirm).toHaveBeenCalledWith('sim-1');
+		expect(toastSuccess).toHaveBeenCalledWith('已为「sim-1」重新确认端点');
+		expect(list.mock.calls.length).toBeGreaterThan(calls);
+	});
+
+	it('失败时给中文提示', async () => {
+		reconfirm.mockRejectedValue(apiErr(404, 'world_not_found'));
+		render(Worlds);
+		await settle();
+		await fireEvent.click(rowButton('重新确认端点 sim-1')!);
+		await settle();
+		await fireEvent.click(inBody('确认')!);
+		await settle();
+		expect(toastError).toHaveBeenCalledWith('世界不存在');
 	});
 });

@@ -463,6 +463,47 @@ TEST(WorldSettingsCompose, InheritedEndpointRefusedWhenOnlyTheProviderKindChange
     EXPECT_EQ(settings_from_json(reg.get("w1").settings_json).extraction->model, "m3");
 }
 
+// 裁定 R53：重新确认端点。provider_name 非空的角色整段换成 provider 此刻的 endpoint（名字不变），provider 已被删掉的
+// 角色变成 null；客户端显式给的端点与没设的角色不动；注册表里不会有密钥。
+TEST(WorldSettingsCompose, ReconfirmEndpointsCopiesTheProvidersCurrentEndpoint) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    reg.update_world_settings(
+        "default",
+        R"({"extraction":{"provider":"openai","provider_name":"p","base_url":"http://h",)"
+        R"("model":"m1","max_tokens":1,"timeout_ms":1000},)"
+        R"("embedding":{"provider":"openai","provider_name":"gone","base_url":"http://g",)"
+        R"("model":"e1","dim":8,"max_tokens":1,"timeout_ms":1000},)"
+        R"("chat":{"provider":"openai","provider_name":"","base_url":"http://mine",)"
+        R"("model":"c1","max_tokens":1,"timeout_ms":1000}})");
+    reg.create_world("w1", "", {}, "", kNow);
+
+    EndpointSettings moved;
+    moved.provider = "anthropic";
+    moved.provider_name = "ignored";             // 名字以世界里记的为准
+    moved.base_url = "";
+    moved.model = "m2";
+    const std::map<std::string, EndpointSettings> current{{"p", moved}};
+    const auto out = settings_from_json(reg.reconfirm_world_endpoints("w1", current));
+    ASSERT_TRUE(out.extraction.has_value());
+    EXPECT_EQ(out.extraction->provider_name, "p");
+    EXPECT_EQ(out.extraction->provider, "anthropic");
+    EXPECT_EQ(out.extraction->base_url, "");
+    EXPECT_EQ(out.extraction->model, "m2");
+    EXPECT_FALSE(out.embedding.has_value());                    // provider 已被删掉 → null
+    ASSERT_TRUE(out.chat.has_value());                          // 显式端点不动
+    EXPECT_EQ(out.chat->base_url, "http://mine");
+    EXPECT_EQ(out.chat->model, "c1");
+    EXPECT_FALSE(out.consolidation.has_value());                // 没设的角色不动
+    EXPECT_EQ(settings_from_json(reg.get("w1").settings_json), out);
+    EXPECT_EQ(reg.get("w1").settings_json.find("api_key"), std::string::npos);
+    // 之后按 provider 此刻的端点核对就过了。
+    const ProviderEndpoints now_at{{"p", ProviderEndpoint{.provider = "anthropic", .base_url = ""}}};
+    EXPECT_NO_THROW((void)reg.update_world_settings("w1", "{}", now_at));
+    EXPECT_EQ(code_of([&] { (void)reg.reconfirm_world_endpoints("nope", current); }),
+              "world_not_found");
+}
+
 // 裁定 R40：客户端显式给的 endpoint 建世界，同时另一个线程反复把默认世界的这个角色绑到 p 再解绑
 // （replace_world_sections，即 sync_default_settings）。合并与核对在同一次持锁内：存下来的世界要么是
 // 显式端点（provider_name 为空、客户端地址），要么建世界被拒（endpoint_changed）；绝不会出现

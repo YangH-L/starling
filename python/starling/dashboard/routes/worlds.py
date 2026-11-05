@@ -276,6 +276,15 @@ def _update_settings(pool, providers: dict, name: str, overrides: dict) -> dict:
     return out
 
 
+def _reconfirm_endpoints(pool, providers: dict, name: str) -> dict:
+    """重新确认端点之后回世界详情（设置去掉密钥，与 GET /api/worlds/{name} 同形），重嵌入提示放 warnings。"""
+    _settings, warnings = pool.reconfirm_endpoints(name)
+    out = _world_detail(pool, providers, name)
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
 def _set_auto_snapshot(pool, name: str, on_session: bool, interval_hours: int) -> dict:
     return {"world": name, "auto_snapshot": pool.set_auto_snapshot(name, on_session, interval_hours)}
 
@@ -359,6 +368,14 @@ def build_worlds_router(require_token) -> APIRouter:
         _require_registry(pool)
         _require_client_settings(body)
         return await _run(_update_settings, pool, request.app.state.config.providers, name, body)
+
+    @router.post("/worlds/{name}/settings/reconfirm")
+    async def reconfirm_endpoints(request: Request, name: str):
+        # 裁定 R53：把各 provider 此刻的端点（默认配置里的地址与种类）复制进这个世界引用它们的角色。默认世界 400
+        # invalid_settings（同 PUT 改它的 endpoint）。
+        pool = _pool(request)
+        _require_registry(pool)
+        return await _run(_reconfirm_endpoints, pool, request.app.state.config.providers, name)
 
     @router.post("/worlds/{name}/close")
     async def close_world(request: Request, name: str):

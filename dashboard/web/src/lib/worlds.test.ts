@@ -295,6 +295,12 @@ describe('worldsApi 多世界（第 1 期）', () => {
 			background: { auto_snapshot: { on_session: true, interval_hours: 0 } }
 		});
 	});
+	it('reconfirm：POST /settings/reconfirm（裁定 R53），世界名经编码', async () => {
+		await worldsApi.reconfirm('Run A');
+		expect(calls.map(([p, i]) => `${i.method ?? 'GET'} ${p}`)).toEqual([
+			'POST /api/worlds/Run%20A/settings/reconfirm'
+		]);
+	});
 	it('create：带 labels 时发 labels；没传 auto_snapshot 就不发这个字段', async () => {
 		await worldsApi.create('sim-2', '', undefined, { env: 'test' });
 		expect(JSON.parse(String(calls[0][1].body))).toEqual({
@@ -307,7 +313,7 @@ describe('worldsApi 多世界（第 1 期）', () => {
 		['world_busy', '世界正在关闭或恢复，请稍后再试'],
 		['world_not_found', '世界不存在'],
 		['world_not_initialized', '这个世界的库文件不见了'],
-		['endpoint_changed', '供应商地址改了，这个世界需要重新确认端点'],
+		['endpoint_changed', '供应商地址改了，到「世界」页对这个世界点「重新确认端点」'],
 		['labels_immutable', '标签建好后不能改'],
 		['invalid_settings', '设置不合法'],
 		['world_tenant_mismatch', '该世界的数据库里有其他租户的数据，拒绝打开']
