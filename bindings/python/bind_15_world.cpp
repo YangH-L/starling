@@ -77,6 +77,31 @@ py::dict record_out(const gov::WorldRecord& rec) {
                     "last_write_at"_a = rec.last_write_at, "stats_at"_a = rec.stats_at);
 }
 
+// 一个 provider 此刻的端点身份（裁定 R51）：{"provider": 种类, "base_url": 地址}，缺的键或 None 按空串。
+// 只做类型归一；比较在 C++ require_endpoint_unchanged。
+gov::ProviderEndpoint provider_endpoint_in(const py::handle& obj) {
+    const auto dict = py::reinterpret_borrow<py::dict>(obj);
+    const auto field = [&dict](const char* key) {
+        if (!dict.contains(key)) { return std::string(); }
+        const py::object val = dict[key];
+        return val.is_none() ? std::string() : val.cast<std::string>();
+    };
+    return gov::ProviderEndpoint{.provider = field("provider"), .base_url = field("base_url")};
+}
+
+// {provider 名: {"provider", "base_url"}} → ProviderEndpoints；None → nullopt（不核对）。
+std::optional<gov::ProviderEndpoints> provider_endpoints_in(const py::object& obj) {
+    if (obj.is_none()) { return std::nullopt; }
+    gov::ProviderEndpoints out;
+    for (const auto& [name, endpoint] : obj.cast<py::dict>()) {
+        if (!py::isinstance<py::dict>(endpoint)) {
+            throw py::type_error("provider_endpoints values must be dicts");
+        }
+        out.emplace(name.cast<std::string>(), provider_endpoint_in(endpoint));
+    }
+    return out;
+}
+
 // overrides：None → "{}"，否则 json.dumps（持 GIL）。
 std::string overrides_in(const py::object& overrides) {
     return overrides.is_none() ? std::string("{}") : from_py(overrides);
@@ -166,24 +191,23 @@ void bind_15_world(pybind11::module_& m) {
                  return py::dict("worlds"_a = worlds, "total"_a = page.total);
              }, py::arg("labels") = py::none(), py::arg("offset") = 0, py::arg("limit") = 50)
         // 新世界设置 = 默认世界当前设置 + overrides 的值拷贝（C++ create_world，一次持锁）。
-        // provider_base_urls（裁定 R40）：{provider 名: 当前 base_url}。给出时 C++ 在同一次持锁内合并、核对
-        // 继承来的 endpoint、再写；endpoint_changed 时什么都不写。None：不核对。
+        // provider_endpoints（裁定 R40、R51）：{provider 名: {"provider": 种类, "base_url": 地址}}。给出时 C++
+        // 在同一次持锁内合并、核对继承来的 endpoint、再写；endpoint_changed 时什么都不写。None：不核对。
         .def("create",
              // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
              [](gov::RegistryDb& reg, const std::string& name, const std::string& label,
                 const std::map<std::string, std::string>& labels, const py::object& overrides,
-                const std::string& now_iso,
-                const std::optional<gov::ProviderBaseUrls>& provider_base_urls) {
+                const std::string& now_iso, const py::object& provider_endpoints) {
                  const auto overrides_text = overrides_in(overrides);
+                 const auto endpoints = provider_endpoints_in(provider_endpoints);
                  gov::WorldRecord rec;
                  {
                      const py::gil_scoped_release release;
-                     rec = reg.create_world(name, label, labels, overrides_text, now_iso,
-                                            provider_base_urls);
+                     rec = reg.create_world(name, label, labels, overrides_text, now_iso, endpoints);
                  }
                  return record_out(rec);
              }, py::arg("name"), py::arg("label"), py::arg("labels"), py::arg("overrides"),
-             py::arg("now_iso"), py::arg("provider_base_urls") = py::none())
+             py::arg("now_iso"), py::arg("provider_endpoints") = py::none())
         // 递归删世界目录可能很大，释放 GIL。
         .def("remove", [](gov::RegistryDb& reg, const std::string& name) {
             const py::gil_scoped_release release;
@@ -191,15 +215,16 @@ void bind_15_world(pybind11::module_& m) {
         }, py::arg("name"))
         .def("update_settings",
              [](gov::RegistryDb& reg, const std::string& name, const py::object& overrides,
-                const std::optional<gov::ProviderBaseUrls>& provider_base_urls) {
+                const py::object& provider_endpoints) {
                  const auto overrides_text = overrides_in(overrides);
+                 const auto endpoints = provider_endpoints_in(provider_endpoints);
                  std::string merged;
                  {
                      const py::gil_scoped_release release;
-                     merged = reg.update_world_settings(name, overrides_text, provider_base_urls);
+                     merged = reg.update_world_settings(name, overrides_text, endpoints);
                  }
                  return to_py(merged);
-             }, py::arg("name"), py::arg("overrides"), py::arg("provider_base_urls") = py::none())
+             }, py::arg("name"), py::arg("overrides"), py::arg("provider_endpoints") = py::none())
         // 权威来源同步（裁定 R27）：出现的段整段替换、background 逐叶合并、null 清除。返回新的设置 dict。
         .def("replace_settings_sections",
              [](gov::RegistryDb& reg, const std::string& name, const py::object& sections) {
@@ -246,13 +271,19 @@ void bind_15_world(pybind11::module_& m) {
     }, py::arg("data_dir"));
 
     // world_endpoint 是 settings 里 extraction / embedding / chat / consolidation 之一的 dict；解析走 C++
-    // settings_from_json（字段规则同一份）。provider_name 为空永不抛，否则 base_url 不同抛 endpoint_changed。
+    // settings_from_json（字段规则同一份）。current 是该 provider 此刻的 {"provider", "base_url"}，provider
+    // 已被删掉时 None（裁定 R51）。provider_name 为空永不抛；否则 provider 不存在、或种类与 base_url 任一不同
+    // 抛 endpoint_changed（消息只点名 provider 与 role，裁定 R54）。
     m.def("world_require_endpoint_unchanged",
-          [](const py::dict& world_endpoint, const std::string& current_base_url) {
+          [](const py::dict& world_endpoint, const py::object& current, const std::string& role) {
               const auto parsed = gov::settings_from_json(
                   from_py(py::dict("extraction"_a = world_endpoint)));
-              gov::require_endpoint_unchanged(*parsed.extraction, current_base_url);
-          }, py::arg("world_endpoint"), py::arg("current_base_url"));
+              const std::optional<gov::ProviderEndpoint> now_at =
+                  current.is_none() ? std::nullopt
+                                    : std::optional<gov::ProviderEndpoint>(
+                                          provider_endpoint_in(current.cast<py::dict>()));
+              gov::require_endpoint_unchanged(*parsed.extraction, now_at, role);
+          }, py::arg("world_endpoint"), py::arg("current"), py::arg("role"));
 
     // 一份（可能不完整的）设置 dict → C++ 补齐默认值后的完整设置 dict（settings_from_json →
     // settings_to_json）。默认值只在 C++：引擎池建引擎前用它得到实际生效的设置。非法输入同 settings_from_json。

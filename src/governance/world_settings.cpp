@@ -3,7 +3,8 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
-
+#include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -358,14 +359,20 @@ WorldSettings replace_sections(const WorldSettings& base, const std::string& sec
 }
 
 void require_endpoint_unchanged(const EndpointSettings& world_endpoint,
-                                const std::string& current_provider_base_url) {
+                                const std::optional<ProviderEndpoint>& current,
+                                std::string_view role) {
     if (world_endpoint.provider_name.empty()) {
         return;
     }
-    if (current_provider_base_url != world_endpoint.base_url) {
-        throw WorldStoreError("endpoint_changed",
-                              "provider " + world_endpoint.provider_name + " 的 base_url 已从 " +
-                                  world_endpoint.base_url + " 变为 " + current_provider_base_url);
+    // 裁定 R54：消息只点名 provider 与角色，不带地址（spec §16：错误响应与日志里没有地址）。
+    const std::string who =
+        "provider " + world_endpoint.provider_name + "（角色 " + std::string(role) + "）";
+    if (!current.has_value()) {
+        throw WorldStoreError("endpoint_changed", who + " 已不存在");
+    }
+    if (current->provider != world_endpoint.provider ||
+        current->base_url != world_endpoint.base_url) {
+        throw WorldStoreError("endpoint_changed", who + " 的种类或地址已改动");
     }
 }
 

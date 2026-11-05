@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace {
@@ -309,12 +310,68 @@ TEST(WorldSettings, ReplaceSectionsValidatesLikeMerge) {
 
 TEST(WorldSettings, EndpointChanged) {
     EndpointSettings ep;
+    ep.provider = "openai";
     ep.provider_name = "p";
     ep.base_url = "http://a";
-    EXPECT_NO_THROW(require_endpoint_unchanged(ep, "http://a"));
-    EXPECT_EQ(error_code([&] { require_endpoint_unchanged(ep, "http://b"); }), "endpoint_changed");
+    const ProviderEndpoint same{.provider = "openai", .base_url = "http://a"};
+    EXPECT_NO_THROW(require_endpoint_unchanged(ep, same, "extraction"));
+    EXPECT_EQ(error_code([&] {
+                  require_endpoint_unchanged(
+                      ep, ProviderEndpoint{.provider = "openai", .base_url = "http://b"}, "extraction");
+              }),
+              "endpoint_changed");
     ep.provider_name.clear();
-    EXPECT_NO_THROW(require_endpoint_unchanged(ep, "http://b"));
+    EXPECT_NO_THROW(require_endpoint_unchanged(
+        ep, ProviderEndpoint{.provider = "openai", .base_url = "http://b"}, "extraction"));
+}
+
+// 裁定 R51：base_url 为空表示「这个种类的默认地址」，所以种类一变，空串对空串也是另一家的地址。
+TEST(WorldSettings, EndpointChangedWhenOnlyTheKindChangesWithAnEmptyBaseUrl) {
+    EndpointSettings ep;
+    ep.provider = "openai";
+    ep.provider_name = "p";
+    const ProviderEndpoint anthropic{.provider = "anthropic", .base_url = ""};
+    EXPECT_EQ(error_code([&] { require_endpoint_unchanged(ep, anthropic, "extraction"); }),
+              "endpoint_changed");
+    ep.provider = "anthropic";
+    EXPECT_NO_THROW(require_endpoint_unchanged(ep, anthropic, "extraction"));
+    const ProviderEndpoint openai{.provider = "openai", .base_url = ""};
+    EXPECT_EQ(error_code([&] { require_endpoint_unchanged(ep, openai, "extraction"); }),
+              "endpoint_changed");
+}
+
+// provider 已被删掉（nullopt，相当于 {"", ""}）一律拒绝，连世界里记的也是空种类、空地址时也拒绝。
+TEST(WorldSettings, EndpointChangedWhenTheProviderWasDeleted) {
+    EndpointSettings ep;
+    ep.provider_name = "p";
+    EXPECT_EQ(error_code([&] { require_endpoint_unchanged(ep, std::nullopt, "embedding"); }),
+              "endpoint_changed");
+    ep.provider = "openai";
+    ep.base_url = "http://a";
+    EXPECT_EQ(error_code([&] { require_endpoint_unchanged(ep, std::nullopt, "embedding"); }),
+              "endpoint_changed");
+}
+
+// 裁定 R54：消息只点名 provider 与角色，不带地址（spec §16）。
+TEST(WorldSettings, EndpointChangedMessageNamesNoAddress) {
+    EndpointSettings ep;
+    ep.provider = "openai";
+    ep.provider_name = "p";
+    ep.base_url = "http://old.example";
+    for (const std::optional<ProviderEndpoint>& current :
+         {std::optional<ProviderEndpoint>(
+              ProviderEndpoint{.provider = "openai", .base_url = "http://new.example"}),
+          std::optional<ProviderEndpoint>()}) {
+        try {
+            require_endpoint_unchanged(ep, current, "embedding");
+            ADD_FAILURE() << "no throw";
+        } catch (const WorldStoreError& err) {
+            const std::string text = err.what();
+            EXPECT_EQ(text.find("example"), std::string::npos) << text;
+            EXPECT_NE(text.find("embedding"), std::string::npos) << text;
+            EXPECT_NE(text.find('p'), std::string::npos) << text;
+        }
+    }
 }
 
 TEST(WorldSettings, IngestPartition) {

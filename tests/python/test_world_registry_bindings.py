@@ -102,11 +102,17 @@ def test_helpers(tmp_path):
     assert _core.world_ingest_partition(False, "t", "abc123") == "world-abc123"
     ep = {"provider": "openai", "provider_name": "p", "base_url": "http://a", "model": "m",
           "dim": 1, "max_tokens": 1, "timeout_ms": 1}
-    _core.world_require_endpoint_unchanged(ep, "http://a")
-    with pytest.raises(_core.WorldStoreError) as ei:
-        _core.world_require_endpoint_unchanged(ep, "http://b")
-    assert _code(ei.value) == "endpoint_changed"
-    _core.world_require_endpoint_unchanged({**ep, "provider_name": ""}, "http://b")
+    here = {"provider": "openai", "base_url": "http://a"}
+    _core.world_require_endpoint_unchanged(ep, here, "extraction")
+    for current in ({"provider": "openai", "base_url": "http://b"},
+                    {"provider": "anthropic", "base_url": "http://a"},   # 种类变了（裁定 R51）
+                    None):                                               # provider 已被删掉
+        with pytest.raises(_core.WorldStoreError) as ei:
+            _core.world_require_endpoint_unchanged(ep, current, "embedding")
+        assert _code(ei.value) == "endpoint_changed"
+        assert "http://" not in str(ei.value) and "embedding" in str(ei.value)   # 裁定 R54
+    _core.world_require_endpoint_unchanged({**ep, "provider_name": ""},
+                                           {"provider": "openai", "base_url": "http://b"}, "chat")
     _core.world_import_json(str(tmp_path))   # 无 worlds.json：空操作
 
 

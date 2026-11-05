@@ -145,7 +145,7 @@ def test_world_errors_map_to_http_codes(client, monkeypatch):
     def changed(self, role):
         _core.world_require_endpoint_unchanged(
             {"provider_name": "p", "provider": "openai", "base_url": "https://old.example"},
-            "https://new.example")
+            {"provider": "openai", "base_url": "https://new.example"}, role)
 
     monkeypatch.setattr(DashboardEngine, "_require_endpoint_unchanged", changed)
     resp = client.post("/api/w/w1/remember", json={"text": "x"})
@@ -1115,8 +1115,8 @@ def test_converse_with_a_provider_works_when_nothing_moved(tmp_path, monkeypatch
         assert used == [("http://h.example", "sk-secret-123")] * 2   # 世界自己的抽取，地址没变
 
 
-def test_provider_base_urls_snapshot_survives_a_concurrent_config_edit(client, monkeypatch):
-    """_provider_base_urls 遍历 cfg.providers 时，/api/config 的另一个线程在改它（setdefault、clear + update）。先拍
+def test_provider_endpoints_snapshot_survives_a_concurrent_config_edit(client, monkeypatch):
+    """_provider_endpoints 遍历 cfg.providers 时，/api/config 的另一个线程在改它（setdefault、clear + update）。先拍
     快照再遍历：不抛「dictionary changed size during iteration」。卡点：读第一个 provider 的 base_url 时（遍历的
     途中）往同一个 dict 里加一项，就是并发的 setdefault 落在两次迭代之间。"""
     pool = _pool(client)
@@ -1132,5 +1132,51 @@ def test_provider_base_urls_snapshot_survives_a_concurrent_config_edit(client, m
             return super().get(key, default)
     providers["p"] = _Prov(base_url="http://h")
     providers["q"] = {"base_url": "http://q"}
-    urls = pool._provider_base_urls()
-    assert inserted and urls["p"] == "http://h" and urls["q"] == "http://q"
+    urls = pool._provider_endpoints()
+    assert inserted and urls["p"] == {"provider": "openai", "base_url": "http://h"}
+    assert urls["q"] == {"provider": "openai", "base_url": "http://q"}
+
+
+# ───────────────────────── 裁定 R51：端点身份 = (provider 种类, base_url) ─────────────────────────
+
+def _recording_client(tmp_path, monkeypatch, built: list, provider: dict):
+    """默认世界的 extraction 绑 p（provider 由调用方给）。每个建出来的抽取/对话适配器记下
+    (provider 种类, base_url, api_key)；引擎照常从设置建适配器（不装替身），所以记下的就是真实建法。"""
+    import starling.dashboard.engine as engmod
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def _chat(cfg):
+        built.append(((cfg.get("provider") or "openai"), cfg.get("base_url", ""), cfg.get("api_key")))
+        return make_stub_llm(default_response=_STUB)
+    monkeypatch.setattr(engmod, "_build_chat_adapter", _chat)
+    cfg = DashboardConfig(db_path=str(tmp_path / "dashboard.db"), token="",
+                          tick_interval_s=600.0, source_lane_enabled=False,
+                          ingest_spool_path=str(tmp_path / "spool"))
+    cfg.providers["p"] = dict(provider)
+    cfg.roles["extraction"] = "p"
+    return cfg, TestClient(create_app(cfg, engine_factory=lambda ctx, prov: DashboardEngine(ctx, prov)))
+
+
+@pytest.mark.parametrize("before, after", [("openai", "anthropic"), ("anthropic", "openai")])
+def test_kind_change_with_an_empty_base_url_refuses_the_inherited_endpoint(tmp_path, monkeypatch,
+                                                                         before, after):
+    """审查 C-1：p 的 base_url 为空（种类默认地址），w1 继承 p。设置页把 p 改成另一种类、换新密钥，base_url 仍为空。
+    以前只比 base_url（"" == ""），w1 会按旧种类建适配器、带着新密钥发到旧种类的默认地址。现在种类也比：409
+    endpoint_changed，w1 没有用新密钥建过任何适配器。"""
+    built: list = []
+    _cfg, client = _recording_client(tmp_path, monkeypatch, built,
+                                     {"provider": before, "model": "m1", "base_url": "",
+                                      "api_key": "sk-old"})
+    with client:
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+        resp = client.post("/api/config", json={"providers": {
+            "p": {"provider": after, "api_key": "sk-new"}}})
+        assert resp.status_code == 200, resp.text
+        assert client.app.state.config.providers["p"]["base_url"] == ""
+        built.clear()                                   # 默认世界的热换已在上面完成
+        resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 2"})
+        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), resp.text
+        assert all(key != "sk-new" for _kind, _url, key in built), built
+        # 默认世界跟着 config 走：按新种类、新密钥照常写。
+        assert client.post("/api/remember", json={"text": "Carol owns billing"}).status_code == 200

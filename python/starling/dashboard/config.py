@@ -264,6 +264,26 @@ def _endpoint_settings(name: str, prov: dict) -> dict:
     return ep
 
 
+def provider_endpoint_settings(name: str, prov: dict) -> dict:
+    """一个 provider → 世界设置里的 endpoint dict（不含密钥），与 world_settings() 建 endpoint 同一套字段规则。
+    重新确认端点（裁定 R53）把它交给 C++。"""
+    return _endpoint_settings(name, prov)
+
+
+def provider_endpoint(prov: dict) -> dict:
+    """一个 provider 此刻的端点身份 {"provider", "base_url"}（裁定 R51），按 world_settings() 写 endpoint 的同一套
+    规则归一（种类缺省 openai、base_url 缺省空串），所以与世界里记的 endpoint 可以逐字段比较。比较在 C++。"""
+    ep = _endpoint_settings("", prov)
+    return {"provider": ep["provider"], "base_url": ep.get("base_url", "")}
+
+
+def provider_endpoints(providers: dict) -> dict[str, dict]:
+    """{provider 名: provider_endpoint(...)}，交给 C++ 核对客户端写的设置（裁定 R40、R51）。不含密钥。
+    先拍一份快照再遍历：/api/config 的 _post_config（setdefault）与 _restore（clear + update）可能同时在改这个
+    dict，直接遍历会抛「dictionary changed size during iteration」。list(...) 由 C 实现、持 GIL 一次拷完。"""
+    return {name: provider_endpoint(prov or {}) for name, prov in list(providers.items())}
+
+
 def _migrate_legacy_model_config(cfg: DashboardConfig, data: dict) -> None:
     """Old `{llm, embedder}` files → providers/roles (one-way, on load).
 

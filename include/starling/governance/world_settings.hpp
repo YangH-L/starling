@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace starling::governance {
 
@@ -85,10 +86,22 @@ WorldSettings merge_settings(const WorldSettings& base, const std::string& overr
 // 校验规则与 settings_from_json 相同，非法时在返回前抛出，base 不被修改。
 WorldSettings replace_sections(const WorldSettings& base, const std::string& sections_json);
 
-// world 里的 provider_name 非空，且 current_provider_base_url != world 记的 base_url
-// → 抛 endpoint_changed。provider_name 为空（客户端显式给的）永不抛。
+// 一个 provider 此刻的端点身份（裁定 R51）：种类与 base_url。base_url 为空表示「这个种类的默认地址」，
+// openai 与 anthropic 的默认地址不同，所以只比 base_url 认不出地址变了：种类一变，密钥就会发到另一家。
+// 不含密钥。
+struct ProviderEndpoint {
+    std::string provider;
+    std::string base_url;
+    bool operator==(const ProviderEndpoint&) const = default;
+};
+
+// world 里的 provider_name 非空时核对该 provider 此刻的端点（current）：provider 已不存在（nullopt，相当于
+// {"", ""}，一律拒绝）、或种类与 base_url 任一与 world 记的不同 → 抛 endpoint_changed。provider_name 为空
+// （客户端显式给的）永不抛。role（extraction / embedding / chat / consolidation）只用于消息：消息只点名
+// provider 与角色，不带地址（裁定 R54，spec §16）。
 void require_endpoint_unchanged(const EndpointSettings& world_endpoint,
-                                const std::string& current_provider_base_url);
+                                const std::optional<ProviderEndpoint>& current,
+                                std::string_view role);
 
 // 摄入分区目录名：默认世界 "tenant-" + 百分号编码(tenant)，其余 "world-" + dir_id。
 // 编码与 Python urllib.parse.quote(tenant, safe='') 逐字节一致。

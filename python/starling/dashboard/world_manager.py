@@ -102,6 +102,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from starling import _core
+from starling.dashboard.config import provider_endpoints
 from starling.dashboard.engine import (DashboardEngine, SessionSnapshotDeferred,
                                        WorldContext)
 
@@ -951,16 +952,13 @@ class WorldPool:
         # endpoint、写在同一次持注册表锁内完成（spec §8.3）；地址不同就 endpoint_changed、什么都不写。同步默认
         # 世界设置取同一把锁，插不进中间。没给设置时照旧只继承默认世界（它由同步与 config 保持一致）。
         return reg.create(name, label, dict(labels or {}), merged or None, self._clock(),
-                          provider_base_urls=self._provider_base_urls() if merged else None)
+                          provider_endpoints=self._provider_endpoints() if merged else None)
 
-    def _provider_base_urls(self) -> dict[str, str]:
-        """{provider 名: 当前 base_url}（starling.json 的 provider 注册表），交给 C++ 核对客户端写的设置里继承来的
-        endpoint（裁定 R40）。provider 没有地址时按空串。"""
-        # 先拍一份快照再遍历：/api/config 的 _post_config（setdefault）与 _restore（clear + update）可能同时在
-        # 改这个 dict，直接遍历会抛「dictionary changed size during iteration」（500）。list(...) 由 C 实现、
-        # 持 GIL 一次拷完，期间别的线程改不了它。
-        return {name: (prov or {}).get("base_url") or ""
-                for name, prov in list(self._config.providers.items())}
+    def _provider_endpoints(self) -> dict[str, dict]:
+        """{provider 名: {"provider": 种类, "base_url": 地址}}（starling.json 的 provider 注册表），交给 C++ 核对客户端
+        写的设置里继承来的 endpoint（裁定 R40、R51）。只给当前值，比较在 C++；不含密钥。遍历前先拍快照（见
+        config.provider_endpoints）。"""
+        return provider_endpoints(self._config.providers)
 
     def delete_world(self, world: str) -> None:
         """删世界：先关（等租约、停线程、丢引擎），旧 Runtime 回收不了就拒绝（world_busy，什么都不删），
@@ -1039,7 +1037,7 @@ class WorldPool:
         with self._world_lock(world):
             # 裁定 R40：合并、核对继承来的 endpoint、写都在 C++ 的同一次持锁内；endpoint_changed 时什么都不写。
             merged = reg.update_settings(world, overrides,
-                                         provider_base_urls=self._provider_base_urls())
+                                         provider_endpoints=self._provider_endpoints())
             settings = _core.world_effective_settings(merged)
             with self._lock:
                 engine = self._engines.get(world)

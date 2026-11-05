@@ -12,8 +12,8 @@ provider registry (`providers`, keys only), so the embedder used to WRITE vector
 设置、摄入分区目录）与 `providers`（starling.json 的 provider 注册表，只用来按 provider_name 取
 api_key 与当前 base_url）。直接传 `DashboardConfig` 的旧写法照样可用（裁定 R17）：经
 `WorldContext.from_config` 适配，providers 取 `config.providers`。继承来的 endpoint 每次调用前
-都经 C++ `world_require_endpoint_unchanged` 核对 provider 的当前地址（spec §8.3），改了就拒绝
-（endpoint_changed），不把密钥发到另一个地址。
+都经 C++ `world_require_endpoint_unchanged` 核对 provider 此刻的种类与地址（spec §8.3，裁定 R51），改了
+就拒绝（endpoint_changed），不把密钥发到另一个地址。
 
 The SQLite runtime/connection is built ONCE at construction (db_path is fixed)
 and never rebuilt — config changes only swap the llm and/or rebuild the
@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from starling import _core
 from starling import runtime as _runtime
 from starling._memory_core import LLMNotConfigured, MemoryCore
+from starling.dashboard.config import provider_endpoint
 from starling.dashboard.ingest_filter import chunk_dialogue, clean_turns, clean_turns_ts
 
 
@@ -394,14 +395,15 @@ class DashboardEngine:
             cfg["api_key"] = key
         return cfg
 
-    def _check_endpoint(self, ep: dict | None) -> None:
-        """一个 endpoint（provider_name 非空时）对 provider 的当前 base_url 做 C++ 核对
-        （world_require_endpoint_unchanged）：不同就抛 WorldStoreError("endpoint_changed")。provider 已被删掉时
-        当前地址按空串算（与记下的地址不同就同样拒绝）。规则全在 C++，这里只取当前地址。"""
+    def _check_endpoint(self, ep: dict | None, role: str) -> None:
+        """一个 endpoint（provider_name 非空时）对 provider 此刻的种类与 base_url 做 C++ 核对
+        （world_require_endpoint_unchanged，裁定 R51）：provider 已被删掉、或种类与地址任一不同就抛
+        WorldStoreError("endpoint_changed")。规则全在 C++，这里只取 provider 当前的值。"""
         if not ep or not ep.get("provider_name"):
             return
-        current = (self._providers.get(ep["provider_name"]) or {}).get("base_url") or ""
-        _core.world_require_endpoint_unchanged(ep, current)
+        prov = self._providers.get(ep["provider_name"])
+        current = provider_endpoint(prov) if prov is not None else None
+        _core.world_require_endpoint_unchanged(ep, current, role)
 
     def _source_endpoint(self, role: str) -> dict | None:
         """role 的适配器此刻该按哪个 endpoint 建：_settings[role]；chat 没绑定时回退到抽取的（与构造时一致）。"""
@@ -416,10 +418,10 @@ class DashboardEngine:
         装的替身，见 llm 的 setter）时按 _settings 核对，与之前相同。调用方在这之后再读适配器（可能刚换过）。"""
         ep = self._source_endpoint(role)
         if role in self._built_endpoints and self._built_endpoints[role] != ep:
-            self._check_endpoint(ep)                  # 新设置的地址也得对，才按它重建
+            self._check_endpoint(ep, role)            # 新设置的地址也得对，才按它重建
             self._rebuild_role(role)
             return
-        self._check_endpoint(self._built_endpoints.get(role, ep))
+        self._check_endpoint(self._built_endpoints.get(role, ep), role)
 
     def _rebuild_role(self, role: str) -> None:
         """按 _settings 重建 role 的适配器（持 self._lock，地址已核对过）。chat 跟着重建：它可能回退到抽取的
@@ -477,7 +479,7 @@ class DashboardEngine:
             # 抽取的），任何一个地址改了就抛 endpoint_changed，什么都不换。建适配器本身不发请求，但嵌入一换就会
             # 重嵌入、用这个密钥发出去。
             for role in roles:
-                self._check_endpoint(self._source_endpoint(role))
+                self._check_endpoint(self._source_endpoint(role), role)
             if "extraction" in roles:
                 self.set_llm(self._endpoint_cfg("extraction"))
             if "chat" in roles:

@@ -403,7 +403,7 @@ TEST(WorldSettingsCompose, InheritedEndpointMustMatchTheProviderAddress) {
     reg.update_world_settings(
         "default", R"({"embedding":{"provider":"openai","provider_name":"p","base_url":"http://h",)"
                    R"("model":"e1","dim":8,"max_tokens":1,"timeout_ms":1000}})");
-    const ProviderBaseUrls urls{{"p", "http://h"}};
+    const ProviderEndpoints urls{{"p", ProviderEndpoint{.provider = "openai", .base_url = "http://h"}}};
     reg.create_world("w1", "", {}, "", kNow, urls);
     const auto before = reg.get("w1").settings_json;
     const std::string evil = R"({"embedding":{"base_url":"http://evil"}})";
@@ -420,7 +420,7 @@ TEST(WorldSettingsCompose, InheritedEndpointMustMatchTheProviderAddress) {
     }
     EXPECT_EQ(dirs, std::vector<std::string>{reg.get("w1").dir_id});    // 默认世界的库在原地
     // 表里没有这个 provider（已被删掉）：同样拒绝。
-    EXPECT_EQ(code_of([&] { (void)reg.update_world_settings("w1", "{}", ProviderBaseUrls{}); }),
+    EXPECT_EQ(code_of([&] { (void)reg.update_world_settings("w1", "{}", ProviderEndpoints{}); }),
               "endpoint_changed");
     // 地址不变的改动照常写；显式端点（provider_name 为空）不核对。
     const auto ok = settings_from_json(
@@ -435,6 +435,34 @@ TEST(WorldSettingsCompose, InheritedEndpointMustMatchTheProviderAddress) {
     EXPECT_EQ(settings_from_json(reg.get("w1").settings_json).embedding->provider_name, "p");
 }
 
+// 裁定 R51：写设置时的核对比种类与地址两项。provider 的 base_url 为空（种类默认地址），只改了种类（openai →
+// anthropic）也是另一家的地址：endpoint_changed，什么都不写。provider 被删掉同样拒绝。
+TEST(WorldSettingsCompose, InheritedEndpointRefusedWhenOnlyTheProviderKindChanged) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    reg.update_world_settings(
+        "default", R"({"extraction":{"provider":"openai","provider_name":"p","base_url":"",)"
+                   R"("model":"m","max_tokens":1,"timeout_ms":1000}})");
+    const ProviderEndpoints openai{{"p", ProviderEndpoint{.provider = "openai", .base_url = ""}}};
+    const ProviderEndpoints anthropic{
+        {"p", ProviderEndpoint{.provider = "anthropic", .base_url = ""}}};
+    reg.create_world("w1", "", {}, R"({"extraction":{"model":"m2"}})", kNow, openai);
+    const auto before = reg.get("w1").settings_json;
+    EXPECT_EQ(code_of([&] { (void)reg.update_world_settings("w1", "{}", anthropic); }),
+              "endpoint_changed");
+    EXPECT_EQ(reg.get("w1").settings_json, before);
+    EXPECT_EQ(code_of([&] {
+                  (void)reg.create_world("w2", "", {}, R"({"extraction":{"model":"m2"}})", kNow,
+                                         anthropic);
+              }),
+              "endpoint_changed");
+    EXPECT_EQ(code_of([&] { (void)reg.get("w2"); }), "world_not_found");
+    EXPECT_EQ(code_of([&] { (void)reg.update_world_settings("w1", "{}", ProviderEndpoints{}); }),
+              "endpoint_changed");
+    (void)reg.update_world_settings("w1", R"({"extraction":{"model":"m3"}})", openai);
+    EXPECT_EQ(settings_from_json(reg.get("w1").settings_json).extraction->model, "m3");
+}
+
 // 裁定 R40：客户端显式给的 endpoint 建世界，同时另一个线程反复把默认世界的这个角色绑到 p 再解绑
 // （replace_world_sections，即 sync_default_settings）。合并与核对在同一次持锁内：存下来的世界要么是
 // 显式端点（provider_name 为空、客户端地址），要么建世界被拒（endpoint_changed）；绝不会出现
@@ -444,7 +472,7 @@ TEST(WorldSettingsCompose, InheritedEndpointMustMatchTheProviderAddress) {
 TEST(WorldSettingsCompose, CreateWithAnExplicitEndpointNeverInheritsAProviderNameAtTheClientUrl) {
     const TempDir tmp;
     auto reg = open_db(tmp);
-    const ProviderBaseUrls urls{{"p", "http://h"}};
+    const ProviderEndpoints urls{{"p", ProviderEndpoint{.provider = "openai", .base_url = "http://h"}}};
     const std::string bound =
         R"({"embedding":{"provider":"openai","provider_name":"p","base_url":"http://h",)"
         R"("model":"e1","dim":8,"max_tokens":1,"timeout_ms":1000}})";
