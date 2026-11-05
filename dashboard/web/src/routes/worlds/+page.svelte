@@ -229,8 +229,10 @@
 		if (!name || reconfirming !== null) return;
 		reconfirming = name;
 		try {
-			await worldsApi.reconfirm(name);
+			const row = await worldsApi.reconfirm(name);
 			toast.success(`已为「${name}」重新确认端点`);
+			// 非致命提示(如嵌入供应商拒绝了重嵌入):保存已成功,但不能静默吞掉(裁定 R58)。
+			for (const w of row?.warnings ?? []) toast.warning(w);
 			await q.refetch();
 		} catch (e) {
 			toast.error(errText(e));
@@ -764,7 +766,7 @@
 <ConfirmDialog
 	bind:open={reconfirmOpen}
 	title={`重新确认「${reconfirmTarget}」的端点？`}
-	description={`将把默认配置里各供应商当前的地址复制到世界「${reconfirmTarget}」引用它们的角色上；已删除的供应商对应的角色会解绑。客户端单独指定的端点不受影响。`}
+	description={`将把默认配置里各供应商当前的设置（地址、种类、模型）复制到世界「${reconfirmTarget}」引用它们的角色上，嵌入端点也可能随之改变；已删除的供应商对应的角色会解绑。若嵌入的模型或维度变了，世界「${reconfirmTarget}」的记忆会全部重新嵌入；只改了地址不会。客户端单独指定的端点不受影响。`}
 	confirmLabel="确认"
 	onconfirm={doReconfirm}
 />

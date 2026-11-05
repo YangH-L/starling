@@ -376,6 +376,17 @@ void require_endpoint_unchanged(const EndpointSettings& world_endpoint,
     }
 }
 
+bool embedding_needs_reembed(const std::optional<EndpointSettings>& before,
+                             const std::optional<EndpointSettings>& after) {
+    if (!after.has_value()) {
+        return false;
+    }
+    if (!before.has_value()) {
+        return true;
+    }
+    return before->model != after->model || before->dim != after->dim;
+}
+
 std::string ingest_partition(bool is_default_world, const std::string& tenant,
                              const std::string& dir_id) {
     return is_default_world ? "tenant-" + percent_encode(tenant) : "world-" + dir_id;

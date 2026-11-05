@@ -306,6 +306,20 @@ void bind_15_world(pybind11::module_& m) {
               gov::require_endpoint_unchanged(*parsed.extraction, now_at, role);
           }, py::arg("world_endpoint"), py::arg("current"), py::arg("role"));
 
+    // 嵌入 endpoint 从 before 换成 after（各为设置里 embedding 段的 dict，None = 没绑定）时要不要重嵌入（裁定 R58）。
+    // 解析走 settings_from_json（字段规则同一份），规则在 C++ embedding_needs_reembed。
+    m.def("world_embedding_needs_reembed",
+          [](const py::object& before, const py::object& after) {
+              const auto parse = [](const py::object& endpoint)
+                  -> std::optional<gov::EndpointSettings> {
+                  if (endpoint.is_none()) { return std::nullopt; }
+                  return gov::settings_from_json(
+                             from_py(py::dict("embedding"_a = endpoint.cast<py::dict>())))
+                      .embedding;
+              };
+              return gov::embedding_needs_reembed(parse(before), parse(after));
+          }, py::arg("before"), py::arg("after"));
+
     // 一份（可能不完整的）设置 dict → C++ 补齐默认值后的完整设置 dict（settings_from_json →
     // settings_to_json）。默认值只在 C++：引擎池建引擎前用它得到实际生效的设置。非法输入同 settings_from_json。
     m.def("world_effective_settings", [](const py::dict& settings) {

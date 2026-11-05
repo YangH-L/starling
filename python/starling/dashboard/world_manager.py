@@ -1051,7 +1051,8 @@ class WorldPool:
         """重新确认端点（裁定 R53）：把 starling.json 里各 provider 此刻的 endpoint（不含密钥，与 world_settings 同一套
         字段规则）交给 C++ reconfirm_world_endpoints，世界里引用某个 provider 的角色整段换成它此刻的 endpoint，
         provider 已被删掉的角色解绑。返回 (实际生效的完整设置, 重嵌入提示)。开着的世界按变了的角色热换适配器
-        （apply_world_settings，与 PUT 设置同一条路，裁定 R35）。
+        （apply_world_settings，与 PUT 设置同一条路，裁定 R35），但只在嵌入的模型或维度变了时重嵌入（裁定 R58）：只换了
+        地址的嵌入只重建适配器，解绑的嵌入换成占位，两者都不删向量。
 
         默认世界拒绝，码与 PUT 改它的 endpoint 相同（invalid_settings）：它的端点归 config，同步时自动跟上。
         持世界锁，理由同 update_settings。"""
@@ -1069,7 +1070,8 @@ class WorldPool:
                 engine = self._engines.get(world)
             warnings: list[str] = []
             if engine is not None:
-                warnings = engine.apply_world_settings(settings)
+                # 裁定 R58：只有嵌入的模型或维度变了才重嵌入；只换地址、或嵌入角色被解绑，向量原样留着。
+                warnings = engine.apply_world_settings(settings, reconfirm=True)
             engine = None
         return settings, warnings
 

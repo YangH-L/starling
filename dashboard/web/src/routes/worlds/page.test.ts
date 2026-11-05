@@ -9,10 +9,12 @@ import { goto } from '$app/navigation';
 
 const toastError = vi.fn();
 const toastSuccess = vi.fn();
+const toastWarning = vi.fn();
 vi.mock('$lib/ui/toast', () => ({
 	toast: {
 		error: (...a: unknown[]) => toastError(...a),
 		success: (...a: unknown[]) => toastSuccess(...a),
+		warning: (...a: unknown[]) => toastWarning(...a),
 		info: vi.fn()
 	}
 }));
@@ -1229,6 +1231,7 @@ describe('/worlds 重新确认端点（裁定 R53）', () => {
 		reconfirm.mockReset().mockResolvedValue({ ...DATA.worlds[1] });
 		toastError.mockReset();
 		toastSuccess.mockReset();
+		toastWarning.mockReset();
 		noteDefaultWorld('default');
 	});
 
@@ -1251,13 +1254,35 @@ describe('/worlds 重新确认端点（裁定 R53）', () => {
 		await settle();
 		expect(reconfirm).not.toHaveBeenCalled();
 		expect(document.body.textContent).toContain('重新确认「sim-1」的端点？');
-		expect(document.body.textContent).toContain('默认配置里各供应商当前的地址');
+		expect(document.body.textContent).toContain('默认配置里各供应商当前的设置');
+		// 裁定 R58:点名世界,说明嵌入端点可能改变、模型或维度变了会重新嵌入该世界的记忆。
+		expect(document.body.textContent).toContain('嵌入端点也可能随之改变');
+		expect(document.body.textContent).toContain('世界「sim-1」的记忆会全部重新嵌入');
 		const calls = list.mock.calls.length;
 		await fireEvent.click(inBody('确认')!);
 		await settle();
 		expect(reconfirm).toHaveBeenCalledWith('sim-1');
 		expect(toastSuccess).toHaveBeenCalledWith('已为「sim-1」重新确认端点');
 		expect(list.mock.calls.length).toBeGreaterThan(calls);
+		expect(toastWarning).not.toHaveBeenCalled();
+	});
+
+	it('响应带 warnings 时逐条 toast.warning(裁定 R58:重嵌入失败不静默)', async () => {
+		reconfirm.mockResolvedValue({
+			...DATA.worlds[1],
+			warnings: ['embedding provider rejected the config', 'second']
+		});
+		render(Worlds);
+		await settle();
+		await fireEvent.click(rowButton('重新确认端点 sim-1')!);
+		await settle();
+		await fireEvent.click(inBody('确认')!);
+		await settle();
+		expect(toastSuccess).toHaveBeenCalledWith('已为「sim-1」重新确认端点');
+		expect(toastWarning.mock.calls).toEqual([
+			['embedding provider rejected the config'],
+			['second']
+		]);
 	});
 
 	it('失败时给中文提示', async () => {

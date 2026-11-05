@@ -103,6 +103,12 @@ void require_endpoint_unchanged(const EndpointSettings& world_endpoint,
                                 const std::optional<ProviderEndpoint>& current,
                                 std::string_view role);
 
+// 嵌入 endpoint 从 before 换成 after 时，世界里已有的向量是否作废、要重嵌入（裁定 R58）。向量的空间由嵌入的模型与维度决定，
+// 与地址、密钥、种类无关，所以：after 为空（角色解绑，例如 provider 被删掉）→ false，向量留着（召回降级到重新绑定为止）；
+// before 为空、after 不为空 → true（之前是占位嵌入）；两者都在时 model 或 dim 任一不同 → true，只换地址 → false。
+bool embedding_needs_reembed(const std::optional<EndpointSettings>& before,
+                             const std::optional<EndpointSettings>& after);
+
 // 摄入分区目录名：默认世界 "tenant-" + 百分号编码(tenant)，其余 "world-" + dir_id。
 // 编码与 Python urllib.parse.quote(tenant, safe='') 逐字节一致。
 std::string ingest_partition(bool is_default_world, const std::string& tenant,

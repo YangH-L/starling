@@ -352,6 +352,30 @@ TEST(WorldSettings, EndpointChangedWhenTheProviderWasDeleted) {
               "endpoint_changed");
 }
 
+// 裁定 R58：向量只在嵌入的模型或维度变了时作废；只换地址、种类不重嵌入；解绑不重嵌入。
+TEST(WorldSettings, EmbeddingNeedsReembedOnlyWhenModelOrDimChanges) {
+    EndpointSettings before;
+    before.provider = "openai";
+    before.provider_name = "p";
+    before.base_url = "http://a";
+    before.model = "e1";
+    before.dim = 1024;
+    EndpointSettings moved = before;
+    moved.base_url = "http://b";
+    moved.provider = "anthropic";
+    EXPECT_FALSE(embedding_needs_reembed(before, moved));
+    EXPECT_FALSE(embedding_needs_reembed(before, before));
+    EndpointSettings model = moved;
+    model.model = "e2";
+    EXPECT_TRUE(embedding_needs_reembed(before, model));
+    EndpointSettings dim = before;
+    dim.dim = 512;
+    EXPECT_TRUE(embedding_needs_reembed(before, dim));
+    EXPECT_FALSE(embedding_needs_reembed(before, std::nullopt));
+    EXPECT_FALSE(embedding_needs_reembed(std::nullopt, std::nullopt));
+    EXPECT_TRUE(embedding_needs_reembed(std::nullopt, before));
+}
+
 // 裁定 R54：消息只点名 provider 与角色，不带地址（spec §16）。
 TEST(WorldSettings, EndpointChangedMessageNamesNoAddress) {
     EndpointSettings ep;

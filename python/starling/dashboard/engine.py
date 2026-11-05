@@ -570,11 +570,12 @@ class DashboardEngine:
         with self._lock:
             self._settings = settings
 
-    def reload_adapters(self, roles, *, gist: bool = False) -> list[str]:
+    def reload_adapters(self, roles, *, gist: bool = False, reembed: bool = True) -> list[str]:
         """按当前设置（self._settings）与 provider 注册表重建 roles 里的适配器（extraction / chat /
         consolidation / embedding），gist 为真时重新装上阈值；与构造时（_init_core）同一套取法（_build_role）。POST
         /api/config（按改动的角色，含只改了密钥的 provider）与 PUT /api/worlds/{name}/settings
-        （apply_world_settings，按改动的段）都经这里。返回重嵌入的提示（嵌入 provider 拒绝时，非致命）。"""
+        （apply_world_settings，按改动的段）都经这里。reembed 为假时换了嵌入也只换适配器，向量不动（重新确认端点，
+        裁定 R58）。返回重嵌入的提示（嵌入 provider 拒绝时，非致命）。"""
         roles = set(roles)
         warnings: list[str] = []
         with self._lock:
@@ -588,18 +589,22 @@ class DashboardEngine:
             # 没绑 chat 的世界用抽取的 endpoint 对话（与构造时一致，_source_endpoint）。
             for role in ("extraction", "chat", "consolidation", "embedding"):
                 if role in roles:
-                    warn = self._build_role(role, snaps[role], reembed=True)
+                    warn = self._build_role(role, snaps[role], reembed=reembed)
                     if warn:
                         warnings.append(warn)
             if gist:
                 self.set_gist_thresholds(self._settings.get("gist_thresholds") or {})
         return warnings
 
-    def apply_world_settings(self, settings: dict) -> list[str]:
+    def apply_world_settings(self, settings: dict, *, reconfirm: bool = False) -> list[str]:
         """换上一个世界的新设置（PUT /api/worlds/{name}/settings 之后，C++ 已合并好），并按与旧设置相比
         变了的段重建适配器：不留旧 endpoint 的适配器（继承来的地址核对按新设置做，见
         _require_endpoint_unchanged）。chat 没绑定时跟着抽取变。background 只换引用：tick 间隔与摄入开关
-        在下一次打开这个世界时生效，自动快照的配置池每次从注册表现读。返回重嵌入的提示。"""
+        在下一次打开这个世界时生效，自动快照的配置池每次从注册表现读。返回重嵌入的提示。
+
+        reconfirm（重新确认端点，裁定 R58）：嵌入段变了时，只有嵌入的模型或维度真的变了才重嵌入，判定在 C++
+        world_embedding_needs_reembed。只换了地址就只重建适配器，向量原样留着；嵌入角色被解绑（provider 删掉了）换成
+        占位嵌入，不重嵌入，向量也留着（召回降级到重新绑定为止）。为假（PUT 设置）时嵌入段一变就重嵌入，与之前相同。"""
         with self._lock:
             old, self._settings = self._settings, settings
             changed = {role for role in ("extraction", "embedding", "chat", "consolidation")
@@ -607,8 +612,11 @@ class DashboardEngine:
             if "extraction" in changed and not settings.get("chat"):
                 changed.add("chat")
             gist = old.get("gist_thresholds") != settings.get("gist_thresholds")
+            reembed = (not reconfirm
+                       or _core.world_embedding_needs_reembed(old.get("embedding"),
+                                                              settings.get("embedding")))
             try:
-                return self.reload_adapters(changed, gist=gist)
+                return self.reload_adapters(changed, gist=gist, reembed=reembed)
             except _core.WorldStoreError:
                 # 新设置里有继承地址已变的 endpoint（裁定 R38，核对在换任何适配器之前）：换回旧设置，
                 # 引擎原样。C++ 在写注册表时已于同一次持锁内核对过（裁定 R40），这里是纵深防御。

@@ -249,8 +249,9 @@ export const worldsApi = {
 		api.put<WorldSettings>(`${base(name)}/settings`, settings, { timeoutMs: 120_000 }),
 	// 重新确认端点(裁定 R53):把各供应商此刻的地址复制进这个世界引用它们的角色,回世界详情。
 	// 开着的世界要热换适配器、等世界锁,与 updateSettings 一样放宽到 120s。
+	// 回世界详情;重嵌入失败等非致命提示放 warnings(裁定 R58)。
 	reconfirm: (name: string) =>
-		api.post<WorldRow>(`${base(name)}/settings/reconfirm`, {}, { timeoutMs: 120_000 }),
+		api.post<WorldRow & { warnings?: string[] }>(`${base(name)}/settings/reconfirm`, {}, { timeoutMs: 120_000 }),
 	// 关闭要等该世界的在途请求结束并停线程。
 	close: (name: string) =>
 		api.post<{ closed: string }>(`${base(name)}/close`, {}, { timeoutMs: 60_000 }),

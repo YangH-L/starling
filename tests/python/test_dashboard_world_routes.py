@@ -1352,6 +1352,87 @@ def test_reconfirm_unbinds_a_role_whose_provider_was_deleted(tmp_path, monkeypat
         assert (resp.status_code, resp.json()) == (409, {"detail": "llm_not_configured"})
 
 
+# ───────────────────────── 裁定 R58：重新确认端点只在模型或维度变了时重嵌入 ─────────────────────────
+
+def _vector_snapshot(db_path: str) -> list:
+    """(stmt_id, embedded_at) 全表，按 stmt_id 排序。重嵌入先删后写，行数可能不变，但 embedded_at 一定变。"""
+    import sqlite3
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return con.execute("SELECT stmt_id, embedded_at FROM statement_vectors "
+                           "ORDER BY stmt_id").fetchall()
+    finally:
+        con.close()
+
+
+def _embedded_w1(client, monkeypatch) -> tuple:
+    """建 w1、写一条、tick 嵌入；返回 (库路径, 向量快照, 记下 _reembed 调用的列表)。"""
+    pool = _pool(client)
+    assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+    assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+    assert client.post("/api/w/w1/tick", json={}).status_code == 200
+    db = pool.registry.get("w1")["db_path"]
+    before = _vector_snapshot(db)
+    assert before, "tick did not embed anything"
+    reembeds: list = []
+    real = DashboardEngine._reembed
+
+    def _spy(self):
+        reembeds.append(self.world)
+        return real(self)
+    monkeypatch.setattr(DashboardEngine, "_reembed", _spy)
+    return db, before, reembeds
+
+
+def test_reconfirm_after_an_address_only_change_keeps_the_vectors(tmp_path, monkeypatch):
+    """审查 N-2：p 只换了地址（模型、维度不变）。w1 的嵌入角色过期（endpoint_changed）。以前重新确认经 reload_adapters
+    重嵌入：先删光 statement_vectors 再全量重嵌。现在只按新地址重建适配器，向量一行不动。"""
+    built: list = []
+    with _embedding_client(tmp_path, monkeypatch, built) as client:
+        db, before, reembeds = _embedded_w1(client, monkeypatch)
+        resp = client.post("/api/config", json={"providers": {"p": {"base_url": "http://h2.example"}}})
+        assert resp.status_code == 200, resp.text
+        reembeds.clear()                                # 默认世界自己的重嵌入不算
+        built.clear()
+        resp = client.post("/api/worlds/w1/settings/reconfirm")
+        assert resp.status_code == 200, resp.text
+        assert "warnings" not in resp.json()
+        assert reembeds == []
+        assert _vector_snapshot(db) == before
+        assert built and built[-1]["base_url"] == "http://h2.example", built
+        resp = client.post("/api/w/w1/tick", json={})
+        assert resp.status_code == 200 and "embed" not in resp.json()["stages_skipped"], resp.text
+
+
+def test_reconfirm_after_an_embedding_model_change_reembeds(tmp_path, monkeypatch):
+    """p 的嵌入模型换了：重新确认把新模型复制进 w1，向量的空间变了，要重嵌入（与设置页换嵌入同一条规则）。"""
+    built: list = []
+    with _embedding_client(tmp_path, monkeypatch, built) as client:
+        db, before, reembeds = _embedded_w1(client, monkeypatch)
+        resp = client.post("/api/config", json={"providers": {"p": {"model": "m2"}}})
+        assert resp.status_code == 200, resp.text
+        reembeds.clear()
+        resp = client.post("/api/worlds/w1/settings/reconfirm")
+        assert resp.status_code == 200, resp.text
+        assert reembeds == ["w1"]
+        assert _vector_snapshot(db) != before
+
+
+def test_reconfirm_after_the_embedding_provider_was_deleted_keeps_the_vectors(tmp_path, monkeypatch):
+    """p 被删掉：重新确认解绑 w1 的嵌入角色，引擎换成占位嵌入。以前占位嵌入随即把真实向量全删了、重嵌成占位向量；现在
+    不重嵌入，向量原样留着（召回降级到重新绑定为止）。"""
+    built: list = []
+    with _embedding_client(tmp_path, monkeypatch, built) as client:
+        db, before, reembeds = _embedded_w1(client, monkeypatch)
+        assert client.delete("/api/config/provider/p").status_code == 200
+        reembeds.clear()
+        resp = client.post("/api/worlds/w1/settings/reconfirm")
+        assert resp.status_code == 200, resp.text
+        assert "embedding" not in resp.json()["settings"]
+        assert reembeds == []
+        assert _vector_snapshot(db) == before
+
+
 def test_world_list_sorts_by_last_write_then_creation(client):
     """spec §14（审查 M-1）：写过的世界按最近写入降序在前（排序按注册表缓存列），没写过的在后。"""
     pool = _pool(client)
