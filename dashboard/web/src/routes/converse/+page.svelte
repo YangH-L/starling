@@ -3,7 +3,7 @@
 	import { explicitWorld, withWorld } from '$lib/world.svelte';
 	import { streamConverse } from '$lib/ws';
 	import { toast } from '$lib/ui/toast';
-	import { worldErrorMessage } from '$lib/worlds';
+	import { worldCodeMessage } from '$lib/worlds';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Button, Textarea, Badge, Chip, EmptyState, StatusDot, Select } from '$lib/components/ui';
 
@@ -70,9 +70,11 @@
 					busy = false;
 				},
 				onError: (code) => {
+					// 世界码(world_busy、endpoint_changed 等)与读页面、remember / recall 同一份中文提示(裁定 R59)。
+					const worldText = worldCodeMessage(code);
 					if (code === 'llm_not_configured')
 						toast.error('未配置 LLM:去「模型」页绑定 extraction / chat 角色');
-					else if (code === 'world_busy') toast.error(worldErrorMessage(code));
+					else if (worldText) toast.error(worldText);
 					else toast.error('对话出错:' + code);
 					if (!turns[idx].text) turns[idx].text = `（出错:${code}）`;
 					turns[idx].streaming = false;

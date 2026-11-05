@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('svelte-sonner', () => ({
-	toast: { success: vi.fn(), error: vi.fn(), message: vi.fn() }
+	toast: { success: vi.fn(), error: vi.fn(), message: vi.fn(), warning: vi.fn() }
 }));
 
 import { toast } from './toast';
@@ -15,5 +15,9 @@ describe('toast helper', () => {
 		expect((sonner.success as any).mock.calls[0][0]).toBe('a');
 		expect((sonner.error as any).mock.calls[0][0]).toBe('b');
 		expect((sonner.message as any).mock.calls[0][0]).toBe('c');
+	});
+	it('maps warning to sonner.warning', () => {
+		toast.warning('w');
+		expect((sonner.warning as any).mock.calls[0][0]).toBe('w');
 	});
 });

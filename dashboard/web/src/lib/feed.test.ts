@@ -18,6 +18,23 @@ describe('describeEvent — 概览 feed 事件结构化', () => {
 		expect(v.tone).toBe('neutral');
 	});
 
+	it('tick: stages_skipped 含 embed → 说跳过嵌入,不说空转(裁定 R59)', () => {
+		const skipped = describeEvent('tick', {
+			embedded: 0,
+			consolidated: 0,
+			stages_skipped: ['embed']
+		}).detail;
+		expect(skipped).toContain('跳过嵌入');
+		expect(skipped).not.toContain('空转');
+		const busy = describeEvent('tick', { fired: 2, stages_skipped: ['embed'] }).detail;
+		expect(busy).toContain('到期触发 2');
+		expect(busy).toContain('跳过嵌入');
+		// 别的阶段被跳过不提嵌入。
+		expect(
+			describeEvent('tick', { embedded: 0, stages_skipped: ['persona'] }).detail
+		).toBe('空转(无待办)');
+	});
+
 	it('tick: 见到已知计数键且全零 → 空转;空 payload 形状陌生 → 不妄断', () => {
 		expect(describeEvent('tick', { embedded: 0, consolidated: 0 }).detail).toBe('空转(无待办)');
 		// 空对象没有任何已知计数键,无从判断是否真空闲 → 宁可空细节

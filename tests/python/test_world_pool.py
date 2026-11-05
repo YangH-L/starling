@@ -169,8 +169,9 @@ def test_concurrent_first_lease_of_different_worlds_builds_in_parallel(tmp_path,
     """建引擎按世界持锁，不持池锁：w1 建引擎时 w2 的首次打开不排在它后面。
 
     计时判据（审查 M-8）：两个世界都在建引擎的 sleep 里重叠，用的是「同时在 sleep 里的世界数」（不受机器快慢影响），
-    另外比墙钟：并行的总时长要明显小于串行的总和（每次建引擎 2 秒 sleep + 真实构造，串行至少 4 秒），留 1.5 秒以上的
-    余量给加载重的 CI。"""
+    另外比墙钟：并行的总时长要明显小于串行的总和（每次建引擎 2 秒 sleep + 真实构造，串行至少 4 秒）。上限是
+    2 × 2 × 0.8 = 3.2 秒；并行的下限是一次 sleep 2 秒加真实构造（本机约 2.3 秒），所以给加载重的 CI 的余量约 0.9 秒，
+    离串行下限还有 0.8 秒。"""
     pool, _reg, _c = _pool(tmp_path)
     try:
         pool.create_world("w1", "")

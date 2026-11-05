@@ -26,6 +26,7 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -277,15 +278,15 @@ fs::path imported_name(const fs::path& json_path) {
     return cand;
 }
 
-// 把目录项的改动（rename）落盘（审查 T2-1）：以只读打开目录、fsync、关闭。macOS 上对目录 fd 的普通 fsync 即可。
-// 成功返回空串，失败返回原因（errno 文本）。
-std::string fsync_dir(const fs::path& dir) {
+// 以只读打开 path、fsync、关闭（审查 T2-1）。目录：把目录项的改动（rename）落盘，macOS 上对目录 fd 的普通 fsync 即可。
+// 普通文件：把它的内容落盘。成功返回空串，失败返回原因（errno 文本）。
+std::string fsync_path(const fs::path& path) {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg) — POSIX open 是变参函数
-    const int dir_fd = ::open(dir.c_str(), O_RDONLY);
-    if (dir_fd < 0) { return std::string("open: ") + std::strerror(errno); }
+    const int path_fd = ::open(path.c_str(), O_RDONLY);
+    if (path_fd < 0) { return std::string("open: ") + std::strerror(errno); }
     std::string failure;
-    if (::fsync(dir_fd) != 0) { failure = std::string("fsync: ") + std::strerror(errno); }
-    (void)::close(dir_fd);
+    if (::fsync(path_fd) != 0) { failure = std::string("fsync: ") + std::strerror(errno); }
+    (void)::close(path_fd);
     return failure;
 }
 
@@ -321,6 +322,11 @@ void import_worlds_json(const fs::path& data_dir) {
     (void)remove_importing(importing, true);   // 上次崩溃的残留
     try {
         internal::write_fresh_registry(importing, default_world, retention, worlds);
+        // 裁定 R59（T2-1 余项）：库在 DELETE 日志模式下关好之后，先把 .importing 本身 fsync 再改名，否则断电后改名
+        // 可能先于内容落盘，留下一个名叫 registry.db 的空库或残库。失败按写库失败处理：删掉 .importing，worlds.json 不动。
+        if (const std::string failure = fsync_path(importing); !failure.empty()) {
+            throw std::runtime_error("cannot sync " + importing.string() + " (" + failure + ")");
+        }
         fs::rename(importing, registry);
     } catch (const std::exception& err) {
         const std::string leftover = remove_importing(importing, false);
@@ -333,7 +339,7 @@ void import_worlds_json(const fs::path& data_dir) {
     // 两个改名可能只留下后一个——registry.db 不在、worlds.json 也不在，下次启动建一个只有默认世界的新注册表，
     // 随后的快照清扫把没登记的快照文件全删掉。fsync 失败按第 5 步失败处理：registry.db 已就位，worlds.json 留在
     // 原处（下次启动见到 registry.db 就什么都不做，留着的 worlds.json 无害）。
-    if (const std::string failure = fsync_dir(root); !failure.empty()) {
+    if (const std::string failure = fsync_path(root); !failure.empty()) {
         corrupt("imported " + json_path.string() + " into " + registry.string() +
                 ", but could not sync " + root.string() + " (" + failure + "); " +
                 json_path.string() + " was left in place and is ignored from now on");
@@ -349,7 +355,7 @@ void import_worlds_json(const fs::path& data_dir) {
     }
     // 第 5 步的改名同样落盘：之后的启动不再见到 worlds.json。失败只影响这一个改名能否留下，registry.db 已经落盘，
     // 不报错（下次启动见到 registry.db 就什么都不做）。
-    (void)fsync_dir(root);
+    (void)fsync_path(root);
 }
 
 }  // namespace starling::governance

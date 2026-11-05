@@ -29,13 +29,18 @@
 	});
 
 	let ticking = $state(false);
+	const EMBED_SKIPPED_HINT = '嵌入端点失效，本轮跳过嵌入；到「世界」页重新确认端点';
 
 	async function tick() {
 		ticking = true;
 		try {
 			// tick 批量嵌入积压语句(逐条走网络),按积压量放宽。
-			await api.post(worldPath('/api/tick'), {}, { timeoutMs: 120_000 });
+			const stats = await api.post<{ stages_skipped?: string[] }>(worldPath('/api/tick'), {}, {
+				timeoutMs: 120_000
+			});
 			toast.success('Tick 发送成功');
+			// 嵌入端点失效时 tick 只跳过嵌入阶段(裁定 R54),其余照常:成功提示之外要说明积压不会被消化(裁定 R59)。
+			if (stats?.stages_skipped?.includes('embed')) toast.warning(EMBED_SKIPPED_HINT);
 			await q.refetch();
 		} catch (e) {
 			toast.error(describeError(e));

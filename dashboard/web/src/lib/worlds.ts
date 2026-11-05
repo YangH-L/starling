@@ -346,8 +346,22 @@ export function apiDetail(err: unknown): string {
 	return String(err);
 }
 
-/** 读页面遇到这些码时显示中文提示,而不是裸的 "404 world_not_found"。 */
-const WORLD_CODES = ['world_not_found', 'world_busy', 'world_not_initialized', 'worlds_unavailable'];
+/**
+ * 读页面与命令(remember / recall / 对话)遇到这些码时显示中文提示,而不是裸的 "404 world_not_found"。
+ * endpoint_changed(裁定 R59):继承的供应商地址或种类改了,提示去「世界」页重新确认端点。
+ */
+export const WORLD_CODES = [
+	'world_not_found',
+	'world_busy',
+	'world_not_initialized',
+	'worlds_unavailable',
+	'endpoint_changed'
+];
+
+/** 一个裸错误码(如对话 WS 的 error 帧)是已知世界码就给中文提示,否则 null。 */
+export function worldCodeMessage(code: string): string | null {
+	return WORLD_CODES.includes(code) ? worldErrorMessage(code) : null;
+}
 
 /**
  * 读页面的错误文案:ApiError 的 detail 是已知的世界错误码就给中文提示,否则原样用 message。
@@ -356,8 +370,7 @@ const WORLD_CODES = ['world_not_found', 'world_busy', 'world_not_initialized', '
 export function describeError(err: unknown): string {
 	if (err instanceof ApiError) {
 		const d = apiDetail(err);
-		if (WORLD_CODES.includes(d)) return worldErrorMessage(d);
-		return err.message;
+		return worldCodeMessage(d) ?? err.message;
 	}
 	return err instanceof Error ? err.message : String(err);
 }

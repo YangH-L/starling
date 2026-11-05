@@ -60,6 +60,11 @@ DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个�
 
   即 pool._lock → pool._world_locks[name] → engine._lock → supervisor。实际代码里 1 在 2 之内只短暂取
   （查表、改表），从不在持 1 时去取 2。
+
+  app.state.config_lock（threading.Lock，写配置的路由在工作线程里取，见 routes/config.py）排在这四把之前：持着它时
+  会发默认世界的租约（补起 workers-lost 的后台线程时非阻塞取世界锁）、取默认世界的 engine._lock。所以别处要它时
+  一律在取世界锁、engine._lock 之前取，不得在持世界锁或 engine._lock 时等它（重新确认端点只在取世界锁之前持它
+  拷 provider 表，裁定 R59 N-3）。
   持租约的代码不得阻塞地等 _world_locks：关闭、恢复持着世界锁等租约归零，反过来就是死锁。持租约时取
   世界锁的地方只有两处，都不阻塞地等：
     - 首次建引擎（lease 先登记租约、放开 _lock，再取世界锁建引擎）：_acquire_for_build 以 50 毫秒为一段
@@ -91,6 +96,7 @@ delete_world 或关停（close_all），默认世界只在关停时关。
 """
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import os
@@ -561,8 +567,9 @@ class WorldPool:
             return sorted(self._closing)
 
     def list_worlds(self, labels: dict | None = None, offset: int = 0, limit: int = 50) -> dict:
-        """注册表的一页 {"worlds": [记录], "total"}（C++ RegistryDb::list：标签全部匹配、按 created_at 降序，
-        分页参数由 C++ 校验，invalid_world_query）。只读注册表，不开任何世界的库；开着的世界的计数由调用方
+        """注册表的一页 {"worlds": [记录], "total"}（C++ RegistryDb::list：标签全部匹配；写过的世界按最近写入
+        last_write_at 降序在前，没写过的在后，同序再按 created_at 降序、name 升序，spec §14；分页参数由 C++ 校验，
+        invalid_world_query）。只读注册表，不开任何世界的库；开着的世界的计数由调用方
         经 live_stats 现读。"""
         reg = self._require_registry()
         return reg.list(labels=dict(labels or {}), offset=offset, limit=limit)
@@ -1047,7 +1054,7 @@ class WorldPool:
             engine = None
         return settings, warnings
 
-    def reconfirm_endpoints(self, world: str) -> tuple[dict, list[str]]:
+    def reconfirm_endpoints(self, world: str, *, config_lock=None) -> tuple[dict, list[str]]:
         """重新确认端点（裁定 R53）：把 starling.json 里各 provider 此刻的 endpoint（不含密钥，与 world_settings 同一套
         字段规则）交给 C++ reconfirm_world_endpoints，世界里引用某个 provider 的角色整段换成它此刻的 endpoint，
         provider 已被删掉的角色解绑。返回 (实际生效的完整设置, 重嵌入提示)。开着的世界按变了的角色热换适配器
@@ -1055,14 +1062,19 @@ class WorldPool:
         地址的嵌入只重建适配器，解绑的嵌入换成占位，两者都不删向量。
 
         默认世界拒绝，码与 PUT 改它的 endpoint 相同（invalid_settings）：它的端点归 config，同步时自动跟上。
-        持世界锁，理由同 update_settings。"""
+        持世界锁，理由同 update_settings。
+
+        config_lock（app.state.config_lock，裁定 R59 N-3）：各 provider 此刻的 endpoint 表在这把锁内拷出。POST /api/config
+        持着它原地改 provider 条目（种类、地址、密钥依次写），不持锁拷就可能拷到改了一半的条目（新种类配旧地址）。锁顺序见
+        模块文档：config_lock 排在世界锁之前，所以这里只在取世界锁之前短暂持它，拷完即放，不在持世界锁时取。"""
         reg = self._require_registry()
         self._record(world)                           # world_not_found
         if world == reg.default_world():
             raise WorldSwitchError(
                 "invalid_settings", "the default world's endpoints come from the dashboard config")
-        current = {name: provider_endpoint_settings(name, prov or {})
-                   for name, prov in list(self._config.providers.items())}
+        with config_lock if config_lock is not None else contextlib.nullcontext():
+            current = {name: provider_endpoint_settings(name, prov or {})
+                       for name, prov in list(self._config.providers.items())}
         with self._world_lock(world):
             merged = reg.reconfirm_endpoints(world, current)
             settings = _core.world_effective_settings(merged)

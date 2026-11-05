@@ -345,6 +345,11 @@ describe('describeError 与 worlds_unavailable', () => {
 		])
 			expect(describeError(new ApiError(404, '/x', `404 ${code}`))).toBe(text);
 		expect(describeError(new ApiError(500, '/x', '500 boom'))).toBe('500 boom');
+		// 裁定 R59:interact 的 remember / recall 经 describeError,409 endpoint_changed 给中文提示。
+		expect(describeError(new ApiError(409, '/api/w/w1/remember', '409 endpoint_changed'))).toBe(
+			worldErrorMessage('endpoint_changed')
+		);
+		expect(worldErrorMessage('endpoint_changed')).toContain('重新确认端点');
 		expect(describeError(new Error('plain'))).toBe('plain');
 		expect(describeError('str')).toBe('str');
 	});

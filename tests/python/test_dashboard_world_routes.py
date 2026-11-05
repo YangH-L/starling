@@ -1433,6 +1433,38 @@ def test_reconfirm_after_the_embedding_provider_was_deleted_keeps_the_vectors(tm
         assert _vector_snapshot(db) == before
 
 
+
+def test_reconfirm_copies_the_provider_table_under_the_config_lock(tmp_path, monkeypatch):
+    """审查 N-3（裁定 R59）：重新确认拷 provider 表时持 config_lock，与 POST /api/config 互斥。这里在另一个线程里持着
+    config_lock，期间把 p 改到一半（只写了新地址），放锁前写完（种类也换掉）。重新确认要等锁：拷到的是改完的条目，
+    不是改了一半的。去掉修复后，重新确认不等锁，拷到改了一半的条目（新地址配旧种类）。"""
+    import threading
+    import time
+    built: list = []
+    cfg, client = _recording_client(tmp_path, monkeypatch, built,
+                                    {"provider": "openai", "model": "m1",
+                                     "base_url": "http://h.example", "api_key": "sk-1"})
+    with client:
+        pool = _pool(client)
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        lock = client.app.state.config_lock
+        half = threading.Event()
+
+        def edit():
+            with lock:
+                cfg.providers["p"]["base_url"] = "http://h2.example"
+                half.set()
+                time.sleep(0.5)
+                cfg.providers["p"]["provider"] = "anthropic"
+        editor = threading.Thread(target=edit)
+        editor.start()
+        assert half.wait(5)
+        resp = client.post("/api/worlds/w1/settings/reconfirm")
+        editor.join()
+        assert resp.status_code == 200, resp.text
+        stored = pool.registry.get("w1")["settings"]["extraction"]
+        assert (stored["provider"], stored["base_url"]) == ("anthropic", "http://h2.example"), stored
+
 def test_world_list_sorts_by_last_write_then_creation(client):
     """spec §14（审查 M-1）：写过的世界按最近写入降序在前（排序按注册表缓存列），没写过的在后。"""
     pool = _pool(client)

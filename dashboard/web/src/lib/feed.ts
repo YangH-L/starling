@@ -114,6 +114,9 @@ function describeTick(p: Record<string, unknown>): string {
 		const n = num(val);
 		if (n !== null && n > 0) parts.push(`${key} ${n}`);
 	}
+	// 跳过了嵌入阶段(嵌入端点失效、或降载):积压没被消化,不能说成「空转」(裁定 R59)。
+	const embedSkipped = Array.isArray(p.stages_skipped) && p.stages_skipped.includes('embed');
+	if (embedSkipped) parts.push('跳过嵌入');
 	if (parts.length) {
 		const mode = typeof p.mode === 'string' && p.mode ? `${p.mode}:` : '';
 		return `${mode}${parts.join(' · ')}`;

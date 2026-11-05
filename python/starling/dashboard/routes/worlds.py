@@ -276,9 +276,10 @@ def _update_settings(pool, providers: dict, name: str, overrides: dict) -> dict:
     return out
 
 
-def _reconfirm_endpoints(pool, providers: dict, name: str) -> dict:
-    """重新确认端点之后回世界详情（设置去掉密钥，与 GET /api/worlds/{name} 同形），重嵌入提示放 warnings。"""
-    _settings, warnings = pool.reconfirm_endpoints(name)
+def _reconfirm_endpoints(pool, providers: dict, name: str, config_lock) -> dict:
+    """重新确认端点之后回世界详情（设置去掉密钥，与 GET /api/worlds/{name} 同形），重嵌入提示放 warnings。provider 表在
+    config_lock 内拷出（与 POST /api/config 互斥，裁定 R59 N-3）。"""
+    _settings, warnings = pool.reconfirm_endpoints(name, config_lock=config_lock)
     out = _world_detail(pool, providers, name)
     if warnings:
         out["warnings"] = warnings
@@ -375,7 +376,8 @@ def build_worlds_router(require_token) -> APIRouter:
         # invalid_settings（同 PUT 改它的 endpoint）。
         pool = _pool(request)
         _require_registry(pool)
-        return await _run(_reconfirm_endpoints, pool, request.app.state.config.providers, name)
+        return await _run(_reconfirm_endpoints, pool, request.app.state.config.providers, name,
+                          getattr(request.app.state, "config_lock", None))
 
     @router.post("/worlds/{name}/close")
     async def close_world(request: Request, name: str):
