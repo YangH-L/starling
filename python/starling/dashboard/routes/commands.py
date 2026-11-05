@@ -4,6 +4,9 @@ Engine calls run real network I/O (LLM extraction / embedding, with C++-side
 retry backoff up to tens of seconds), so handlers offload them to a worker
 thread via anyio.to_thread — running them inline on the event loop would
 freeze every other request and the WS heartbeat for the whole call.
+
+按世界寻址（见 world_scope）：同一份路由挂在 /api（默认世界）与 /api/w/{world} 下，引擎是该世界的
+引擎（引擎池按需打开）。广播带世界名（realtime.world_event）。
 """
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from starling.dashboard.world_manager import WorldSwitchError, engine_lease
+from starling.dashboard.routes.world_scope import lease_off_loop, world_name
 
 
 def _now_iso() -> str:
@@ -77,29 +80,21 @@ class CommitmentBody(BaseModel):
     stmt_id: str            # ACTIVE 承诺手动流转(fulfill/withdraw);非 ACTIVE → 409
 
 
-def _build_engine(config):
-    from starling.dashboard.engine import DashboardEngine
-    return DashboardEngine(config)
-
-
-async def _engine(request: Request):
-    """依赖项：持一份引擎租约，覆盖整个请求（线程池排队、锁外的 LLM 阶段、最后的提交），
-    请求结束（响应发出）后归还。engine 还是 None 时按当前 config 惰性建一个。
+async def _engine(request: Request, world: str = Depends(world_name)):
+    """依赖项：持 world 的一份引擎租约，覆盖整个请求（线程池排队、锁外的 LLM 阶段、最后的提交），
+    请求结束（响应发出）后归还。世界没开着时池按需建它的引擎。
 
     Single-process only: under `uvicorn --workers N` each worker would build
     its own engine writing the same SQLite. Run one worker.
 
-    世界切换中（见 WorldManager.lease）→ 503 world_switching：切换要等在途租约全部归还
-    才丢旧引擎，窗口里的新请求不能再拿到旧引擎，也不能按旧 config 惰性重建一个。
+    世界不存在 → 404 world_not_found；正在关闭、恢复、删除 → 503 world_busy（world_scope 的异常处理器）：
+    关闭与恢复要等在途租约全部归还才丢引擎，窗口里的新请求不能再拿到旧引擎。
 
-    取租约与进入 try 之间不能有 await：任务在那里被取消，租约就永远不归还，此后每次切换
-    都会等满超时回 ingest_busy。所以同步取（与旧实现一样，惰性构建在事件循环上做）。
+    租约在工作线程里取（裁定 R32，world_scope.lease_off_loop）：世界没开着时要取它的世界锁建引擎，世界锁
+    可能被快照、清理归档占着，事件循环不能等它。取到之后立刻进 try（await 返回与 try 之间没有检查点），
+    请求被取消也照样归还；取的途中被取消，由 lease_off_loop 归还线程随后拿到的租约。
     """
-    try:
-        lease = engine_lease(request.app.state, build=_build_engine)
-    except WorldSwitchError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail=exc.code) from exc
+    lease = await lease_off_loop(request.app.state.pool, world)
     try:
         yield lease.engine
     finally:
@@ -107,7 +102,8 @@ async def _engine(request: Request):
 
 
 def build_commands_router(require_token) -> APIRouter:
-    router = APIRouter(prefix="/api", dependencies=[Depends(require_token)])
+    """路由不带前缀：create_app 把它挂在 /api 与 /api/w/{world} 两处（见 world_scope）。"""
+    router = APIRouter(dependencies=[Depends(require_token)])
 
     @router.post("/remember")
     async def remember(body: RememberBody, request: Request, eng=Depends(_engine)):
@@ -263,6 +259,7 @@ def build_commands_router(require_token) -> APIRouter:
 
 
 async def _broadcast(request: Request, kind: str, payload: dict) -> None:
+    """本请求世界上的事件广播（带世界名）。"""
     mgr = getattr(request.app.state, "ws_manager", None)
     if mgr is not None:
-        await mgr.broadcast({"type": kind, "payload": payload})
+        await mgr.broadcast_world(kind, world_name(request), payload)

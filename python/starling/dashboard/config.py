@@ -195,6 +195,94 @@ class DashboardConfig:
             "STARLING_DASH_INGEST_SPOOL", str(_DEFAULT_INGEST_SPOOL))
         return Path(configured).expanduser()
 
+    # ----- 记忆服务：数据目录与默认世界的设置（spec §8、§10.1） -----
+    @property
+    def data_dir(self) -> str:
+        """注册表（registry.db）与新世界目录 worlds/ 所在的目录：环境变量 STARLING_DATA_DIR，
+        没设就是默认世界库文件所在的目录（今天 ~/.starling）。db_path 没有父目录（:memory:、空串、
+        裸文件名）时为空串：没有地方放注册表，引擎池只服务默认世界（裁定 R6）。这个判断先于环境
+        变量：否则测试里的 :memory: 会被登记成某个目录下的默认世界。"""
+        db_path = self.db_path
+        if not db_path or db_path == ":memory:" or not os.path.dirname(db_path):
+            return ""
+        env = os.environ.get("STARLING_DATA_DIR")
+        if env:
+            return str(Path(env).expanduser())
+        return os.path.dirname(os.path.abspath(db_path))
+
+    def world_settings(self) -> dict:
+        """把当前 provider / roles / lane / gist / tick 转成世界设置的部分 dict（字段见 C++
+        world_settings.hpp）。只做字段改名，不做判断：合并、校验、补默认值都在 C++
+        （registry.update_settings）。不含密钥：endpoint 只记 provider_name 与当时的 base_url，
+        密钥在调用时按 provider_name 从 providers 取（spec §8.3）。不带 background.auto_snapshot
+        （裁定 R16），所以同步默认世界时保留注册表里按世界存的自动快照配置。
+
+        没绑定的角色（或绑到不存在的 provider）写 null，gist_thresholds 为空时写 null：合并本身删不掉
+        键，null 让 C++ 删掉注册表里的旧绑定、把阈值重置为 {}（裁定 R24）。chat 没绑定时按
+        DashboardConfig.chat() 的回退取抽取的 provider。vector_backend 永远写 sqlite（裁定 R26）：
+        注册表里的设置只收 sqlite，zvec 不进存着的、被继承的设置；默认世界的引擎直接按 config 的后端建。"""
+        out: dict = {}
+        for role, name in (("extraction", self.roles.get("extraction")),
+                           ("embedding", self.roles.get("embedding")),
+                           ("chat", self.roles.get("chat") or self.roles.get("extraction")),
+                           ("consolidation", self.roles.get("consolidation"))):
+            prov = self.providers.get(name) if name else None
+            out[role] = _endpoint_settings(name, prov) if prov is not None else None
+        out["vector_backend"] = "sqlite"
+        out["source_lane"] = {
+            "enabled": bool(self.source_lane_enabled),
+            "render_time": bool(self.source_lane_render_time),
+            "tau_source": float(self.source_lane_tau_source),
+            "model": self.source_lane_model,
+            "dim": int(self.source_lane_dim),
+            "k_source": int(self.source_lane_k_source),
+            "chunk_byte_budget": int(self.source_lane_chunk_byte_budget),
+        }
+        gist = {k: v for k, v in (self.gist_thresholds or {}).items() if v is not None}
+        out["gist_thresholds"] = gist or None
+        out["background"] = {"tick_interval_s": float(self.tick_interval_s)}
+        return out
+
+
+# provider dict 里与 C++ EndpointSettings 同名的非密钥字段。api_key 永不写出。
+_ENDPOINT_TEXT_KEYS = ("base_url", "model", "thinking_type")
+_ENDPOINT_INT_KEYS = ("dim", "max_tokens", "timeout_ms", "max_retries")
+
+
+def _endpoint_settings(name: str, prov: dict) -> dict:
+    """一个 provider（starling.json 的一项）→ 世界设置里的 endpoint dict。None 与缺省的字段不写出，
+    由 C++ 补默认值；provider 缺省按 openai 写出（与 _build_chat_adapter 的缺省一致）。"""
+    ep: dict = {"provider_name": name, "provider": prov.get("provider") or "openai"}
+    for key in _ENDPOINT_TEXT_KEYS:
+        if prov.get(key) is not None:
+            ep[key] = str(prov[key])
+    for key in _ENDPOINT_INT_KEYS:
+        if prov.get(key) is not None:
+            ep[key] = int(prov[key])
+    if prov.get("enable_thinking") is not None:
+        ep["enable_thinking"] = bool(prov["enable_thinking"])
+    return ep
+
+
+def provider_endpoint_settings(name: str, prov: dict) -> dict:
+    """一个 provider → 世界设置里的 endpoint dict（不含密钥），与 world_settings() 建 endpoint 同一套字段规则。
+    重新确认端点（裁定 R53）把它交给 C++。"""
+    return _endpoint_settings(name, prov)
+
+
+def provider_endpoint(prov: dict) -> dict:
+    """一个 provider 此刻的端点身份 {"provider", "base_url"}（裁定 R51），按 world_settings() 写 endpoint 的同一套
+    规则归一（种类缺省 openai、base_url 缺省空串），所以与世界里记的 endpoint 可以逐字段比较。比较在 C++。"""
+    ep = _endpoint_settings("", prov)
+    return {"provider": ep["provider"], "base_url": ep.get("base_url", "")}
+
+
+def provider_endpoints(providers: dict) -> dict[str, dict]:
+    """{provider 名: provider_endpoint(...)}，交给 C++ 核对客户端写的设置（裁定 R40、R51）。不含密钥。
+    先拍一份快照再遍历：/api/config 的 _post_config（setdefault）与 _restore（clear + update）可能同时在改这个
+    dict，直接遍历会抛「dictionary changed size during iteration」。list(...) 由 C 实现、持 GIL 一次拷完。"""
+    return {name: provider_endpoint(prov or {}) for name, prov in list(providers.items())}
+
 
 def _migrate_legacy_model_config(cfg: DashboardConfig, data: dict) -> None:
     """Old `{llm, embedder}` files → providers/roles (one-way, on load).

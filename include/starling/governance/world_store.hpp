@@ -5,15 +5,20 @@
 // 设计稿：docs/superpowers/specs/2026-10-25-world-scene-management-design.md
 //   §3 世界注册表、§4 快照。
 //
-// 一个世界 = 一个 SQLite 文件 + 一个租户 id。注册表 worlds.json 是世界路径的
-// 唯一来源：任何 API 都不接受客户端传入文件路径。绑定层（Python / HTTP）只做
-// 转发；注册、校验、保留策略与快照语义全部在这里。
+// 一个世界 = 一个 SQLite 文件 + 一个租户 id。注册表 registry.db（RegistryDb，见 registry_db.hpp）
+// 是世界路径的唯一来源：任何 API 都不接受客户端传入文件路径。绑定层（Python / HTTP）只做
+// 转发；注册、校验、保留策略与快照语义全部在这里。旧注册表 worlds.json 只剩一次性导入
+// （import_worlds_json，registry_db.hpp）。
+//
+// 并发：调用方必须按世界串行化快照、回滚、修剪、删快照与自动快照（即原来 WorldManager 的管理锁，
+// 现在按世界持有）。RegistryDb 自己的互斥锁只保护注册表行：take_snapshot 先读快照列表、再写文件、
+// 最后登记，两步之间不持它的锁，同一世界上并发的两次快照会互相把对方刚改好名、还没登记的文件
+// 当成残留清扫掉。不同世界之间互不影响。
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
-#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -32,6 +37,7 @@ private:
 // code 取值：invalid_world_name | world_exists | world_not_found | world_protected
 //           | registry_corrupt | invalid_retention | snapshot_not_found
 //           | insufficient_disk | snapshot_failed
+//           | labels_immutable（RegistryDb::set_labels：世界已有标签，标签创建后不可改）
 //           | invalid_snapshot_kind（take_snapshot：kind 不是 manual / auto，或 kind 与 reason 不配对）
 //           | world_tenant_mismatch（verify_world_tenant：库里有别的租户的行）
 //           | snapshot_unsupported_backend（take_snapshot / rollback_world：vector_backend 不是 sqlite）
@@ -43,6 +49,8 @@ private:
 //           | invalid_auto_snapshot（W4：interval_hours 越界、session 触发缺 session_id、
 //             now_iso 解析不了（AutoTrigger 与 SnapshotOptions 的都算）、触发类型非法、
 //             list_sessions 的 limit 越界）
+//           | invalid_settings（world_settings：设置 JSON 解析失败、未知键、类型错误）
+//           | endpoint_changed（require_endpoint_unchanged：继承来的 provider 的种类或 base_url 已被改动，或 provider 已被删掉）
 
 struct SnapshotEntry {
     std::string id;           // 20261025T011200Z-a1b2
@@ -62,100 +70,61 @@ struct SnapshotEntry {
     std::string content_mark;
 };
 
-// 每个世界的自动快照配置（W4）。JSON：{"on_session": bool, "interval_hours": int}。
+// 每个世界的自动快照配置（W4）。存在世界设置 settings_json 的 background.auto_snapshot 里
+// （world_settings.hpp），JSON：{"on_session": bool, "interval_hours": int}。
 //   on_session：某个 session_id 在该世界第一次写入之前先拍一份；
 //   interval_hours：距上一份自动快照超过这么多小时、且有新写入时拍一份；0 表示关闭，上限 8760。
 struct AutoSnapshotConfig {
     bool on_session = false;
     std::int64_t interval_hours = 0;
-};
-
-struct WorldEntry {
-    std::string name;
-    std::string tenant;
-    std::string db_path;      // 绝对路径
-    std::string snapshot_dir; // 绝对路径
-    std::string label;
-    std::string created_at;
-    // 注册表里缺这个字段时（W4 之前的注册表），registry_from_json 补默认值：默认世界
-    // {false, 24}，其余世界 {true, 0}。保存时总是写出。
-    AutoSnapshotConfig auto_snapshot;
-};
-
-struct Registry {
-    int version = 1;
-    std::string default_world = "default";
-    std::string active = "default";
-    int snapshot_retention = 5;
-    std::map<std::string, WorldEntry> worlds;                       // 按 name 排序
-    std::map<std::string, std::vector<SnapshotEntry>> snapshots;    // world name → 列表
+    bool operator==(const AutoSnapshotConfig&) const = default;
 };
 
 [[nodiscard]] bool is_valid_world_name(std::string_view name);
-// load 与 save 用同一套校验（registry_corrupt / invalid_retention）：
-//   - default / active 已登记，snapshot_retention >= 2；
-//   - 除 default 外每个世界名都满足 is_valid_world_name；
-//   - 每个 db_path / snapshot_dir 都是绝对路径；
-//   - 布局（registry_dir 取注册表文件所在目录，世界目录 = <registry_dir>/worlds/<name>）。以下三条
-//     都在解析符号链接之后判断（含末端悬空的链接），不因字面路径在世界目录里就放行：
-//       1. 世界目录本身解析后恰好是（解析后的）<registry_dir>/worlds/<name>：不能是指到别的世界
-//          目录或其子目录的符号链接（否则删一个世界会删掉它的兄弟），尚不存在时照常通过；
+
+class RegistryDb;   // registry_db.hpp：世界注册表 registry.db（SQLite）
+
+// ---- 注册表不变式（取代 worlds.json 时代 load_registry 的校验） -----------------
+//
+// 注册表行只由 C++ 写（RegistryDb 的方法、import_worlds_json），路径都由 dir_id 推出；这里查的是
+// 手改过的 registry.db 与被换成符号链接的世界目录。以前 WorldManager 每次操作之前都 load_registry，
+// 整份注册表校验一遍。现在（裁定 R12）每个删除或替换文件的函数自己在开头、任何文件 I/O 之前对
+// 这个世界调用 validate_world：take_snapshot（含残留清扫）、apply_retention、delete_snapshot、
+// take_auto_snapshot（含修剪）、check_rollback、rollback_world、list_rollback_archives、
+// purge_rollback_archives。违反时抛 validate_world 的码（registry_corrupt 等），什么都不删、不建。
+// 调用方不必重复；可以另外在启动时调用 validate_registry，尽早拒绝坏注册表。
+// 写路径存不进 validate_world 会拒的设置：settings_from_json / merge_settings 拒绝越界的
+// interval_hours（裁定 R11），所以一次设置更新不会让启动时的 validate_registry 失败。
+//
+// validate_world 只查一个世界（世界不存在抛 world_not_found；保留份数 < 2 抛 invalid_retention），
+// 其余违反都是 registry_corrupt：
+//   - 非 default 世界的名字满足 is_valid_world_name；dir_id 是单独一级路径（非空、不是 "." / ".."、
+//     不含 '/' 与 '\\'）；db_path / snapshot_dir 是绝对路径；settings_json 能被 settings_from_json 解析
+//     （解析的错误码，例如 invalid_settings、invalid_auto_snapshot，写进 registry_corrupt 的消息），
+//     auto_snapshot 的 interval_hours 在 0–8760；
+//   - 布局（世界目录 = <data_dir>/worlds/<dir_id>）。以下三条都在解析符号链接之后判断（含末端悬空的
+//     链接），不因字面路径在世界目录里就放行：
+//       1. 世界目录本身解析后恰好是（解析后的）<data_dir>/worlds/<dir_id>：不能是指到别的世界目录或
+//          其子目录的符号链接（否则删一个世界会删掉它的兄弟），尚不存在时照常通过；
 //       2. 非 default 世界的 db_path 严格位于自己的世界目录之下（default 的库保持原地，不受此限）；
 //       3. 每个世界（含 default）的 snapshot_dir 严格位于自己的世界目录之下。
 //     所以世界目录、snapshots/、world.db 不能是指到世界目录之外的符号链接（指向同一世界目录内
 //     别处可以）；路径解析出错（EACCES、ELOOP）同样按越界处理，消息带上原因。
-//     注册表目录本身可以是符号链接（例如整个 ~/.starling 指到别处）：两侧都解析，比的是同一处。
-//     <registry_dir>/worlds 解析后也必须在 registry_dir 之下；世界目录尚不存在时照常通过。
+//     数据目录本身可以是符号链接（例如整个 ~/.starling 指到别处）：两侧都解析，比的是同一处。
+//     <data_dir>/worlds 解析后也必须在 data_dir 之下；世界目录尚不存在时照常通过。
 //   - 每份快照的 kind 是 manual / auto，path 在字面上位于所属世界的 snapshot_dir 之下；
-//     kind="manual" 时 reason 必须是 "manual"，kind="auto" 时 reason 必须是 "session" 或 "interval"；
-//   - 每个世界的 auto_snapshot（字段存在时）是对象，on_session 是布尔，interval_hours 是 0–8760 的
-//     整数；字段缺失时补默认值（见 WorldEntry::auto_snapshot），不算损坏；
-//   - snapshots 的每个键都是已登记的世界。
-// 违反任一条：load 抛 registry_corrupt；save 同样抛，注册表文件不被覆盖。布局规则 1–3 的消息写明
-// 字段、原路径与解析到的位置，末尾附补救提示（世界目录内的路径不能外链；换盘请整个移动注册表目录）。
-// dashboard 启动时 bootstrap_worlds 就会 load，所以违反布局会让 dashboard 拒绝启动。
-[[nodiscard]] Registry load_registry(const std::filesystem::path& registry_path);
-void save_registry(const std::filesystem::path& registry_path, const Registry& reg);
-// 注册表文件不存在时，创建只含 default 世界的注册表并保存（default 的 auto_snapshot 为 {false, 24}）。
-// 注册表已存在时，原样返回，不修改 default 的路径。
-[[nodiscard]] Registry ensure_registry(const std::filesystem::path& registry_path,
-                                       const std::filesystem::path& default_db_path,
-                                       const std::string& default_tenant);
-// 新世界目录为 <registry_dir>/worlds/<name>/，库文件为 world.db，快照目录为 snapshots/。
-// 只创建目录和注册项，不创建库文件，库文件留到首次激活时由 SqliteAdapter 建。
-// tenant 固定为 name（新建世界不是分叉，没有来源租户）。
-// auto_snapshot 的 interval_hours 越界时抛 invalid_auto_snapshot（在名字校验之后、建目录之前）。
-WorldEntry create_world(Registry& reg, const std::filesystem::path& registry_dir,
-                        const std::string& name, const std::string& label,
-                        std::string_view now_iso,
-                        const AutoSnapshotConfig& auto_snapshot = AutoSnapshotConfig{
-                            .on_session = true, .interval_hours = 0,});
-// 拒绝删除 default 和当前活动世界，抛 world_protected。
-// 删除注册项、对应的快照列表，并删除 <registry_dir>/worlds/<name>/ 整个目录。
-// 只删 registry_dir 之下的路径（防止注册表被篡改后删到外部目录）：<registry_dir>/worlds
-// 本身解析后（例如它是指向外部的符号链接）不在 registry_dir 之下时抛 snapshot_failed，
-// 什么都不删，注册项保留。<registry_dir>/worlds/<name> 解析后也必须恰好是解析后的
-// <registry_dir>/worlds/<name>（与 load_registry 的布局规则 1 相同；本函数可以不经 load 直接调用，
-// 所以自己再查）：指向兄弟世界目录或其子目录、指到外部、解析不了，都抛 snapshot_failed，什么都
-// 不删，注册项保留。
-void delete_world(Registry& reg, const std::filesystem::path& registry_dir,
-                  const std::string& name);
-void set_active(Registry& reg, const std::string& name);
-// 改一个世界的自动快照配置（只改内存，调用方保存）。世界不存在抛 world_not_found，
-// interval_hours 不在 0–8760 抛 invalid_auto_snapshot；两种情况注册表都不变。
-void set_auto_snapshot(Registry& reg, const std::string& world, const AutoSnapshotConfig& config);
+//     kind="manual" 时 reason 必须是 "manual"，kind="auto" 时 reason 必须是 "session" 或 "interval"。
+// 布局规则 1–3 的消息写明字段、原路径与解析到的位置，末尾附补救提示（世界目录内的路径不能外链；
+// 换盘请整个移动数据目录）。规则与 import_worlds_json 导入前对 worlds.json 的检查是同一份代码。
+void validate_world(const RegistryDb& reg, const std::string& world);
+// 对注册表里的每个世界跑 validate_world（按 RegistryDb::list 的顺序，遇到第一个违反就抛）。
+void validate_registry(const RegistryDb& reg);
 
-// ---- JSON 文本（绑定层的序列化入口，格式与 worlds.json 逐字一致） -------------
-//
-// 绑定层把注册表在 Python dict 与 Registry 之间转换时只走这四个函数，序列化
-// 因此只有 C++ 一份实现。
-[[nodiscard]] std::string registry_to_json(const Registry& reg);
-// 解析并校验（与 load_registry 同一套检查）：JSON 语法错误、字段缺失或类型不符、
-// 默认/活动世界未登记抛 registry_corrupt，snapshot_retention < 2 抛 invalid_retention。
-[[nodiscard]] Registry registry_from_json(const std::string& text);
-// 单个世界/快照的 JSON，与注册表里对应条目逐字一致（世界条目不含 name，name 是注册表的键）。
-[[nodiscard]] std::string world_entry_to_json(const WorldEntry& entry);
-[[nodiscard]] std::string snapshot_entry_to_json(const SnapshotEntry& entry);
+// 改一个世界的自动快照配置：只覆盖 background.auto_snapshot，其余设置原样保留。经
+// RegistryDb::update_world_settings 合并，读—改—写在注册表锁内一次完成，与并发的设置更新互不丢改动。
+// 世界不存在抛 world_not_found，interval_hours 不在 0–8760 抛 invalid_auto_snapshot；两种情况注册表
+// 都不变。settings_json 解析不了时 settings_from_json 的错误照抛。
+void set_auto_snapshot(RegistryDb& reg, const std::string& world, const AutoSnapshotConfig& config);
 
 // ---- 世界统计与快照（W2） --------------------------------------------------
 
@@ -165,9 +134,12 @@ struct WorldStats {
     std::int64_t statements = 0;      // WHERE tenant_id = tenant
     std::int64_t engrams = 0;         // WHERE tenant_id = tenant
     std::string world_time;           // 见 snapshot_world_time
+    std::int64_t holders = 0;         // statements 里该租户的 COUNT(DISTINCT holder_id)
+    std::string last_write_at;        // statements 里该租户的 MAX(created_at)；没有行时为空串
 };
 // 只读打开 db_path（mode=ro）。库文件不存在时返回全 0 的统计，不抛异常。
-// 表不存在时（库是空的、未迁移），对应计数为 0。
+// 表不存在时（库是空的、未迁移），对应计数为 0、last_write_at 为空串。
+// holders / last_write_at 是注册表统计缓存（registry_db.hpp update_stats）的来源，引擎池按世界调用。
 [[nodiscard]] WorldStats world_stats(const std::string& db_path, const std::string& tenant);
 
 // 租户不变式（spec §2.1）：一个世界库里只允许有该世界自己的租户。只读打开 db_path，
@@ -204,12 +176,13 @@ struct SnapshotOptions {
 // 1. 取世界；不存在抛 world_not_found。kind 与 reason 不是 manual/manual、auto/session、
 //    auto/interval 之一抛 invalid_snapshot_kind；opts.now_iso 非空且形状不对抛
 //    invalid_auto_snapshot；vector_backend 不是 "sqlite" 抛 snapshot_unsupported_backend；保留份数
-//    非法抛 invalid_retention。都在任何文件 I/O 之前：快照目录还没建，源库还没打开。
+//    非法抛 invalid_retention；validate_world 不通过抛它的码（registry_corrupt 等，裁定 R12）。都在
+//    任何文件 I/O 之前：快照目录还没建，源库还没打开，残留没清扫。
 // 1b. 清扫 snapshot_dir 里上次崩溃留下的残留：名字形如快照 id 的 <id>.db.partial，
-//    以及没有任何注册项引用的 <id>.db（改名之后、调用方存注册表之前崩溃的产物，没有
-//    元数据，列不出来）。只认快照 id 形状的文件名，别的文件一概不碰；每个删除都经
-//    remove_within（不出 snapshot_dir）。清扫失败只记日志，不影响本次快照。
-//    调用方必须按世界串行化快照（WorldManager 的管理锁），否则会把并发快照刚改好名、
+//    以及没有任何注册项引用的 <id>.db（改名之后、登记之前崩溃的产物，没有元数据，列不出来）。
+//    只认快照 id 形状的文件名，别的文件一概不碰；每个删除都经 remove_within（不出
+//    snapshot_dir）。清扫失败只记日志，不影响本次快照。
+//    调用方必须按世界串行化快照（见文件头「并发」），否则会把并发快照刚改好名、
 //    还没登记的文件当成残留。
 // 2. 只读打开 db_path，计算 live_bytes；free_space(snapshot_dir) < 3 * live_bytes 时
 //    抛 insufficient_disk（不写任何文件）。恰好 3 倍放行。
@@ -232,37 +205,37 @@ struct SnapshotOptions {
 //    否则删掉 partial 并抛 snapshot_failed。在这条连接上算 world_time、sessions_complete、content_mark。
 // 6. fs::rename(partial, <id>.db)，填 size_bytes、created_at（opts.now_iso 非空时就是它，
 //    否则取当前时间），session_id 取 opts.session_id。
-// 7. 插到 reg.snapshots[world] 的开头（最新在前），然后调用 apply_retention。
+// 7. 登记到注册表（RegistryDb::put_snapshot，成为该世界最新的一份），然后调用 apply_retention。
+//    登记失败时删掉刚改好名的 <id>.db 并抛 snapshot_failed：不留没有登记的文件（原来由调用方存
+//    注册表失败后调 discard_snapshot_file 补偿，现在在这里做完）。改名之后、登记之前崩溃留下的
+//    <id>.db 由下一次快照的第 1b 步清扫。
 //    成功的快照一定返回它的条目：修剪失败（旧快照路径无法解析或删不掉）在这里
-//    被吞掉，不外抛。列表与磁盘仍一致（每个旧快照先删文件再摘注册项），只是
+//    被吞掉，不外抛。注册表与磁盘仍一致（每个旧快照先删文件再摘注册项），只是
 //    暂时多出几份，下一次 take_snapshot 或显式 apply_retention 会重试。
-// 8. 不负责 save_registry，由调用方保存。
 // opts.kind 不是 "manual" / "auto" 时在写任何文件之前抛 invalid_snapshot_kind
-// （保留策略只认 "auto"，拼错会悄悄丢掉回滚锚点保护）；reason 不配对同样在这里拒，
-// 不等到 save_registry 才报 registry_corrupt。
+// （保留策略只认 "auto"，拼错会悄悄丢掉回滚锚点保护）；reason 不配对同样在这里拒。
 // fs::space 返回「未知」（uintmax_t(-1)，FUSE / 网络文件系统）时跳过磁盘守卫。
 // 任何 SQLite 错误都转成 snapshot_failed，并保证不留下 partial 文件。
-SnapshotEntry take_snapshot(Registry& reg, const std::string& world,
+SnapshotEntry take_snapshot(RegistryDb& reg, const std::string& world,
                             const SnapshotOptions& opts);
 
-// 按保留份数 N 修剪 reg.snapshots[world]，并删除对应的文件，返回被删除的 id 列表。
+// 按保留份数 N（RegistryDb::snapshot_retention）修剪该世界的快照，并删除对应的文件，返回被删除的
+// id 列表。「最新」「最旧」指 RegistryDb::snapshots 的顺序（登记顺序，后登记的在前）。
+// 开头先 validate_world（裁定 R12），不通过抛它的码，什么都不删。
 // 规则（spec §4.4）：
 //   - 总数 <= N：不删。
 //   - 超出部分从最旧的开始删，优先删 auto；auto 删完还超出时才删 manual，从最旧的开始。
 //   - 但列表里有 auto 时，至少保留最新的 1 份 auto（回滚锚点）。
-// 逐个「先删文件、再摘注册项」。路径解析后越出 snapshot_dir（被篡改的注册项、指向外部
-// 的符号链接）时抛 snapshot_failed 并保留该注册项：文件没删，摘掉注册项就再也清不掉它。
-std::vector<std::string> apply_retention(Registry& reg, const std::string& world);
+// 逐个「先删文件、再摘注册项」（每摘一项写一次注册表）。路径解析后越出 snapshot_dir（被篡改的
+// 注册项、指向外部的符号链接）时抛 snapshot_failed 并保留该注册项：文件没删，摘掉注册项就再也
+// 清不掉它。此前已删的 victim 已从注册表摘掉。摘注册项失败抛 snapshot_failed，文件已删、注册项
+// 还在：下一次修剪对不存在的文件照常删除（remove_within 返回 true），再摘一次。
+std::vector<std::string> apply_retention(RegistryDb& reg, const std::string& world);
 
-// 删除一份快照（注册项 + 文件）。不存在时抛 snapshot_not_found。文件已经不在了也照删
-// 注册项。只删 snapshot_dir 之下的文件：越界时抛 snapshot_failed，注册项保留。
-void delete_snapshot(Registry& reg, const std::string& world, const std::string& snapshot_id);
-
-// 只删一份快照的文件，不动注册表（reg 是 const）。给 take_snapshot 成功、调用方却没能
-// 存下注册表时做补偿：新文件没有登记，不删就成了列不出来的孤儿。不存在抛
-// world_not_found / snapshot_not_found，越出 snapshot_dir 抛 snapshot_failed。
-void discard_snapshot_file(const Registry& reg, const std::string& world,
-                           const std::string& snapshot_id);
+// 删除一份快照（注册项 + 文件）。开头先 validate_world（裁定 R12，字面越出 snapshot_dir 的条目在这里
+// 就以 registry_corrupt 拒绝）。不存在时抛 snapshot_not_found。文件已经不在了也照删注册项。只删
+// snapshot_dir 之下的文件：解析符号链接后越界时抛 snapshot_failed，注册项保留。
+void delete_snapshot(RegistryDb& reg, const std::string& world, const std::string& snapshot_id);
 
 // ---- 自动快照与会话清单（W4） -------------------------------------------------
 //
@@ -280,15 +253,17 @@ struct AutoSnapshotResult {
     // unchanged 两种触发都会给（按会话：同一会话已有内容相同的按会话快照）。拍了快照时为空。
     std::string skipped;
     // 修剪卡住、拒绝拍时的原因（第 5 步，Codex I-3 / r2 R2-2），以 "retention cannot prune" 开头，
-    // 附修剪的错误。非空时 taken 为空、skipped 为空，reg 可能已被部分修剪：调用方必须保存 reg，
-    // 并把这次当作失败（码 snapshot_failed）。
+    // 附修剪的错误。非空时 taken 为空、skipped 为空，注册表可能已被部分修剪（已写入 registry.db）：
+    // 调用方把这次当作失败（码 snapshot_failed）。
     std::string refused;
 };
 
-// 按触发判断要不要拍一份自动快照，要拍就走 take_snapshot（kind="auto"）。只改内存，调用方保存。
-// 顺序：
+// 按触发判断要不要拍一份自动快照，要拍就走 take_snapshot（kind="auto"）。配置取自该世界设置的
+// background.auto_snapshot（settings_from_json(rec.settings_json)）。顺序：
 //   1. 世界不存在抛 world_not_found；trigger.kind 不是 session / interval、now_iso 解析不了抛
-//      invalid_auto_snapshot。
+//      invalid_auto_snapshot；然后 validate_world（裁定 R12：第 5 步的修剪与拍快照都删文件），不通过
+//      抛它的码（存着的 settings_json 解析不了、interval_hours 越界都是 registry_corrupt），不当成
+//      refused。
 //   2. base.vector_backend 不是 "sqlite" → skipped="unsupported_backend"，不抛、不写盘。
 //   3. 按会话：on_session 为 false → disabled；session_id 为空抛 invalid_auto_snapshot；库里已有
 //      这个会话（只读查 source_unit_meta，表或库文件不存在算没有）→ known_session；
@@ -307,17 +282,17 @@ struct AutoSnapshotResult {
 //   5. 决定要拍之后、拍之前（Codex I-3）：先跑一次 apply_retention（异常接住）；之后该世界的快照数
 //      仍 >= snapshot_retention 就返回 refused（原因点名 retention 与修剪的错误），不拍、不写新文件、
 //      不抛。否则修剪卡住（最旧的 auto 路径越界或删不掉）时，每次触发都会多登记一份，无人值守地
-//      一直涨到磁盘守卫。拒绝时 reg 保留部分修剪的结果：卡住条目之前排着的正常 victim 已删文件、
-//      已摘注册项（r2 R2-2），调用方必须保存 reg 并计为失败，否则注册表里留下文件已不在的条目。
+//      一直涨到磁盘守卫。拒绝时部分修剪的结果已写入注册表：卡住条目之前排着的正常 victim 已删文件、
+//      已摘注册项（r2 R2-2），调用方计为失败。
 //      修剪成功或本来就少于保留份数时照常拍，新快照让总数至多到保留份数。手动 take_snapshot 不做
 //      这一步（W2 语义：有人在场，修剪失败只是暂时多一份），所以封顶只约束自动触发。
 // 拍出来的条目 created_at 与 id 的时间前缀都取 trigger.now_iso（经 SnapshotOptions::now_iso）。
 // base 的 free_space / before_vacuum / note 照传，kind / reason / session_id / now_iso 由这里决定。
-// take_snapshot 的磁盘守卫与保留策略照常生效，失败照常抛出。第 5 步的修剪若删掉了旧条目，reg 已
-// 改动；随后拍快照抛错时这些删除已落盘（文件先删、注册项后摘），而调用方拿不到 reg：注册表里留下
-// 文件已不在的条目，下一次成功的修剪会把它们摘掉（remove_within 对不存在的文件照常返回）。
-AutoSnapshotResult take_auto_snapshot(Registry& reg, const std::string& world,
-                                      const AutoTrigger& trigger, const SnapshotOptions& base);
+// take_snapshot 的磁盘守卫与保留策略照常生效，失败照常抛出。第 5 步的修剪若删掉了旧条目，这些
+// 删除（文件与注册项）在随后拍快照抛错时也已经落盘。
+AutoSnapshotResult take_auto_snapshot(RegistryDb& reg, const std::string& world,
+                                      const AutoTrigger& trigger,
+                                      const SnapshotOptions& base = SnapshotOptions{});
 
 struct SessionRow {
     std::string session_id;
@@ -341,22 +316,26 @@ struct SessionList {
 // 锚点取注册表里 kind="auto"、reason="session"、session_id 相同的快照中 created_at 最新的一份。
 // 世界不存在抛 world_not_found；limit 不在 1–1000 抛 invalid_auto_snapshot；库文件或表不存在
 // 返回空清单（total=0）；库读不出抛 snapshot_failed。
-[[nodiscard]] SessionList list_sessions(const Registry& reg, const std::string& world,
+[[nodiscard]] SessionList list_sessions(const RegistryDb& reg, const std::string& world,
                                         std::int64_t limit);
 
 // ---- 回滚与归档（W3） ------------------------------------------------------
 //
-// 设计稿 §5.1 语义 A（丢掉后续）。世界 home = <registry_dir>/worlds/<name>（与 create_world /
-// delete_world 同一推导；snapshot_dir 不参与），归档目录为 <世界 home>/archive。回滚不写注册表。
-// registry_dir 取注册表文件所在目录。
+// 设计稿 §5.1 语义 A（丢掉后续）。世界 home = <data_dir>/worlds/<dir_id>（data_dir 即
+// reg.data_dir()，dir_id 取自注册表；与 RegistryDb::create / remove 同一推导；snapshot_dir 不参与），
+// 归档目录为 <世界 home>/archive。回滚不写注册表。
+//
+// check_rollback、rollback_world、list_rollback_archives、purge_rollback_archives 在取到世界之后先
+// validate_world（裁定 R12），不通过抛它的码（registry_corrupt 等），什么都不建、不删、不替换；
+// 下面的 a、b、c 包含在 validate_world 的布局规则里，仍各自再查一遍（纵深防御，紧挨着动文件）。
 //
 // 归档操作（回滚建硬链接、列出、清理）之前都先 fail closed，此时什么都还没建、没删：
-//   a. <registry_dir>/worlds 解析符号链接后仍在 registry_dir 之下，否则 registry_corrupt
-//      （与 load_registry 同一检查）；
-//   b. 世界 home 解析符号链接后严格在 <registry_dir>/worlds 之下，并且恰好是解析后的
-//      <registry_dir>/worlds/<name>（与 load_registry 的布局规则 1 相同：不经 load 直接调用时，
-//      worlds/sim-1 -> worlds/sim-2 不能让 sim-1 的回滚、列出、清理落到 sim-2 上），否则
-//      snapshot_failed（与 delete_world 同一边界）；
+//   a. <data_dir>/worlds 解析符号链接后仍在 data_dir 之下，否则 registry_corrupt
+//      （与 validate_world 同一检查）；
+//   b. dir_id 是单独一级路径（非空、不是 "." / ".."、不含 '/' 与 '\\'），世界 home 解析符号链接后
+//      严格在 <data_dir>/worlds 之下，并且恰好是解析后的 <data_dir>/worlds/<dir_id>（与 validate_world
+//      的布局规则 1 相同：不经校验直接调用时，worlds/<sim-1> -> worlds/<sim-2> 不能让 sim-1 的回滚、
+//      列出、清理落到 sim-2 上），否则 snapshot_failed（与 RegistryDb::remove 同一边界）；
 //   c. archive/ 解析符号链接后严格在世界 home 之下，否则 snapshot_failed。
 // 回滚只在 a、b 通过之后才 create_directories(archive)，所以世界目录之外什么都不会被建出来。
 
@@ -376,15 +355,15 @@ struct RollbackResult {
 };
 
 // 回滚的预检：只做 rollback_world 第 1–4 步的只读检查，顺序、错误码与 rollback_world 相同：
-//   world_not_found → snapshot_not_found → snapshot_unsupported_backend → 快照路径越出
-//   snapshot_dir（snapshot_failed）→ 快照文件缺失或不是普通文件（snapshot_corrupt）→ 世界 home
-//   的 a、b 检查（registry_corrupt / snapshot_failed）→ insufficient_disk（2 ×）。
+//   world_not_found → validate_world（registry_corrupt 等，裁定 R12）→ snapshot_not_found →
+//   snapshot_unsupported_backend → 快照路径越出 snapshot_dir（snapshot_failed）→ 快照文件缺失或不是
+//   普通文件（snapshot_corrupt）→ 世界 home 的 a、b 检查（registry_corrupt / snapshot_failed）→
+//   insufficient_disk（2 ×）。
 // 什么都不动：不清扫、不复制、不建目录。给调用方在停引擎之前先拒掉「不改输入、重试也过不了」
 // 的请求（WorldManager.rollback 在切换窗口之前调它）。通过不代表回滚一定成功：rollback_world
 // 自己再查一遍，以它为准（预检之后状态可能变了）。非 WorldStoreError 的异常转成 snapshot_failed。
-void check_rollback(const Registry& reg, const std::filesystem::path& registry_dir,
-                    const std::string& world, const std::string& snapshot_id,
-                    const RollbackOptions& opts);
+void check_rollback(const RegistryDb& reg, const std::string& world,
+                    const std::string& snapshot_id, const RollbackOptions& opts);
 
 // 把世界 world 的库替换成快照 snapshot_id 的内容（spec §5.1 语义 A）。
 // 别的连接：第 8 步的探测（BEGIN EXCLUSIVE，busy_timeout 0）看得见哪些连接取决于库的日志模式
@@ -397,7 +376,8 @@ void check_rollback(const Registry& reg, const std::filesystem::path& registry_d
 // 不变式：库路径上任何时刻都是一份完整的库（替换前是旧库，替换后是新库），从不为空。
 // 归档用硬链接建出来，替换是 rename(partial, 库) 一步原子完成。
 // 顺序（第 1–4 步与 check_rollback 是同一份代码）：
-//   1. 取世界（world_not_found）与快照（snapshot_not_found）。opts.vector_backend 不是
+//   1. 取世界（world_not_found），validate_world（registry_corrupt 等，裁定 R12），再取快照
+//      （snapshot_not_found）。opts.vector_backend 不是
 //      "sqlite" 抛 snapshot_unsupported_backend。都在任何文件 I/O 之前。
 //   2. 快照路径解析符号链接后必须严格在该世界 snapshot_dir 之下（snapshot_failed）。
 //   3. 快照文件缺失或不是普通文件 → snapshot_corrupt。
@@ -426,8 +406,8 @@ void check_rollback(const Registry& reg, const std::filesystem::path& registry_d
 //      必须仍在世界 home 之下），用 create_hard_link 给库建归档名
 //      `<archive>/<库文件名>.pre-rollback-<compact_now>-<4 hex>`（名字被占用就重抽）。建不了
 //      （EXDEV、文件系统不支持硬链接、权限）→ snapshot_failed，什么都没变。EXDEV 的错误信息写明
-//      归档目录与库不在同一个文件系统、要把注册表挪到库旁边（只在 STARLING_WORLDS_REGISTRY 指到
-//      另一个卷、default 世界的库仍在原卷时出现；不退回复制）。
+//      归档目录与库不在同一个文件系统、要把数据目录挪到库旁边（只在数据目录在另一个卷、default
+//      世界的库仍在原卷时出现；不退回复制）。
 //   10. 删掉库旁边的空 `-wal` / `-journal` 和 `-shm`（只读读者会留下 32 KB 的 `-shm` 与
 //      0 字节的 `-wal`）。在替换之前删：它们不带状态（-wal / -journal 已确认为空，-shm 由 SQLite
 //      按主文件加 WAL 重建），替换随后失败时旧库少了它们照常可用；替换之后再删，会有一段时间
@@ -438,9 +418,8 @@ void check_rollback(const Registry& reg, const std::filesystem::path& registry_d
 // snapshot_failed。归档名摘不掉时它是现役库的第二个名字：记 stderr，错误信息写明不能用写
 // 连接打开它（清理它只删一个名字，无害）。
 // 不改注册表。所有非 WorldStoreError 的异常都转成 snapshot_failed。
-RollbackResult rollback_world(const Registry& reg, const std::filesystem::path& registry_dir,
-                              const std::string& world, const std::string& snapshot_id,
-                              const RollbackOptions& opts);
+RollbackResult rollback_world(const RegistryDb& reg, const std::string& world,
+                              const std::string& snapshot_id, const RollbackOptions& opts);
 
 struct ArchiveEntry {
     std::string name;            // 文件名，例如 "world.db.pre-rollback-20261026T120000Z-ab12"
@@ -450,14 +429,13 @@ struct ArchiveEntry {
 // 列出 <世界 home>/archive 下文件名形如 "*.pre-rollback-<YYYYMMDDTHHMMSSZ>-<4 hex>" 的
 // 普通文件（跳过符号链接），按名字降序（最新在前）。目录不存在时返回空。与现役库是同一个文件
 // （fs::equivalent）的条目不是归档，跳过（不计个数、不计字节、不清理）。
-// 不存在的世界抛 world_not_found；a、b、c 检查（见上）不通过、或读不出时抛 registry_corrupt /
-// snapshot_failed。
-[[nodiscard]] std::vector<ArchiveEntry> list_rollback_archives(
-    const Registry& reg, const std::filesystem::path& registry_dir, const std::string& world);
+// 不存在的世界抛 world_not_found；validate_world 不通过抛它的码（裁定 R12）；a、b、c 检查（见上）
+// 不通过、或读不出时抛 registry_corrupt / snapshot_failed。
+[[nodiscard]] std::vector<ArchiveEntry> list_rollback_archives(const RegistryDb& reg,
+                                                             const std::string& world);
 
-// 删除 list_rollback_archives 列出的全部文件，每个都经 remove_within(archive 目录, 文件)。
-// 返回删除的个数。确认越界的文件不删，抛 snapshot_failed。
-std::size_t purge_rollback_archives(const Registry& reg, const std::filesystem::path& registry_dir,
-                                    const std::string& world);
+// 删除 list_rollback_archives 列出的全部文件（经它先跑 validate_world），每个都经
+// remove_within(archive 目录, 文件)。返回删除的个数。确认越界的文件不删，抛 snapshot_failed。
+std::size_t purge_rollback_archives(const RegistryDb& reg, const std::string& world);
 
 }  // namespace starling::governance

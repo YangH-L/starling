@@ -1,10 +1,11 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { api, type CascadePreview } from '$lib/api';
+	import { api, type CascadePreview, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent, withWorld, onWorldChange } from '$lib/world.svelte';
 	import { toast } from '$lib/ui/toast';
 	import { labelFor, glossFor, sectionize } from '$lib/labels';
 	import DataTable from '$lib/components/DataTable.svelte';
@@ -81,7 +82,7 @@
 		if (modality) p.set('modality', modality);
 		if (beliefOrder) p.set('belief_order', beliefOrder);
 		if (subjectKind) p.set('subject_kind', subjectKind);
-		return `/api/statements?${p}`;
+		return worldPath(`/api/statements?${p}`);
 	}
 	const q = createQuery(() => api.get<{ rows: Record<string, unknown>[] }>(url()));
 	$effect(() => {
@@ -97,7 +98,7 @@
 	// review I3 — 原先只订写事件,漏了后台 tick:表格有 consolidation_state 一列,
 	// 而固化/归档/衰减都由 tick 推进,只订写事件会让状态徽章陈旧。
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	let allRows = $derived(q.data?.rows ?? []);
@@ -110,6 +111,14 @@
 
 	let detailOpen = $state(false);
 	let detail = $state<Record<string, unknown> | null>(null);
+	// 换世界:抽屉里是上个世界的行,关掉并清空,免得挂在新世界的名字下。
+	onWorldChange(() => {
+		detailOpen = false;
+		detail = null;
+		confirmOpen = false;
+		confirmCfg = null;
+		confirmForId = '';
+	});
 	function openDetail(r: Record<string, unknown>) {
 		detail = r;
 		detailOpen = true;
@@ -192,14 +201,14 @@
 			detailOpen = false;
 			await q.refetch();
 		} catch (e) {
-			toast.error(`${label}失败:${e instanceof Error ? e.message : String(e)}`);
+			toast.error(`${label}失败:${describeError(e)}`);
 		} finally {
 			busy = false;
 		}
 	}
-	const approve = (id: string) => act('批准', () => api.post('/api/review', { stmt_id: id }));
+	const approve = (id: string) => act('批准', () => api.post(worldPath('/api/review'), { stmt_id: id }));
 	const reconsolidate = (id: string) =>
-		act('请求再固化', () => api.post('/api/reconsolidate', { stmt_id: id }));
+		act('请求再固化', () => api.post(worldPath('/api/reconsolidate'), { stmt_id: id }));
 	// 片 6 级联预览(inform-only):立刻开确认框(不阻塞遗忘),再后台取「会波及哪些派生
 	// 后代」折进提示。预览只读、best-effort——慢/失败都不挡操作;若用户已切到别的语句
 	// (confirmForId 变了)或框已关,陈旧结果丢弃。遗忘仍只逻辑删除本条,不级联删后代。
@@ -209,11 +218,11 @@
 		confirmCfg = {
 			title: reject ? '拒绝并遗忘此语句?' : '遗忘此语句?',
 			desc: base,
-			run: () => act(reject ? '拒绝' : '遗忘', () => api.post('/api/forget', { ids: [id] }))
+			run: () => act(reject ? '拒绝' : '遗忘', () => api.post(worldPath('/api/forget'), { ids: [id] }))
 		};
 		confirmOpen = true;
 		api
-			.get<CascadePreview>(`/api/cascade_preview/${encodeURIComponent(id)}`)
+			.get<CascadePreview>(worldPath(`/api/cascade_preview/${encodeURIComponent(id)}`))
 			.then((preview) => {
 				if (!confirmOpen || confirmForId !== id || preview.affected_count === 0) return;
 				const sample = preview.affected
@@ -309,7 +318,7 @@
 	<span class="ml-auto pb-1.5 text-xs text-subtle">{rows.length} 条 · 点击行看详情</span>
 </div>
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else}
 	<DataTable
 		{rows}
@@ -327,7 +336,7 @@
 		{@const cs = String(detail.consolidation_state ?? '')}
 		{#if sid}
 			<div class="mb-3 flex flex-wrap gap-2">
-				<Button variant="soft" onclick={() => goto(`/lens?stmt=${encodeURIComponent(sid)}`)}>
+				<Button variant="soft" onclick={() => goto(withWorld(`/lens?stmt=${encodeURIComponent(sid)}`))}>
 					透视来源 →
 				</Button>
 				{#if rs === 'review_requested'}

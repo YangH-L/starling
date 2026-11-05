@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { api, ApiError } from './api';
+import { api, ApiError, worldPath } from './api';
+import { noteDefaultWorld } from './world.svelte';
 import * as tok from './token';
 
 beforeEach(() => {
@@ -48,5 +49,37 @@ describe('api', () => {
 		expect(err.isAuth).toBe(true);
 		expect(err.path).toBe('/api/overview');
 		expect(String(err.message)).toContain('nope');
+	});
+});
+
+describe('worldPath', () => {
+	beforeEach(() => noteDefaultWorld('default'));
+
+	it('默认世界保持旧路径,其他世界加 /api/w/<世界>/ 前缀', () => {
+		expect(worldPath('/api/statements', 'default')).toBe('/api/statements');
+		expect(worldPath('/api/statements?q=1', 'Run-A')).toBe('/api/w/Run-A/statements?q=1');
+		expect(worldPath('/api/statements', 'a b')).toBe('/api/w/a%20b/statements');
+	});
+	it('默认世界不叫 default 时,按注册表的默认世界名判断', () => {
+		noteDefaultWorld('main');
+		expect(worldPath('/api/statements', 'main')).toBe('/api/statements');
+		expect(worldPath('/api/statements', 'default')).toBe('/api/w/default/statements');
+	});
+	it('管理路由不加前缀', () => {
+		for (const p of [
+			'/api/worlds',
+			'/api/worlds/x/close',
+			'/api/worlds?offset=0',
+			'/api/config',
+			'/api/config/test',
+			'/api/eval',
+			'/health',
+			'/api/ping'
+		])
+			expect(worldPath(p, 'Run-A')).toBe(p);
+	});
+	it('前缀相近但不是管理路由的路径仍按世界寻址', () => {
+		expect(worldPath('/api/worldsx', 'Run-A')).toBe('/api/w/Run-A/worldsx');
+		expect(worldPath('/api/evaluate', 'Run-A')).toBe('/api/w/Run-A/evaluate');
 	});
 });

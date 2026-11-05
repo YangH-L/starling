@@ -5,12 +5,19 @@ import { render, fireEvent } from '@testing-library/svelte';
 // /api/config 是这页唯一的外部依赖。get 决定加载成败;post 是我们要证明「没被调用」的那个。
 const get = vi.fn();
 const post = vi.fn();
-vi.mock('$lib/api', () => ({
-	api: { get: (...a: unknown[]) => get(...a), post: (...a: unknown[]) => post(...a), del: vi.fn() },
-	ApiError: class ApiError extends Error {}
-}));
+vi.mock('$lib/api', async (orig) => {
+	const real = await orig<typeof import('$lib/api')>();
+	return {
+		...real, // worldPath 用真的:危险区的路径改写是被测行为
+		// ApiError 用真的:worlds.ts 的 apiDetail 靠 instanceof 取错误码
+		api: { get: (...a: unknown[]) => get(...a), post: (...a: unknown[]) => post(...a), del: vi.fn() }
+	};
+});
 
 import Settings from './+page.svelte';
+import { ApiError as RealApiError } from '$lib/api';
+import { page } from '$app/state';
+import { noteDefaultWorld } from '$lib/world.svelte';
 
 const byText = (c: HTMLElement | HTMLBodyElement, t: string) =>
 	[...c.querySelectorAll('button')].find((b) => b.textContent?.trim() === t) as
@@ -122,8 +129,24 @@ describe('设置页:配置加载门(数据丢失防线)', () => {
 		expect(post.mock.calls[0][0]).toBe('/api/config');
 	});
 
+	it('角色绑定上方说明作用范围:只改默认世界与以后新建的世界(审查 M-3)', async () => {
+		get.mockResolvedValue(CONFIG);
+		const { container } = render(Settings);
+		await settle();
+		const note = container.querySelector('[data-testid="settings-scope-note"]');
+		expect(note?.textContent?.trim()).toBe(
+			'这里的供应商与角色只改默认世界和以后新建的世界；已有世界的端点在「世界」页重新确认。'
+		);
+	});
+
 	it('重试成功后解除封锁(一次失败不该永久锁死这页)', async () => {
-		get.mockRejectedValueOnce(new Error('boom')).mockResolvedValue(CONFIG);
+		// 只让 /api/config 先失败一次;危险区的世界详情请求也走 get,按路径区分。
+		let cfgCalls = 0;
+		get.mockImplementation(async (path: string) => {
+			if (path !== '/api/config') return { name: 'default', tenant: 'default' };
+			if (cfgCalls++ === 0) throw new Error('boom');
+			return CONFIG;
+		});
 		const { container } = render(Settings);
 		await settle();
 		expect(saveButton(container)!.disabled).toBe(true);
@@ -140,59 +163,96 @@ describe('设置页:配置加载门(数据丢失防线)', () => {
 
 // 危险区是物理删除且不可恢复:钉住「手输租户名 + 确认框」两道闸,以及请求体形状
 // (后端按 confirm === 当前租户名再校验一次)。
-describe('设置页:危险区(清空记忆)', () => {
-	const CONFIG_T = { ...CONFIG, tenant: 'default' };
-	const confirmInput = (c: HTMLElement) =>
-		c.querySelector('#clear-confirm') as HTMLInputElement | null;
+// (旧的危险区用例按默认世界租户 /api/config.tenant 写成,已由下方 R47 的用例取代。)
+
+// ── 危险区:清空的是顶栏选中的世界(裁定 R47) ─────────────────────────────
+describe('设置页:清空记忆随所选世界走', () => {
+	const inBody = (t: string) => byText(document.body, t);
+	const at = (w?: string) => {
+		(page as { url: URL }).url = new URL(
+			w ? `http://localhost/settings?world=${w}` : 'http://localhost/settings'
+		);
+	};
+	const clearBtn = (c: HTMLElement) =>
+		[...c.querySelectorAll('button')].find((b) => b.textContent?.includes('清空世界「')) as
+			| HTMLButtonElement
+			| undefined;
+	const confirmInput = (c: HTMLElement) => c.querySelector('#clear-confirm') as HTMLInputElement;
+	// /api/config 给默认世界的租户 'default-tenant';世界详情给各自的租户。
+	const route = (detail: (path: string) => unknown) =>
+		get.mockImplementation(async (path: string) => {
+			if (path === '/api/config') return { ...CONFIG, tenant: 'default-tenant' };
+			return detail(path);
+		});
 
 	beforeEach(() => {
 		get.mockReset();
 		post.mockReset();
+		noteDefaultWorld('main');
+		at();
 	});
 
-	it('没手输正确的租户名之前,清空按钮禁用', async () => {
-		get.mockResolvedValue(CONFIG_T);
+	it('确认串取自该世界的详情租户,清空请求走 /api/w/<world>/clear_memory,对话框点名世界', async () => {
+		at('w1');
+		route(() => ({ name: 'w1', tenant: 'w1-tenant' }));
+		post.mockResolvedValue({ tenant: 'w1-tenant', total: 5, spool_discarded: 0 });
 		const { container } = render(Settings);
 		await settle();
-
-		const btn = byText(container, '清空记忆');
-		expect(btn, '加载成功后应当渲染危险区').toBeTruthy();
-		expect(btn!.disabled).toBe(true);
-
-		await fireEvent.input(confirmInput(container)!, { target: { value: 'defaul' } });
+		expect(get).toHaveBeenCalledWith('/api/worlds/w1');
+		expect(container.textContent).toContain('输入租户名「w1-tenant」以确认');
+		expect(clearBtn(container)!.textContent).toContain('清空世界「w1」');
+		// 默认世界的租户名('default-tenant')不能放行 w1 的清空
+		await fireEvent.input(confirmInput(container), { target: { value: 'default-tenant' } });
+		await tick();
+		expect(clearBtn(container)!.disabled).toBe(true);
+		await fireEvent.input(confirmInput(container), { target: { value: 'w1-tenant' } });
+		await tick();
+		expect(clearBtn(container)!.disabled).toBe(false);
+		await fireEvent.click(clearBtn(container)!);
 		await settle();
-		expect(byText(container, '清空记忆')!.disabled, '差一个字也不放行').toBe(true);
-		expect(post).not.toHaveBeenCalled();
-	});
-
-	it('手输租户名并在确认框里确认后,才 POST /api/clear_memory', async () => {
-		get.mockResolvedValue(CONFIG_T);
-		post.mockResolvedValue({ tenant: 'default', total: 12, spool_discarded: 0, deleted: {} });
-		const { container } = render(Settings);
-		await settle();
-
-		await fireEvent.input(confirmInput(container)!, { target: { value: 'default' } });
-		await settle();
-		const btn = byText(container, '清空记忆')!;
-		expect(btn.disabled).toBe(false);
-		await fireEvent.click(btn);
-		await settle();
-		expect(post, '点按钮只弹确认框,不直接清空').not.toHaveBeenCalled();
-
-		// ConfirmDialog 走 bits-ui Portal,渲染在 document.body。
-		const confirm = byText(document.body, '确认清空');
-		expect(confirm, '应当弹出确认框').toBeTruthy();
-		await fireEvent.click(confirm!);
+		expect(document.body.textContent).toContain('将物理删除世界「w1」');
+		await fireEvent.click(inBody('确认清空')!);
 		await settle();
 		expect(post).toHaveBeenCalledTimes(1);
-		expect(post.mock.calls[0][0]).toBe('/api/clear_memory');
-		expect(post.mock.calls[0][1]).toEqual({ confirm: 'default' });
+		expect(post.mock.calls[0][0]).toBe('/api/w/w1/clear_memory');
+		expect(post.mock.calls[0][1]).toEqual({ confirm: 'w1-tenant' });
 	});
 
-	it('配置加载失败时不渲染危险区(不知道租户名就无从确认)', async () => {
-		get.mockRejectedValue(new Error('401 unauthorized'));
+	it('默认世界:取默认世界的详情,走旧路径 /api/clear_memory', async () => {
+		route(() => ({ name: 'main', tenant: 'main-tenant' }));
+		post.mockResolvedValue({ tenant: 'main-tenant', total: 1, spool_discarded: 0 });
 		const { container } = render(Settings);
 		await settle();
-		expect(byText(container, '清空记忆')).toBeUndefined();
+		expect(get).toHaveBeenCalledWith('/api/worlds/main');
+		await fireEvent.input(confirmInput(container), { target: { value: 'main-tenant' } });
+		await tick();
+		await fireEvent.click(clearBtn(container)!);
+		await settle();
+		await fireEvent.click(inBody('确认清空')!);
+		await settle();
+		expect(post.mock.calls[0][0]).toBe('/api/clear_memory');
+	});
+
+	it('详情加载失败:清空键与确认输入禁用,不回退到默认世界的租户,绕过 disabled 也不 POST', async () => {
+		at('w1');
+		// 真的 ApiError(404 world_not_found):走 worldsApi.detail → apiDetail → worldErrorMessage 的真实路径
+		route(() => {
+			throw new RealApiError(404, '/api/worlds/w1', '404 world_not_found');
+		});
+		const { container } = render(Settings);
+		await settle();
+		expect(container.textContent).toContain('没能取到世界「w1」的租户名');
+		expect(container.textContent).toContain('世界不存在'); // 错误码已译成中文
+		expect(container.textContent).not.toContain('default-tenant');
+		expect(confirmInput(container).disabled).toBe(true);
+		expect(clearBtn(container)!.disabled).toBe(true);
+		const btn = clearBtn(container)!;
+		btn.disabled = false; // 绕过第一道防线:确认框打不开 / 守卫拦住
+		await fireEvent.click(btn);
+		await settle();
+		const ok = inBody('确认清空');
+		if (ok) await fireEvent.click(ok);
+		await settle();
+		expect(post).not.toHaveBeenCalled();
 	});
 });

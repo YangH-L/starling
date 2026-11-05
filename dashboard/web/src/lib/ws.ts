@@ -7,16 +7,13 @@ import { wsConn } from './health';
  * commitment_transition / memory_cleared)+ app.py 后台循环的 tick + converse 流
  * 完结后补广播的 statement_added。lib/feed.ts 的 switch 也正好覆盖这七种。
  *
- * W1/W2 追加两种,来自 routes/worlds.py:
- *   world_switched   {active}        切换世界成功 —— 整个数据源变了,各页都应刷新
- *   snapshot_created {world, id}     快照成功
- * 二者都归入 mutatesMemory 的「会改变可见状态」一侧(只有 recall 是纯读),
- * feed.ts 同步补了两条文案。
- *
- * W3 再追加一种,同样来自 routes/worlds.py:
- *   world_rolled_back {world, snapshot_id}  回滚到快照成功 —— 该世界快照之后的写入被丢弃;
- *                                           回滚的是活动世界时 /worlds 页整页刷新(同切换)
- * 同样归入「会改变可见状态」一侧,feed.ts 补了文案。
+ * 多世界(记忆服务第 1 期)起,每条消息的形状是 {type, world, payload}:world 是事件发生的世界,
+ * 页面据此只处理当前世界的消息(lib/feed.ts 的 isForWorld / shouldRefetch)。
+ *   world_changed    {statements, last_write_at, ...}  某世界有写入,每世界每秒至多一条(后端去抖)
+ *   snapshot_created {world, id}                       快照成功
+ *   world_rolled_back {world, snapshot_id}             回滚到快照成功 —— 该世界快照之后的写入被丢弃
+ * 三者都归入 mutatesMemory 的「会改变可见状态」一侧(只有 recall 是纯读)。
+ * 原有的 world_switched 随"活动世界"一起去掉了。
  *
  * 收窄为联合类型而非 string:页面里的事件名字面量此前完全不受 svelte-check 校验,
  * 打错一个字母就是静默失效且三门全绿(T8 review M3)。注意 /ws/converse 是另一条
@@ -30,13 +27,14 @@ export const WS_EVENT_TYPES = [
 	'commitment_transition',
 	'commitment_fired',
 	'memory_cleared',
-	'world_switched',
+	'world_changed',
 	'snapshot_created',
 	'world_rolled_back'
 ] as const;
 export type WsEventType = (typeof WS_EVENT_TYPES)[number];
 
-export type WsEvent = { type: WsEventType; payload: unknown };
+/** world 缺省只会出现在旧后端的帧上;新后端的每一帧都带它。 */
+export type WsEvent = { type: WsEventType; world?: string; payload: unknown };
 
 /**
  * 这一帧是否可能改变了记忆库的可见状态 —— 各只读页统一用它作增量刷新的判据。
@@ -116,6 +114,8 @@ import type { ConverseResponse } from './api';
 
 export type ConverseStreamReq = {
 	message: string;
+	/** 对话落在哪个世界;缺省 = 默认世界(首帧里不带就行)。 */
+	world?: string;
 	provider?: string;
 	holder?: string;
 	interlocutor?: string;

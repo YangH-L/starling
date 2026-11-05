@@ -2,10 +2,11 @@
 	import { untrack } from 'svelte';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { shouldRefetch } from '$lib/feed';
+	import { currentWorld } from '$lib/world.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import WorldRollbackDrawer from '$lib/components/WorldRollbackDrawer.svelte';
-	import { Button, EmptyState, Field, Select, Skeleton } from '$lib/components/ui';
+	import { Button, EmptyState, Skeleton } from '$lib/components/ui';
 	import {
 		apiDetail,
 		shortId,
@@ -21,25 +22,19 @@
 	const SESSION_LIMIT = 200;
 	const NO_ANCHOR_HINT = '未开启按会话快照、快照失败，或已被保留策略清理';
 
-	const worldsQ = createQuery(() => worldsApi.list());
+	// 选中的世界就是顶栏选的那个(URL ?world=),本页不再有自己的下拉。
+	// 回滚抽屉要这个世界的一行(是否开着、名字);取详情而不是列表的第一页,世界再多也取得到。
+	let selected = $derived(currentWorld());
+	const worldsQ = createQuery(() => worldsApi.detail(selected));
 	$effect(() => {
+		void selected;
 		worldsQ.refetch();
 	});
-
-	let worlds = $derived(worldsQ.data?.worlds ?? []);
-	let worldOptions = $derived(
-		worlds.map((w) => ({ value: w.name, label: w.label ? `${w.name} · ${w.label}` : w.name }))
-	);
-
-	// 选中的世界:没手动选过时跟随活动世界;选过之后以用户的选择为准(该世界还在的话)。
-	let picked = $state('');
-	let selected = $derived(
-		picked && worlds.some((w) => w.name === picked) ? picked : (worldsQ.data?.active ?? '')
-	);
+	let worlds = $derived(worldsQ.data ? [worldsQ.data] : []);
 
 	let sessions = $state<SessionList | null>(null);
 	let sessionsErr = $state('');
-	let sessReq = 0; // 防陈旧:切换世界后,只让最新一次的清单落地
+	let sessReq = 0; // 防陈旧:换世界后,只让最新一次的清单落地
 
 	async function loadSessions(name: string) {
 		const mine = ++sessReq;
@@ -55,7 +50,7 @@
 		}
 	}
 
-	// 选中世界变化(含首次拿到活动世界)时取该世界的清单。
+	// 选中世界变化时取该世界的清单。
 	$effect(() => {
 		const name = selected;
 		if (!name) return;
@@ -65,16 +60,16 @@
 		});
 	});
 
-	// 有写入、切换或回滚时一并重取世界列表与清单(recall 是纯读,不重取)。
+	// 当前世界有写入或回滚时一并重取世界行与清单(recall 是纯读,不重取)。
 	$effect(() => {
-		if (!mutatesMemory($lastWsEvent)) return;
+		if (!shouldRefetch($lastWsEvent, untrack(() => selected))) return;
 		untrack(() => {
 			void worldsQ.refetch();
 			if (selected) void loadSessions(selected);
 		});
 	});
 
-	// 清单是当前选中世界的(切换后旧清单先清空,不会串到别的世界上)。
+	// 清单是当前选中世界的(换世界后旧清单先清空,不会串到别的世界上)。
 	let rows = $derived(sessions && sessions.world === selected ? sessions.sessions : []);
 	let current = $derived(sessions && sessions.world === selected ? sessions : null);
 
@@ -115,23 +110,13 @@
 />
 
 {#if worldsQ.error && !worldsQ.data}
-	<EmptyState title="加载失败" description={worldsQ.error.message}>
+	<EmptyState title="加载失败" description={worldErrorMessage(apiDetail(worldsQ.error))}>
 		<Button variant="soft" onclick={() => void worldsQ.refetch()}>重试</Button>
 	</EmptyState>
 {:else if !worldsQ.data}
 	<div class="space-y-2">{#each Array(3) as _}<Skeleton class="h-10 w-full" />{/each}</div>
 {:else}
-	<div class="mb-4 max-w-72">
-		<Field label="世界" for="sessions-world">
-			<Select
-				id="sessions-world"
-				name="sessions-world"
-				value={selected}
-				options={worldOptions}
-				onchange={(e) => (picked = (e.currentTarget as HTMLSelectElement).value)}
-			/>
-		</Field>
-	</div>
+	<p class="mb-3 text-sm text-muted">世界：<span class="font-medium text-fg">{selected}</span>（在顶栏切换）</p>
 
 	{#if current && !current.source_lane_enabled}
 		<p

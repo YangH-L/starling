@@ -6,11 +6,20 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _SPEC = importlib.util.spec_from_file_location(
     "ingest_session",
     str(Path(__file__).resolve().parents[2] / "scripts" / "ingest_session.py"))
 ingest_session = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(ingest_session)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hook_log(tmp_path, monkeypatch):
+    """LOG 默认是 ~/.starling/ingest.log：malformed stdin 等用例会往真实日志追加 "hook failed"。
+    一律改指 tmp（个别用例自己再覆盖成 fake_home 下的路径也照常生效）。"""
+    monkeypatch.setattr(ingest_session, "LOG", tmp_path / "hook-ingest.log")
 
 
 def test_write_job_creates_spool_file(tmp_path, monkeypatch):
@@ -31,6 +40,7 @@ def test_script_runs_standalone_without_starling_package(tmp_path):
     env = os.environ.copy()
     env["STARLING_DASH_INGEST_SPOOL"] = str(spool)
     env["STARLING_DASH_TENANT"] = "tenant/with spaces"
+    env["HOME"] = str(tmp_path / "home")        # 子进程的 LOG 落在 ~/.starling：不得指向真实 home
 
     result = subprocess.run(
         [sys.executable, "-I", str(script), "--bootstrap", str(transcript)],

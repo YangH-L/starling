@@ -31,11 +31,18 @@ export type WorldRow = {
 	label: string;
 	tenant: string;
 	created_at: string;
-	active: boolean;
-	db_bytes: number;
-	live_bytes: number;
+	/** 建世界时给的标签(key → value),建好后不可改(labels_immutable)。 */
+	labels: Record<string, string>;
+	/** 引擎现在开着。 */
+	open: boolean;
+	holders: number;
+	/** 该世界最近一次写入的时间;从没写过为 null/空。 */
+	last_write_at: string | null;
+	/** 列表行不带 db_bytes / live_bytes / engrams(要打开库才有);详情(worldsApi.detail)才有。 */
+	db_bytes?: number;
+	live_bytes?: number;
+	engrams?: number;
 	statements: number;
-	engrams: number;
 	snapshots: number;
 	snapshot_bytes: number;
 	/** W3:回滚时被替换下来的库,保留在 <世界 home>/archive/ 下的份数与总字节。 */
@@ -43,8 +50,16 @@ export type WorldRow = {
 	archive_bytes: number;
 	/** 该世界的库读不出(损坏、被占):统计全为 0。只在出错的行上出现。 */
 	stats_error?: boolean;
+	/** 详情才有:实际生效的设置。endpoint 段只带 key_set,不带密钥。 */
+	settings?: WorldSettings;
 	/** W4:该世界的自动快照配置。 */
 	auto_snapshot: AutoSnapshotConfig;
+};
+
+/** 世界设置(GET /api/worlds/{name} 的 settings)。形状由后端定义,前端只读 background.auto_snapshot。 */
+export type WorldSettings = {
+	background?: { auto_snapshot?: AutoSnapshotConfig; [k: string]: unknown };
+	[k: string]: unknown;
 };
 
 /** W4 快照的触发原因:manual 对应 kind=manual,session / interval 对应 kind=auto。 */
@@ -83,7 +98,7 @@ export type SessionRow = {
 /** GET /api/worlds/{w}/sessions 的响应。 */
 export type SessionList = {
 	world: string;
-	/** 当前 config 的左脑 lane 开关:为 false 时新的写入不会记录会话(对非活动世界也取这个值)。 */
+	/** 当前 config 的左脑 lane 开关:为 false 时新的写入不会记录会话(每个世界各取自己生效的设置)。 */
 	source_lane_enabled: boolean;
 	total: number;
 	/** observed_at IS NULL 的 unit 数。 */
@@ -101,24 +116,40 @@ export type RollbackResult = {
 	snapshot_id: string;
 	/** 回滚前库存在、已改名进 archive/;库原本不存在时为 false。 */
 	archived: boolean;
-	/** 回滚的是活动世界(引擎已重建),前端应整页刷新。 */
-	active: boolean;
+	/** 回滚前引擎开着、回滚后已重新打开。引擎在服务端重建,页面不用整页刷新。 */
+	reopened: boolean;
 };
 
 export type WorldsData = {
-	active: string;
 	default: string;
+	/** 符合标签过滤的世界总数(分页用)。 */
+	total: number;
 	snapshot_retention: number;
 	/** W4:自动快照失败计数与最近一次错误。 */
 	auto_snapshot_status: AutoSnapshotStatus;
 	worlds: WorldRow[];
 };
 
-/** 与后端 is_valid_world_name 同一规则:小写字母/数字开头,其后可含下划线与连字符,最长 32。 */
-export const WORLD_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+/** 与后端同一规则:首字符字母或数字,其后 [A-Za-z0-9._-],长度 1–128,区分大小写。 */
+export const WORLD_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export function isValidWorldName(name: string): boolean {
 	return WORLD_NAME_RE.test(name);
+}
+
+/**
+ * 把 "env=prod, team=x" 解析成标签对象(逗号或空白分隔,key=value);空串给 {};
+ * 任何一段不是 key=value(key 或 value 为空)返回 null。用于新建世界的标签与列表的标签过滤。
+ */
+export function parseLabels(text: string): Record<string, string> | null {
+	const out: Record<string, string> = {};
+	for (const part of text.split(/[,\s]+/)) {
+		if (!part) continue;
+		const i = part.indexOf('=');
+		if (i <= 0 || i === part.length - 1) return null;
+		out[part.slice(0, i)] = part.slice(i + 1);
+	}
+	return out;
 }
 
 const UNITS = ['B', 'KB', 'MB', 'GB', 'TB'] as const;
@@ -137,12 +168,6 @@ export function formatBytes(n: number): string {
 
 /** 契约:interval_hours 取 0–8760,0 表示关闭。 */
 export const MAX_INTERVAL_HOURS = 8760;
-
-/** 新建世界的默认值(用户裁定 2026-10-28):按会话开、定时关。 */
-export const NEW_WORLD_AUTO_SNAPSHOT: Readonly<AutoSnapshotConfig> = Object.freeze({
-	on_session: true,
-	interval_hours: 0
-});
 
 /**
  * 把表单里的间隔(type=number 的 input 绑定出来可能是 number、空串或 null)解析成
@@ -181,15 +206,35 @@ export function shortId(id: string, n: number): string {
 	return id.slice(0, n);
 }
 
+export type ListOpts = { labels?: Record<string, string>; offset?: number; limit?: number };
+
+/** GET /api/worlds 的查询串:label.<key>=<value>(可重复)、offset、limit;全空时为 ''。 */
+function listQuery(o: ListOpts = {}): string {
+	const p: string[] = [];
+	for (const [k, v] of Object.entries(o.labels ?? {}))
+		p.push(`label.${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
+	if (o.offset !== undefined) p.push(`offset=${o.offset}`);
+	if (o.limit !== undefined) p.push(`limit=${o.limit}`);
+	return p.length ? `?${p.join('&')}` : '';
+}
+
 const base = (name: string) => `/api/worlds/${encodeURIComponent(name)}`;
 
 export const worldsApi = {
-	list: () => api.get<WorldsData>('/api/worlds'),
-	// auto_snapshot 可选:不传时不发这个字段,由后端按新世界默认值补。
-	create: (name: string, label?: string, autoSnapshot?: AutoSnapshotConfig) =>
+	list: (o?: ListOpts) => api.get<WorldsData>(`/api/worlds${listQuery(o)}`),
+	// 详情:列表的一行加 db_bytes / live_bytes / engrams 与 settings。
+	detail: (name: string) => api.get<WorldRow>(base(name)),
+	// auto_snapshot 可选:不传时不发这个字段,由后端按默认世界当前设置补(spec §8.2)。
+	create: (
+		name: string,
+		label?: string,
+		autoSnapshot?: AutoSnapshotConfig,
+		labels?: Record<string, string>
+	) =>
 		api.post<WorldRow>('/api/worlds', {
 			name,
 			label,
+			...(labels && Object.keys(labels).length ? { labels } : {}),
 			...(autoSnapshot
 				? {
 						auto_snapshot: {
@@ -199,9 +244,17 @@ export const worldsApi = {
 					}
 				: {})
 		}),
-	// 切换要等摄入线程停稳 + 重开库,放宽到 60s(后端 ingest_busy 的等待上限是 5s,余量给开库)。
-	activate: (name: string) =>
-		api.post<{ active: string }>(`${base(name)}/activate`, {}, { timeoutMs: 60_000 }),
+	// 部分设置,没给的键保持不变;默认世界只接受 background 段。
+	updateSettings: (name: string, settings: WorldSettings) =>
+		api.put<WorldSettings>(`${base(name)}/settings`, settings, { timeoutMs: 120_000 }),
+	// 重新确认端点(裁定 R53):把各供应商此刻的地址复制进这个世界引用它们的角色,回世界详情。
+	// 开着的世界要热换适配器、等世界锁,与 updateSettings 一样放宽到 120s。
+	// 回世界详情;重嵌入失败等非致命提示放 warnings(裁定 R58)。
+	reconfirm: (name: string) =>
+		api.post<WorldRow & { warnings?: string[] }>(`${base(name)}/settings/reconfirm`, {}, { timeoutMs: 120_000 }),
+	// 关闭要等该世界的在途请求结束并停线程。
+	close: (name: string) =>
+		api.post<{ closed: string }>(`${base(name)}/close`, {}, { timeoutMs: 60_000 }),
 	remove: (name: string, confirm: string) =>
 		api.del<{ deleted: string }>(`${base(name)}?confirm=${encodeURIComponent(confirm)}`),
 	snapshots: (name: string) => api.get<{ snapshots: SnapshotRow[] }>(`${base(name)}/snapshots`),
@@ -210,7 +263,7 @@ export const worldsApi = {
 		api.post<SnapshotRow>(`${base(name)}/snapshots`, { note }, { timeoutMs: 120_000 }),
 	removeSnapshot: (name: string, id: string) =>
 		api.del<{ deleted: string }>(`${base(name)}/snapshots/${encodeURIComponent(id)}`),
-	// W3 回滚:校验快照 + 复制到 partial + 活动世界还要停引擎、重建引擎,与拍快照同量级,放宽到 120s。
+	// W3 回滚:校验快照 + 复制到 partial + 开着的世界还要停引擎、重建引擎,与拍快照同量级,放宽到 120s。
 	// mode 显式发送:确认框描述的正是语义 A,别让后端默认值悄悄决定用户确认过的东西。
 	rollback: (name: string, snapshotId: string, confirm: string) =>
 		api.post<RollbackResult>(
@@ -239,13 +292,19 @@ export const worldsApi = {
 };
 
 const ERROR_MESSAGES: Record<string, string> = {
-	invalid_world_name: '世界名只能用小写字母、数字、下划线和连字符，最长 32 个字符',
+	invalid_world_name: '世界名以字母或数字开头，其后可含字母、数字、点、下划线和连字符，最长 128 个字符',
 	world_exists: '同名世界已存在',
 	world_not_found: '世界不存在',
-	world_protected: '默认世界和当前活动世界不能删除',
+	worlds_unavailable: '世界注册表暂时不可用，请稍后再试',
+	world_busy: '世界正在关闭或恢复，请稍后再试',
+	world_not_initialized: '这个世界的库文件不见了',
+	endpoint_changed: '供应商地址改了，到「世界」页对这个世界点「重新确认端点」',
+	labels_immutable: '标签建好后不能改',
+	invalid_settings: '设置不合法',
+	world_protected: '默认世界不能删除',
 	confirm_mismatch: '输入的名称与世界名不一致',
 	ingest_busy: '后台任务或在途请求暂时停不下来，未做任何改动，请稍后再试',
-	world_open_failed: '引擎打开失败，数据库未改动（切换时已留在原世界）；下一次写入、召回或在「队列」页手动 tick 时会自动重建，仍异常请查看服务日志',
+	world_open_failed: '世界打不开，请稍后再试或查看服务日志',
 	snapshot_unsupported_backend: '当前向量后端（zvec）不支持快照',
 	insufficient_disk:
 		'磁盘空间不足：快照需要至少 3 倍于数据量、回滚需要至少 2 倍于快照大小的可用空间',
@@ -254,7 +313,6 @@ const ERROR_MESSAGES: Record<string, string> = {
 	rollback_reopen_failed: '已回滚到快照，但引擎重开失败；页面即将刷新，下一次写入、召回或手动 tick 时会自动重建，仍异常请查看服务日志',
 	snapshot_not_found: '快照不存在',
 	world_tenant_mismatch: '该世界的数据库里有其他租户的数据，拒绝打开',
-	world_switching: '正在切换世界，请稍后再试',
 	snapshot_corrupt: '快照文件损坏或缺失，未做任何改动',
 	rollback_mode_unsupported: '不支持的回滚方式',
 	invalid_auto_snapshot: '自动快照设置无效（间隔须为 0–8760 小时）',
@@ -286,4 +344,33 @@ export function apiDetail(err: unknown): string {
 		return i === -1 ? err.message : err.message.slice(i + 1);
 	}
 	return String(err);
+}
+
+/**
+ * 读页面与命令(remember / recall / 对话)遇到这些码时显示中文提示,而不是裸的 "404 world_not_found"。
+ * endpoint_changed(裁定 R59):继承的供应商地址或种类改了,提示去「世界」页重新确认端点。
+ */
+export const WORLD_CODES = [
+	'world_not_found',
+	'world_busy',
+	'world_not_initialized',
+	'worlds_unavailable',
+	'endpoint_changed'
+];
+
+/** 一个裸错误码(如对话 WS 的 error 帧)是已知世界码就给中文提示,否则 null。 */
+export function worldCodeMessage(code: string): string | null {
+	return WORLD_CODES.includes(code) ? worldErrorMessage(code) : null;
+}
+
+/**
+ * 读页面的错误文案:ApiError 的 detail 是已知的世界错误码就给中文提示,否则原样用 message。
+ * 链接带着 ?world= 被分享出去时,最常见的失败正是世界不存在 / 正在关闭。
+ */
+export function describeError(err: unknown): string {
+	if (err instanceof ApiError) {
+		const d = apiDetail(err);
+		return worldCodeMessage(d) ?? err.message;
+	}
+	return err instanceof Error ? err.message : String(err);
 }

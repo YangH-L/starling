@@ -1,4 +1,5 @@
 import { getToken } from './token';
+import { explicitWorld, defaultWorld } from './world.svelte';
 
 export class ApiError extends Error {
 	constructor(
@@ -56,6 +57,24 @@ async function req<T>(path: string, init: ReqInit = {}): Promise<T> {
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+// ---- 按世界寻址 ----
+// 检视/命令路由在后端挂了两次:/api/x(默认世界)与 /api/w/<世界>/x(指定世界)。
+// 管理路由(世界注册表、配置、评测、健康检查)与具体世界无关,永远不加前缀。
+const MANAGEMENT_RE = /^\/(?:api\/(?:worlds|config|eval|ping)|health)(?=$|[/?#])/;
+
+/**
+ * `/api/x` → `/api/w/<世界>/x`;世界是默认世界时保持 `/api/x`(旧路径)。
+ * world 缺省取当前页选中的世界(URL ?world=,没写则是默认世界)。管理路由与非 /api 路径原样返回。
+ */
+export function worldPath(path: string, world?: string): string {
+	if (!path.startsWith('/api/') || MANAGEMENT_RE.test(path)) return path;
+	// URL 没写 ?world= 就是默认世界,走旧路径:这样默认世界名还没从 /api/worlds 取回来时
+	// (壳层启动的头几百毫秒)页面的首次取数也不会错发到 /api/w/<猜的名字>/ 上。
+	const w = world ?? explicitWorld();
+	if (w === null || w === defaultWorld()) return path;
+	return `/api/w/${encodeURIComponent(w)}/${path.slice('/api/'.length)}`;
 }
 
 export const api = {

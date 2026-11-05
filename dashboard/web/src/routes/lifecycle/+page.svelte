@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { api, type LifecycleResponse } from '$lib/api';
+	import { describeError } from '$lib/worlds';
+	import { api, type LifecycleResponse, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent } from '$lib/world.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Card, Badge, EmptyState, Skeleton } from '$lib/components/ui';
 	import {
@@ -13,14 +14,14 @@
 		type Tone
 	} from '$lib/lifecycle';
 
-	const q = createQuery(() => api.get<LifecycleResponse>('/api/lifecycle'));
+	const q = createQuery(() => api.get<LifecycleResponse>(worldPath('/api/lifecycle')));
 	$effect(() => {
 		q.refetch();
 	});
 	// T8 — 生命周期占用/迁移由后台 tick 推进(固化/归档/遗忘),写入也改变占用分布。
 	// review M2 — mount effect 挪到前面,与其余各页(vitals/overview)的既有顺序一致。
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	let occ = $derived(q.data?.occupancy ?? {});
@@ -45,7 +46,7 @@
 	subtitle="记忆从短期(海马)经固化进入长期(新皮层),再归档或遗忘。当前分布为精确快照,流转为事件派生的累计量。"
 />
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<Skeleton class="h-40 w-full" />
 {:else if q.data}

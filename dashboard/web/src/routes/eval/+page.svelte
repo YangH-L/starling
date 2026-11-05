@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 	import { api } from '$lib/api';
@@ -22,7 +23,7 @@
 
 <PageHeader title="评测报告" subtitle="准入 eval 的 markdown 输出,最新优先。" />
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<Skeleton class="h-40 w-full" />
 {:else if reports.length === 0}

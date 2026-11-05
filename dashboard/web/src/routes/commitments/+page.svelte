@@ -1,9 +1,10 @@
 <script lang="ts">
-	import { api, ApiError } from '$lib/api';
+	import { describeError } from '$lib/worlds';
+	import { api, ApiError, worldPath } from '$lib/api';
 	import { byDeadline, deriveFired, triggersFor, triggerKindLabel, describeTrigger } from '$lib/commitments';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent } from '$lib/world.svelte';
 	import { toast } from '$lib/ui/toast';
 	import { labelFor, glossFor, sectionize } from '$lib/labels';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -25,7 +26,7 @@
 	const STATES = ['created', 'ACTIVE', 'FULFILLED', 'BROKEN', 'RENEGOTIATED', 'WITHDRAWN'];
 
 	const q = createQuery(() =>
-		api.get<{ rows: CommitmentRow[]; triggers: Trigger[] }>('/api/commitments')
+		api.get<{ rows: CommitmentRow[]; triggers: Trigger[] }>(worldPath('/api/commitments'))
 	);
 	$effect(() => {
 		q.refetch();
@@ -35,7 +36,7 @@
 	// create_from_statement → upsert_active_commitment,故新许下的承诺是随 statement_added 落库的。
 	// 原先只订 commitment_* + tick,新承诺要等下一次 tick(最多 30s)才出现在泳道上。
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	let filter = $state('');
@@ -103,7 +104,7 @@
 	async function transition(stmtId: string, kind: 'fulfill' | 'withdraw') {
 		busy = true;
 		try {
-			await api.post(`/api/commitment/${kind}`, { stmt_id: stmtId });
+			await api.post(worldPath(`/api/commitment/${kind}`), { stmt_id: stmtId });
 			toast.success(kind === 'fulfill' ? '已标记完成' : '已撤回');
 			detailOpen = false;
 			await q.refetch();
@@ -114,7 +115,7 @@
 				detailOpen = false;
 				await q.refetch();
 			} else {
-				toast.error(`流转失败:${e instanceof Error ? e.message : String(e)}`);
+				toast.error(`流转失败:${describeError(e)}`);
 			}
 		} finally {
 			busy = false;
@@ -137,7 +138,7 @@
 </div>
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
 		{#each Array(6) as _}<Skeleton class="h-32 w-full" />{/each}

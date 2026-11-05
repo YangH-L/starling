@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { describeError } from '$lib/worlds';
+	import { api, worldPath } from '$lib/api';
 	import { toast } from '$lib/ui/toast';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Button, Input, Badge, CopyButton, EmptyState } from '$lib/components/ui';
@@ -22,11 +23,11 @@
 		try {
 			const q = new URLSearchParams({ interlocutor, token_budget: String(budget) });
 			if (goal) q.set('goal', goal);
-			ws = await api.get(`/api/working_set?${q}`, { timeoutMs: 60_000 }); // 内含 recall(网络 embed)
+			ws = await api.get(worldPath(`/api/working_set?${q}`), { timeoutMs: 60_000 }); // 内含 recall(网络 embed)
 			loadErr = '';
 		} catch (e) {
 			ws = null;
-			loadErr = e instanceof Error ? e.message : String(e);
+			loadErr = describeError(e);
 			toast.error(loadErr);
 		} finally {
 			busy = false;

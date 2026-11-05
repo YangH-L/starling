@@ -1,7 +1,9 @@
 <script lang="ts">
+	import { describeError } from '$lib/worlds';
+	import { withWorld, currentWorld } from '$lib/world.svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { api, type ProvenanceNode, type StatementSearchResponse } from '$lib/api';
+	import { api, type ProvenanceNode, type StatementSearchResponse, worldPath } from '$lib/api';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import CodeBlock from '$lib/components/CodeBlock.svelte';
 	import { Card, Badge, Button, Input, EmptyState, Skeleton } from '$lib/components/ui';
@@ -22,26 +24,31 @@
 	// 深链:?stmt=<id> 到达直接取证(从 /statements「透视来源」跳来,或可分享/回退)。
 	$effect(() => {
 		const sid = page.url.searchParams.get('stmt') ?? '';
-		if (sid && sid !== currentId) void load(sid);
+		// 去重键带上世界:同一个 stmt 换了世界也要重取,否则上个世界的取证树会挂在新世界的名字下。
+		const key = `${currentWorld()}\u0000${sid}`;
+		if (sid && key !== currentId) void load(sid, key);
 	});
 
-	async function load(id: string) {
-		currentId = id;
+	async function load(id: string, key: string) {
+		currentId = key;
+		tree = null;
 		loading = true;
 		loadErr = '';
 		try {
-			tree = await api.get<ProvenanceNode>(`/api/provenance/${encodeURIComponent(id)}`);
+			const t = await api.get<ProvenanceNode>(worldPath(`/api/provenance/${encodeURIComponent(id)}`));
+			if (currentId === key) tree = t; // 换世界后到的旧响应丢弃
 		} catch (e) {
+			if (currentId !== key) return;
 			tree = null;
-			loadErr = e instanceof Error ? e.message : String(e);
+			loadErr = describeError(e);
 		} finally {
-			loading = false;
+			if (currentId === key) loading = false;
 		}
 	}
 
 	// 选中 → 反映到 URL(可分享/可回退),effect 据此加载。
 	function select(id: string) {
-		void goto(`/lens?stmt=${encodeURIComponent(id)}`, { keepFocus: true, noScroll: true });
+		void goto(withWorld(`/lens?stmt=${encodeURIComponent(id)}`), { keepFocus: true, noScroll: true });
 	}
 
 	async function runSearch() {
@@ -54,11 +61,11 @@
 		searchErr = '';
 		try {
 			const r = await api.get<StatementSearchResponse>(
-				`/api/statement_search?q=${encodeURIComponent(q)}`
+				worldPath(`/api/statement_search?q=${encodeURIComponent(q)}`)
 			);
 			searchRows = r.rows;
 		} catch (e) {
-			searchErr = e instanceof Error ? e.message : String(e);
+			searchErr = describeError(e);
 			searchRows = [];
 		} finally {
 			searching = false;
@@ -143,10 +150,13 @@
 	<Skeleton class="mt-4 h-64 w-full" />
 {:else if loadErr}
 	<div class="mt-4">
-		<!-- 重试须直呼 load:上面的 effect 有 sid !== currentId 守卫,而 currentId 已是这条失败的 id,
+		<!-- 重试须直呼 load:上面的 effect 有 key !== currentId 守卫,而 currentId 已是这条失败的 key,
 		     所以点同一条语句不会重新取数(只能整页刷新)。 -->
 		<EmptyState title="无法取证" description={loadErr}>
-			<Button variant="soft" onclick={() => void load(currentId)}>重试</Button>
+			<Button variant="soft" onclick={() => {
+					const sid = page.url.searchParams.get('stmt') ?? '';
+					if (sid) void load(sid, `${currentWorld()}\u0000${sid}`);
+				}}>重试</Button>
 		</EmptyState>
 	</div>
 {:else if tree}

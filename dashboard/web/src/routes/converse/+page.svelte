@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { api, type ConverseResponse } from '$lib/api';
+	import { explicitWorld, withWorld } from '$lib/world.svelte';
 	import { streamConverse } from '$lib/ws';
 	import { toast } from '$lib/ui/toast';
-	import { worldErrorMessage } from '$lib/worlds';
+	import { worldCodeMessage } from '$lib/worlds';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Button, Textarea, Badge, Chip, EmptyState, StatusDot, Select } from '$lib/components/ui';
 
@@ -47,7 +48,12 @@
 		const idx = turns.length; // assistant turn 的下标(下面紧接 push)
 		turns = [...turns, { role: 'assistant', text: '', streaming: true }];
 		streamConverse(
-			{ message: msg, ...(chatProvider ? { provider: chatProvider } : {}) },
+			{
+				message: msg,
+				// 只在 URL 明确写了 ?world= 时才带 world;否则省略,由服务端取它自己的默认世界。
+				...(explicitWorld() ? { world: explicitWorld()! } : {}),
+				...(chatProvider ? { provider: chatProvider } : {})
+			},
 			{
 				onStatus: (status) => {
 					turns[idx].status = status;
@@ -64,9 +70,11 @@
 					busy = false;
 				},
 				onError: (code) => {
+					// 世界码(world_busy、endpoint_changed 等)与读页面、remember / recall 同一份中文提示(裁定 R59)。
+					const worldText = worldCodeMessage(code);
 					if (code === 'llm_not_configured')
 						toast.error('未配置 LLM:去「模型」页绑定 extraction / chat 角色');
-					else if (code === 'world_switching') toast.error(worldErrorMessage(code));
+					else if (worldText) toast.error(worldText);
 					else toast.error('对话出错:' + code);
 					if (!turns[idx].text) turns[idx].text = `（出错:${code}）`;
 					turns[idx].streaming = false;
@@ -128,7 +136,7 @@
 												: '无回复'}
 									/>
 									{#each tr.statement_ids as id}
-										<a href="/statements" title={id}><Chip>{id.slice(0, 8)}…</Chip></a>
+										<a href={withWorld('/statements')} title={id}><Chip>{id.slice(0, 8)}…</Chip></a>
 									{/each}
 									{#if tr.gen_total_tokens || tr.gen_latency_ms}
 										<span class="text-subtle"

@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { api, type CascadePreview } from '$lib/api';
+	import { describeError } from '$lib/worlds';
+	import { api, type CascadePreview, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent } from '$lib/world.svelte';
 	import { toast } from '$lib/ui/toast';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Badge, Card, EmptyState, Skeleton, Drawer, Button, ConfirmDialog } from '$lib/components/ui';
@@ -24,7 +25,7 @@
 	};
 	type ConflictData = { by_kind: Record<string, number>; conflicts: Conflict[] };
 
-	const q = createQuery(() => api.get<ConflictData>('/api/conflicts'));
+	const q = createQuery(() => api.get<ConflictData>(worldPath('/api/conflicts')));
 	$effect(() => {
 		q.refetch();
 	});
@@ -33,7 +34,7 @@
 	// consolidated 给「再固化」),而这两个 state 正是被后台 tick 推进的 —— 只订写事件的话,
 	// 已解决的冲突仍挂在列表上、动作按钮显隐错位。
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	// 一侧已遗忘 = 冲突已就地解决 → 不再列出(遗忘一侧后重取即消失,使工作台动作可见生效)。
@@ -82,14 +83,14 @@
 			detailOpen = false;
 			await q.refetch();
 		} catch (e) {
-			toast.error(`${verb}失败:${e instanceof Error ? e.message : String(e)}`);
+			toast.error(`${verb}失败:${describeError(e)}`);
 		} finally {
 			busy = false;
 		}
 	}
 
 	const reconsolidate = (id: string) =>
-		act('请求再固化', () => api.post('/api/reconsolidate', { stmt_id: id }));
+		act('请求再固化', () => api.post(worldPath('/api/reconsolidate'), { stmt_id: id }));
 
 	function askForget(id: string) {
 		const base = '逻辑删除(→ forgotten,移出检索与回放池)。不可逆。';
@@ -97,12 +98,12 @@
 		confirmCfg = {
 			title: '遗忘此语句?',
 			desc: base,
-			run: () => act('遗忘', () => api.post('/api/forget', { ids: [id] }))
+			run: () => act('遗忘', () => api.post(worldPath('/api/forget'), { ids: [id] }))
 		};
 		confirmOpen = true;
 		// best-effort, non-blocking blast-radius warning (same as the statements page).
 		api
-			.get<CascadePreview>(`/api/cascade_preview/${encodeURIComponent(id)}`)
+			.get<CascadePreview>(worldPath(`/api/cascade_preview/${encodeURIComponent(id)}`))
 			.then((preview) => {
 				if (!confirmOpen || confirmForId !== id || preview.affected_count === 0) return;
 				const sample = preview.affected
@@ -127,7 +128,7 @@
 <PageHeader title="冲突探针" subtitle="ConflictProbe:互斥语句对,按冲突权重降序。" />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="space-y-2">{#each Array(4) as _}<Skeleton class="h-12 w-full" />{/each}</div>
 {:else}

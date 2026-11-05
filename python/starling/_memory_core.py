@@ -430,13 +430,15 @@ class MemoryCore:
             policy=_build_policy(self._extraction), on_token=on_token,
             source_lane=self.source_lane)
 
-    def tick(self, now: str) -> dict:
+    def tick(self, now: str, *, skip_embed: bool = False) -> dict:
         """Advance background workers: embed pending + fire due commitments +
         flush grounding 滞后事件 (P2.j)。三连组合在 C++ `memoryops::tick_all`
         (嵌入网络期间释放 GIL);这里只剩绑定转发。
-        P3.c LW.3: pass live supervisor health so C++ can gate soft stages."""
+        P3.c LW.3: pass live supervisor health so C++ can gate soft stages.
+        skip_embed(裁定 R54):只跳过嵌入阶段(调用方判定嵌入端点此刻不能用),其余照常。"""
         return _core.memory_tick_all(
-            self.rt.adapter, self.worker, self.policy, now, self.rt.health())
+            self.rt.adapter, self.worker, self.policy, now, self.rt.health(),
+            skip_embed=skip_embed)
 
     def embed_pending(self, now: str) -> dict:
         """Run ONLY the embedding stage until the backlog is drained (no

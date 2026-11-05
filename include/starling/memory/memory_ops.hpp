@@ -356,11 +356,15 @@ struct TickOutcome {
 // worker/policy 由调用方持有注入(embedder 可热换,见 DashboardEngine)。
 // health (P3.c LW.2): gates each stage through governance::should_run_stage;
 // defaults to READY (behavior-preserving — existing 4-arg callers unchanged).
+// skip_embed(裁定 R54):调用方判定嵌入端点此刻不能用(例如继承来的 provider 地址已改,
+// endpoint_changed)时为 true:只跳过 Embed 阶段,记进 stages_skipped("embed"),其余阶段
+// 照常按 health 门控运行(承诺触发、grounding、回放、投影、出箱不因嵌入不可用而停)。
 TickOutcome tick_all(persistence::SqliteAdapter& adapter,
                      embedding::EmbeddingWorker& worker,
                      prospective::PolicyEngine& policy,
                      std::string_view now_iso,
-                     RuntimeHealth health = RuntimeHealth::READY);
+                     RuntimeHealth health = RuntimeHealth::READY,
+                     bool skip_embed = false);
 
 // 只跑嵌入阶段:反复调 worker.tick_one_batch 直到积压排空,累加各批的成功与失败数。
 // 与 tick_all 的区别:不碰承诺触发、共同基础、回放、投影、出箱,也不看健康门控

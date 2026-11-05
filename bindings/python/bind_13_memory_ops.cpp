@@ -586,11 +586,13 @@ void bind_13_memory_ops(pybind11::module_& m) {
              starling::embedding::EmbeddingWorker& worker,
              starling::prospective::PolicyEngine& policy,
              const std::string& now_iso,
-             starling::RuntimeHealth health) {
+             starling::RuntimeHealth health,
+             bool skip_embed) {
               starling::memoryops::TickOutcome t;
               {
                   py::gil_scoped_release release;
-                  t = starling::memoryops::tick_all(adapter, worker, policy, now_iso, health);
+                  t = starling::memoryops::tick_all(adapter, worker, policy, now_iso, health,
+                                                    skip_embed);
               }
               py::list stages;
               for (const auto& timing : t.stage_timings_ms) {
@@ -608,7 +610,9 @@ void bind_13_memory_ops(pybind11::module_& m) {
                               "stages_skipped"_a = t.stages_skipped);
           },
           py::arg("adapter"), py::arg("worker"), py::arg("policy"), py::arg("now_iso"),
-          py::arg("health") = starling::RuntimeHealth::READY);
+          py::arg("health") = starling::RuntimeHealth::READY,
+          // 裁定 R54:嵌入端点不可用时只跳过 Embed 阶段(stages_skipped 记 "embed")。
+          py::arg("skip_embed") = false);
 
     // 只跑嵌入阶段(不做承诺/回放/投影/出箱维护):循环在 C++ memoryops::embed_pending。
     // 嵌入逐批走网络,call_guard 释放 GIL;lambda 返回纯 C++ map,call_guard 析构

@@ -1,10 +1,12 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { describeError } from '$lib/worlds';
+	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { untrack } from 'svelte';
+	import { refetchOnEvent, currentWorld } from '$lib/world.svelte';
 	import { labelFor, glossFor, orderedEntries } from '$lib/labels';
-	import { describeEvent, type FeedEventView } from '$lib/feed';
+	import { describeEvent, isForWorld, type FeedEventView } from '$lib/feed';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import StatCard from '$lib/components/StatCard.svelte';
 	import { Card, Skeleton, EmptyState, Badge } from '$lib/components/ui';
@@ -15,12 +17,12 @@
 		queue_by_status: Record<string, number>;
 	};
 
-	const q = createQuery(() => api.get<Overview>('/api/overview'));
+	const q = createQuery(() => api.get<Overview>(worldPath('/api/overview')));
 	$effect(() => {
 		q.refetch();
 	});
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	// T7 — feed 存结构化视图(describeEvent 按事件类型渲染成人话 + 语义色),
@@ -30,7 +32,8 @@
 
 	$effect(() => {
 		const e = $lastWsEvent;
-		if (e) {
+		// 广播带 world:总览只记当前世界的活动。
+		if (e && isForWorld(e, untrack(currentWorld))) {
 			const entry: FeedEntry = {
 				t: new Date().toLocaleTimeString(),
 				view: describeEvent(e.type, e.payload)
@@ -50,7 +53,7 @@
 <PageHeader title="总览" subtitle="记忆体状态、关键计数与实时活动。" />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="grid grid-cols-2 gap-3 md:grid-cols-5">
 		{#each Array(5) as _}<Skeleton class="h-24 w-full" />{/each}

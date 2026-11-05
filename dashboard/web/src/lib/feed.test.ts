@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { describeEvent } from './feed';
+import { describeEvent, isForWorld, shouldRefetch } from './feed';
 
 describe('describeEvent — 概览 feed 事件结构化', () => {
 	it('tick: 只列非零计数,按后端字段名对齐', () => {
@@ -16,6 +16,23 @@ describe('describeEvent — 概览 feed 事件结构化', () => {
 		// 术语跟随 T5 labels.ts 的既有译法(embedded→已嵌入),避免同键两套说法
 		expect(v.detail).toBe('已嵌入 3 · 固化 2');
 		expect(v.tone).toBe('neutral');
+	});
+
+	it('tick: stages_skipped 含 embed → 说跳过嵌入,不说空转(裁定 R59)', () => {
+		const skipped = describeEvent('tick', {
+			embedded: 0,
+			consolidated: 0,
+			stages_skipped: ['embed']
+		}).detail;
+		expect(skipped).toContain('跳过嵌入');
+		expect(skipped).not.toContain('空转');
+		const busy = describeEvent('tick', { fired: 2, stages_skipped: ['embed'] }).detail;
+		expect(busy).toContain('到期触发 2');
+		expect(busy).toContain('跳过嵌入');
+		// 别的阶段被跳过不提嵌入。
+		expect(
+			describeEvent('tick', { embedded: 0, stages_skipped: ['persona'] }).detail
+		).toBe('空转(无待办)');
 	});
 
 	it('tick: 见到已知计数键且全零 → 空转;空 payload 形状陌生 → 不妄断', () => {
@@ -52,16 +69,14 @@ describe('describeEvent — 概览 feed 事件结构化', () => {
 		expect(describeEvent('memory_cleared', { total: 5, spool_discarded: 0 }).detail).toBe('删除 5 行');
 	});
 
-	it('world_switched: 切换到世界 X(info);缺 active 时优雅回退为空细节', () => {
-		const v = describeEvent('world_switched', { active: 'sim-1' });
-		expect(v.label).toBe('切换世界');
-		expect(v.detail).toBe('切换到世界 sim-1');
-		expect(v.tone).toBe('info');
-		expect(describeEvent('world_switched', {}).detail).toBe('');
-		expect(describeEvent('world_switched', null).detail).toBe('');
-		// 非字符串 / 空串的 active 不当作世界名
-		expect(describeEvent('world_switched', { active: 7 }).detail).toBe('');
-		expect(describeEvent('world_switched', { active: '' }).detail).toBe('');
+	it('world_switched 已去掉:当作未知类型,不崩', () => {
+		expect(describeEvent('world_switched', { active: 'sim-1' }).detail).toBe('');
+	});
+	it('world_changed: 语句数与最近写入', () => {
+		const v = describeEvent('world_changed', { statements: 12, last_write_at: 'T' });
+		expect(v.label).toBe('世界有写入');
+		expect(v.detail).toBe('语句共 12 条');
+		expect(describeEvent('world_changed', {}).detail).toBe('');
 	});
 
 	it('snapshot_created: 世界 X 拍了快照(success);缺 world 时优雅回退为空细节', () => {
@@ -167,5 +182,27 @@ describe('describeEvent — 概览 feed 事件结构化', () => {
 		expect(describeEvent('recall', { n: NaN }).detail).toBe('');
 		// 非数值的 embedded 不算「见到已知计数键」→ 形状陌生,不妄断空转
 		expect(describeEvent('tick', { embedded: 'x' }).detail).toBe('');
+	});
+});
+
+describe('按世界过滤 ws 消息', () => {
+	it('isForWorld：world 相同才算当前世界;缺 world 的旧帧一律放行', () => {
+		expect(isForWorld({ world: 'a' }, 'a')).toBe(true);
+		expect(isForWorld({ world: 'b' }, 'a')).toBe(false);
+		expect(isForWorld({}, 'a')).toBe(true);
+	});
+	it('world_changed 只对当前世界触发 refetch;别的世界的消息忽略', () => {
+		expect(shouldRefetch({ type: 'world_changed', world: 'a', payload: {} }, 'a')).toBe(true);
+		expect(shouldRefetch({ type: 'world_changed', world: 'b', payload: {} }, 'a')).toBe(false);
+		expect(shouldRefetch({ type: 'statement_added', world: 'b', payload: {} }, 'a')).toBe(false);
+		expect(shouldRefetch({ type: 'statement_added', world: 'a', payload: {} }, 'a')).toBe(true);
+	});
+	it('recall 是纯读:当前世界也不触发 refetch;空事件不触发', () => {
+		expect(shouldRefetch({ type: 'recall', world: 'a', payload: {} }, 'a')).toBe(false);
+		expect(shouldRefetch(null, 'a')).toBe(false);
+	});
+	it('current 传 null = 不限世界(世界列表页:任一世界变了都要刷新)', () => {
+		expect(shouldRefetch({ type: 'world_changed', world: 'b', payload: {} }, null)).toBe(true);
+		expect(shouldRefetch({ type: 'recall', world: 'b', payload: {} }, null)).toBe(false);
 	});
 });

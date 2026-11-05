@@ -287,6 +287,32 @@ TEST(MemoryOps, TickAllReadyRunsAllStages) {
     EXPECT_EQ(t.embedded, 1);
 }
 
+// 裁定 R54:skip_embed 只跳过 Embed 阶段(stages_skipped 只有 "embed"),其余 8 个阶段照常跑。
+TEST(MemoryOps, TickAllSkipEmbedSkipsOnlyTheEmbedStage) {
+    auto a = make_adapter();
+    extractor::FakeLLMAdapter llm;
+    llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+    ASSERT_EQ(remember(*a, llm, "", params("Dana reviews code")).outcome, "accepted");
+
+    embedding::StubEmbeddingAdapter emb(8);
+    vector::SqliteBlobVectorIndex idx;
+    embedding::EmbeddingWorker worker(*a, emb, idx);
+    prospective::PolicyEngine policy(*a);
+
+    const auto outcome = tick_all(*a, worker, policy, "2026-06-11T10:05:00Z",
+                                  RuntimeHealth::READY, /*skip_embed=*/true);
+
+    EXPECT_EQ(outcome.embedded, 0);
+    EXPECT_EQ(row_count(a->connection(), "SELECT COUNT(*) FROM statement_vectors"), 0);
+    ASSERT_EQ(outcome.stages_skipped.size(), 1U);
+    EXPECT_EQ(outcome.stages_skipped.front(), "embed");
+    EXPECT_EQ(outcome.stage_timings_ms.size(), 8U);
+    EXPECT_FALSE(timed(outcome, "embed"));
+    EXPECT_TRUE(timed(outcome, "policy"));
+    EXPECT_TRUE(timed(outcome, "outbox"));
+    EXPECT_GE(outcome.dispatched, 1);        // 出箱照常收敛
+}
+
 // DEGRADED causality: soft stages are NOT run (embed effect absent); critical
 // stages DO run (outbox drains). stages_skipped == 5 soft labels. Timings only
 // for the 4 critical stages.

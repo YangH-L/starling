@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { describeError } from '$lib/worlds';
+	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent } from '$lib/world.svelte';
 	import { labelFor, glossFor, orderedEntries } from '$lib/labels';
 	import StatCard from '$lib/components/StatCard.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -15,7 +16,7 @@
 		vectors_by_status: Record<string, number>;
 	};
 
-	const q = createQuery(() => api.get<QueueData>('/api/queues'));
+	const q = createQuery(() => api.get<QueueData>(worldPath('/api/queues')));
 	$effect(() => {
 		q.refetch();
 	});
@@ -24,20 +25,25 @@
 	//   embedding_backlog = statements 里没有向量的行 —— 而 post-write pump 没有 embed 阶段
 	//                       (嵌入只在 tick 跑),故新语句落库「瞬间」积压 +1,只订 tick 要等 30s。
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	let ticking = $state(false);
+	const EMBED_SKIPPED_HINT = '嵌入端点失效，本轮跳过嵌入；到「世界」页重新确认端点';
 
 	async function tick() {
 		ticking = true;
 		try {
 			// tick 批量嵌入积压语句(逐条走网络),按积压量放宽。
-			await api.post('/api/tick', {}, { timeoutMs: 120_000 });
+			const stats = await api.post<{ stages_skipped?: string[] }>(worldPath('/api/tick'), {}, {
+				timeoutMs: 120_000
+			});
 			toast.success('Tick 发送成功');
+			// 嵌入端点失效时 tick 只跳过嵌入阶段(裁定 R54),其余照常:成功提示之外要说明积压不会被消化(裁定 R59)。
+			if (stats?.stages_skipped?.includes('embed')) toast.warning(EMBED_SKIPPED_HINT);
 			await q.refetch();
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			toast.error(describeError(e));
 		} finally {
 			ticking = false;
 		}
@@ -61,7 +67,7 @@
 </PageHeader>
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="grid grid-cols-2 gap-3 md:grid-cols-4">
 		{#each Array(4) as _}<Skeleton class="h-20 w-full" />{/each}

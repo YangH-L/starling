@@ -1,14 +1,15 @@
 <script lang="ts">
-	import { api, type Gist, type GistData, type GistMember } from '$lib/api';
+	import { describeError } from '$lib/worlds';
+	import { api, type Gist, type GistData, type GistMember, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent, onWorldChange } from '$lib/world.svelte';
 	import { toast } from '$lib/ui/toast';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Badge, Card, EmptyState, Skeleton, Drawer } from '$lib/components/ui';
 
 	// #38-C v2 可观测:固化 NORM gist 的只读检视(GET /api/gists)+ 谱系钻取。
-	const q = createQuery(() => api.get<GistData>('/api/gists'));
+	const q = createQuery(() => api.get<GistData>(worldPath('/api/gists')));
 	$effect(() => {
 		q.refetch();
 	});
@@ -16,7 +17,7 @@
 	// review M1 — 但页面还渲染 review_status 与 consolidation_state,而审批走 /review
 	// (广播 statement_added)、遗忘走 statement_forgotten,只订 tick 会漏掉这两类。
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	let gists = $derived(q.data?.gists ?? []);
@@ -37,6 +38,15 @@
 	let membersLoading = $state(false);
 	let detailForId = $state(''); // 防陈旧:并发点开时只让最新一次的 members 落地
 
+	// 换世界:抽屉里是上个世界的 gist,关掉并清空;在途的旧 members 因 detailForId 清空而丢弃。
+	onWorldChange(() => {
+		detailOpen = false;
+		detail = null;
+		members = [];
+		membersLoading = false;
+		detailForId = '';
+	});
+
 	async function openDetail(gist: Gist) {
 		detail = gist;
 		detailOpen = true;
@@ -45,12 +55,12 @@
 		detailForId = gist.id;
 		try {
 			const res = await api.get<{ members: GistMember[] }>(
-				`/api/gist_members/${encodeURIComponent(gist.id)}`
+				worldPath(`/api/gist_members/${encodeURIComponent(gist.id)}`)
 			);
 			if (detailForId === gist.id) members = res.members;
 		} catch (e) {
 			if (detailForId === gist.id)
-				toast.error(`取来源失败:${e instanceof Error ? e.message : String(e)}`);
+				toast.error(`取来源失败:${describeError(e)}`);
 		} finally {
 			if (detailForId === gist.id) membersLoading = false;
 		}
@@ -63,7 +73,7 @@
 />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="space-y-2">{#each Array(4) as _}<Skeleton class="h-16 w-full" />{/each}</div>
 {:else}

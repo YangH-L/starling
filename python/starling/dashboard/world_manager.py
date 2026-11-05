@@ -1,140 +1,160 @@
-"""世界管理：注册表读改写 + 世界切换与回滚时的引擎生命周期（W1、W3）。
+"""引擎池：每个世界一个 DashboardEngine，按世界发租约、关闭、恢复（记忆服务第 1 期 Task 5）。
 
-注册表、快照、保留策略、租户不变式、回滚的顺序与原子性都在 C++（`_core.world_*`）；这里
-只做 Python 才能做的事：切换时重建 DashboardEngine（停线程、等在飞请求、释放 C++ 写连接、
-开新库、失败回滚），回滚活动世界时同样停引擎、确认旧 Runtime 已回收、调 C++、再重建。
-设计：docs/superpowers/specs/2026-10-25-world-scene-management-design.md §5.1、§8
+注册表、设置合并、快照、保留策略、租户不变式、回滚的顺序与原子性、自动快照「拍不拍」都在 C++
+（`_core.WorldRegistry`、`_core.world_*`）；这里只做 Python 才能做的事：按世界建引擎、停线程、
+等在途请求、释放 C++ 写连接、恢复前后丢引擎与重开。没有「活动世界」：任何世界都可以同时开着。
+设计：docs/superpowers/specs/2026-11-03-memory-service-design.md §5.5、§7.2、§8、§10.3
+（旧的单世界切换见 docs/superpowers/specs/2026-10-25-world-scene-management-design.md §8）。
 
 引擎租约（lease）
 -----------------
-每个用到引擎的请求在整个生命周期里持一份租约：线程池排队、remember 的锁外抽取、
-/ws/converse 的锁外生成、最后的提交，全在租约之内。切换先置 switching（此后新租约一律
-拒绝，路由回 503 world_switching），再等在途租约归零，然后才丢旧引擎。只等引擎锁是不够
-的：锁外阶段不持引擎锁，旧实现会在这类请求还在飞时就完成切换，请求随后写进旧世界，
-旧 Runtime 也一直活着，切回原世界就是同一个库上两条写连接。
+每个用到某个世界的请求在整个生命周期里持该世界的一份租约：线程池排队、remember 的锁外抽取、
+/ws/converse 的锁外生成、最后的提交，全在租约之内。关闭、删除、恢复一个世界先置该世界的
+「正在关闭」标志（此后它的新租约一律拒绝，WorldSwitchError("world_busy")），再等它的在途租约
+归零，然后才丢引擎。只等引擎锁是不够的：锁外阶段不持引擎锁，请求随后还会写进被丢掉的引擎，
+旧 Runtime 也一直活着，重开同一个世界就是同一个库上两条写连接。别的世界的租约不受影响：
+恢复与关闭只停被操作的世界（spec §7.2）。
 
-租约按请求发放，不按 WebSocket 连接：长连接的对话 socket 在两轮之间不持租约，不挡切换。
-后台 tick / 摄入线程不是租约，切换用 quiesce 停它们。
+租约按请求发放，不按 WebSocket 连接：长连接的对话 socket 在两轮之间不持租约，不挡关闭。
+后台 tick / 摄入线程不是租约，关闭时用 quiesce 停它们（不持引擎锁 join）。
 
-本进程里打开活动世界库文件的每条路径，从打开之前到关闭之后都持一份租约（只读的也一样）：
-检视 SQL 路由（routes/inspect.py）与 GET /api/worlds 的统计（routes/worlds.py）都是。回滚把同一
-路径上的 inode 换掉，一条在替换之前打开了旧 inode、替换之后才第一次读的只读连接会按路径打开
-新库的 -shm，在同进程里认为自己是第一个连接，把引擎正在用的 wal-index 截断重建。C++ 的连接
-探测（world_in_use）看不见这种「打开了还没读」的连接，在 delete 模式的库上连读过库的闲置连接
-也看不见（实测表见 rollback 的文档），它只是纵深防御，所以要靠租约：回滚等租约归零才动文件。
+本进程里打开某个世界库文件的每条路径，从打开之前到关闭之后都持该世界的一份租约（只读的也一样）：
+检视 SQL 路由用 lease(world, build=False)（不建引擎，租约照样计数）。恢复把同一路径上的 inode 换掉，
+一条在替换之前打开了旧 inode、替换之后才第一次读的只读连接会按路径打开新库的 -shm，在同进程里认为
+自己是第一个连接，把引擎正在用的 wal-index 截断重建。C++ 的连接探测（world_in_use）看不见这种
+「打开了还没读」的连接，在 delete 模式的库上连读过库的闲置连接也看不见，它只是纵深防御，所以要靠
+租约：恢复等该世界的租约归零才动文件。live_stats、list_sessions 与 30 秒统计刷新同样持一份
+build=False 的租约读库。
+
+释放 C++ 写连接
+---------------
+DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个引用并 gc.collect() 才会。所以关闭
+一个世界是：停线程 → 等租约归零 → 从表里摘掉引擎、丢掉本帧的引用 → gc，并用 Runtime 的弱引用确认
+它已被回收（_RUNTIME_RELEASE_GRACE_S 内重试：刚返回的栈帧、异常回溯可能还短暂引用着它）。确认不了
+就记 warning，把 (库路径, 弱引用) 记进 _leaked：这个 Runtime 还开着那个库的写连接。只要它还活着：
+  - 该库的世界不能再建引擎（lease 回 world_busy）：同一个库文件上不能有两条写连接；
+  - 该库不能被恢复替换（rollback 回 world_busy，库未动）：那条连接会继续写旧 inode 和它已被 unlink
+    的 WAL，这些写入在恢复出来的库里没有，静默丢失，归档也可能被改动；
+  - 该世界不能被删除（delete_world 回 world_busy）：进程仍在往已 unlink 的 inode 里写。
+每次检查前先 gc 并摘掉已回收的条目，所以 Runtime 一旦被回收，这些操作就照常进行。
+
+新建的引擎一律先发布、再起后台线程（_publish，裁定 R23）：起线程失败时引擎已经在表上，不会变成一个
+既没发布、也没登记成泄漏的活 Runtime。失败只记日志、标记 workers-lost，下一次租约（非阻塞取世界锁）
+补起；补起之前引擎照常服务请求。
 
 锁顺序（全局唯一，任何代码都不得反向持有）
 ------------------------------------------
-  1. manager.lock（RLock）：activate / create / delete / take_snapshot / delete_snapshot /
-     rollback / purge_archives，以及 lifespan 关停。可能被占几秒到几十秒（VACUUM、复制快照、
-     等租约），所以事件循环上的代码从不拿它。C++ 要求按世界串行化回滚，rollback 全程持它
-     即满足。
-  2. manager._gate（Lock，短）：只保护 switching 标志、租约计数、自动快照的失败计数与调度线程
-     句柄，持有期间不做任何 I/O、不建引擎、不拿别的锁（start_scheduler 的 Thread.start() 在它
-     之内，只等新线程起来）。_drained 是建在它上面的 Condition：切换等租约归零时 wait 会
-     放开 _gate，所以「等租约」从不持着 _gate。
-  3. manager._build_lock（Lock）：惰性建引擎（engine 还是 None 时第一条请求来建），以及失败
-     路径丢过引擎之后为新建的引擎补起后台线程。由已拿到租约的请求在放开 _gate 之后持有；
-     切换从不拿它（切换等租约归零时没有人在建）。lifespan 关停（disable_workers）在
-     manager.lock 内取它，等进行中的构建连同补起线程一起收尾，再关掉 workers_enabled。
-  4. engine._lock（RLock，DashboardEngine 内部）：由持租约的请求和后台线程持有。切换从不
-     拿它：quiesce 在不持引擎锁的情况下 join 后台线程（线程分段拿锁，持锁 join 会卡住）。
-  5. supervisor 互斥锁（C++ Runtime 内部）：只在持 engine._lock 时取（见 engine.py 的
+  1. pool._lock（Lock，短）：只保护 _engines / _leases / _closing 三张表，以及只在表上做的簿记
+     （_leaked、_world_locks、去抖状态、自动快照失败计数、后台线程句柄）。持有期间不做任何 I/O、
+     不建引擎、不拿别的锁（起去抖计时器的 Timer.start 只等线程起来）。_drained 是建在它上面的
+     Condition：等租约归零时 wait 放开 _lock，所以「等租约」从不持着 _lock。
+  2. pool._world_locks[name]（每个世界一把 RLock）：建引擎、关引擎、快照、恢复、删除、自动快照、
+     清理归档。可能被占几秒到几十秒（VACUUM、复制快照、等租约），所以事件循环上的代码从不拿它。
+     C++ 要求按世界串行化快照、恢复、修剪，持这把锁即满足。不同世界的世界锁互不相干：一个世界建引擎
+     或恢复时，别的世界照常打开、读写。后台调用方（会话钩子、调度线程）只非阻塞地取，取不到就是
+     "busy"，从不等。
+  3. engine._lock（RLock，DashboardEngine 内部）：由持租约的请求和后台线程持有。池从不拿它：quiesce
+     在不持引擎锁的情况下 join 后台线程（线程分段拿锁，持锁 join 会卡满 5 秒误报 world_busy）。
+  4. supervisor 互斥锁（C++ Runtime 内部）：只在持 engine._lock 时取（见 engine.py 的
      _sample_backpressure 一带），从不反向。
 
-  即 manager.lock → _gate → _build_lock → engine._lock → supervisor。
-  持租约的代码不得去拿 manager.lock：切换持着 manager.lock 等租约归零，反过来就是死锁
-  （超时后 ingest_busy）。
+  即 pool._lock → pool._world_locks[name] → engine._lock → supervisor。实际代码里 1 在 2 之内只短暂取
+  （查表、改表），从不在持 1 时去取 2。
+
+  app.state.config_lock（threading.Lock，写配置的路由在工作线程里取，见 routes/config.py）排在这四把之前：持着它时
+  会发默认世界的租约（补起 workers-lost 的后台线程时非阻塞取世界锁）、取默认世界的 engine._lock。所以别处要它时
+  一律在取世界锁、engine._lock 之前取，不得在持世界锁或 engine._lock 时等它（重新确认端点只在取世界锁之前持它
+  拷 provider 表，裁定 R59 N-3）。
+  持租约的代码不得阻塞地等 _world_locks：关闭、恢复持着世界锁等租约归零，反过来就是死锁。持租约时取
+  世界锁的地方只有两处，都不阻塞地等：
+    - 首次建引擎（lease 先登记租约、放开 _lock，再取世界锁建引擎）：_acquire_for_build 以 50 毫秒为一段
+      轮询，每段之间查该世界的关闭标志，标志已置就放弃（world_busy），租约随之归还，关闭的等待随即结束。
+      关闭先取世界锁、再置标志、再等租约，所以构建的租约要么在关闭取世界锁之前已经建完（关闭等它用完），
+      要么在轮询里看到标志后放弃，不会互等。
+    - 补起 workers-lost 世界的后台线程（_retry_lost_workers，裁定 R23）：只试一次 acquire(blocking=False)，
+      取不到这次就不补，下一次租约再试。
+  这两处都可能在事件循环上运行：路由同步调 lease 时，惰性建引擎与补起线程（start_ingest_worker、起不来时的
+  quiesce，最长约 5 秒）就在事件循环线程上做，与旧实现的惰性构建一样。
 
 自动快照（W4）
 --------------
-两种触发共用 _auto_snapshot，要不要拍、拍什么全由 C++ take_auto_snapshot 判，这里只取锁、存注册表、
-记失败。后台调用方（摄入线程上的会话钩子、调度线程 starling-auto-snapshot）只用非阻塞方式取
-manager.lock，取不到就是 "busy"，从不等：切换、回滚持着 manager.lock 停摄入线程、等租约，摄入线程
-若在这里等锁，quiesce 就要等满 5 秒报 ingest_busy。摄入线程调钩子时不持 engine._lock（T3 的调用点
-保证），所以不会出现 engine._lock → manager.lock 的反向边。会话钩子取锁之前先不加锁读一次注册表
-（worlds.json 原子替换），活动世界按会话关着就直接返回，不取锁，摄入不会因无关的管理操作被推迟；
-开着才走持锁路径，在锁内重新判。失败（C++ 错误、存注册表失败）只计数、记日志，不往外抛（用户裁定：
-照常摄入）；钩子另有最外层兜底，除 SessionSnapshotDeferred 外的任何异常都只记日志。
+两种触发共用 _auto_snapshot，要不要拍、拍什么全由 C++ take_auto_snapshot 判，这里只取锁、记失败。
+按时间：调度线程 starling-auto-snapshot 每轮遍历注册表里的全部世界（开着的、关着的都算），逐个在该
+世界的世界锁内调 C++（裁定 R19）。按会话：钩子挂在每个引擎上（attach_hooks），摄入线程在写入之前调用，
+不持 engine._lock，所以没有 engine._lock → 世界锁的反向边。两者都只非阻塞取世界锁，取不到就是 "busy"：
+钩子抛 SessionSnapshotDeferred 让摄入 job 放回 spool，调度线程等下一轮。失败只计数、记日志，不往外抛
+（用户裁定：照常摄入）。
+
+统计缓存（spec §5.5）
+---------------------
+提交时不写 registry.db。开着的世界的计数由 live_stats 从库里现读（C++ world_stats，持一份租约）；关闭时
+（close_world、close_all）与 30 秒的后台刷新把它写进注册表的缓存列。引擎的 on_commit 由池设置：每个世界
+每秒至多通知一次 on_world_changed（尾沿去抖：一秒内的一串写入，最后一次通知带最终计数）。
+
+本期不做：没有空闲自动关闭（C++ 的空闲判定在第 4 期，裁定 R21）。世界开着直到 close_world、
+delete_world 或关停（close_all），默认世界只在关停时关。
 """
 from __future__ import annotations
 
-import dataclasses
+import contextlib
 import gc
 import logging
 import os
 import threading
 import time
+import traceback
 import weakref
-from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Callable
 
 from starling import _core
-from starling.dashboard.engine import DashboardEngine, SessionSnapshotDeferred
+from starling.dashboard.config import provider_endpoint_settings, provider_endpoints
+from starling.dashboard.engine import (DashboardEngine, SessionSnapshotDeferred,
+                                       WorldContext)
 
 logger = logging.getLogger(__name__)
 
-# 切换等在途请求（租约）归零的上限。超时：清标志、恢复旧引擎的后台线程、回 ingest_busy。
+__all__ = ["EngineFactory", "EngineLease", "WorldContext", "WorldPool", "WorldSwitchError",
+           "engine_lease"]
+
+# 关闭、恢复等在途请求（租约）归零的默认上限。超时：清标志、恢复后台线程、回 world_busy。
 _LEASE_DRAIN_TIMEOUT_S = 30.0
-# 丢掉旧引擎后等旧 Runtime 被回收的宽限：异常回溯、刚返回的栈帧可能还短暂引用着它。
+# 丢掉引擎后等旧 Runtime 被回收的宽限：异常回溯、刚返回的栈帧可能还短暂引用着它。
 _RUNTIME_RELEASE_GRACE_S = 1.0
+# on_world_changed 的去抖窗口（秒）：每个世界每秒至多一次。
+_CHANGE_DEBOUNCE_S = 1.0
+# 统计缓存的后台刷新间隔（spec §5.5）。
+_STATS_REFRESH_S = 30.0
+_STATS_THREAD = "starling-world-stats"
+# 调度线程：首轮之前的等待与每轮间隔（秒）。按时间的间隔以小时计，10 分钟一轮足够；首轮推迟
+# 一分钟，不与启动时的首屏请求、tick 抢 VACUUM 的 I/O。
+_SCHEDULER_POLL_S = 600.0
+_SCHEDULER_FIRST_DELAY_S = 60.0
+_SCHEDULER_THREAD = "starling-auto-snapshot"
+# 默认世界在没有注册表（:memory: 等）时的名字。
+_DEFAULT_NAME = "default"
+# 注册表 list 的分页上限（RegistryDb::list 的 limit 1–500）。
+_LIST_PAGE = 500
+# 默认世界经 PUT /api/worlds/default/settings 能改的设置（裁定 R35）：其余段（endpoint、阈值、来源通道、
+# tick 间隔）归 /api/config，下一次 sync_default_settings 会整段覆盖它们。auto_snapshot 与 ingest 不在
+# config 里（裁定 R16），同步时保留。
+_DEFAULT_WORLD_EDITABLE = {"background": {"auto_snapshot", "ingest"}}
+
+EngineFactory = Callable[[WorldContext, dict], DashboardEngine]
+
+
+def _default_factory(ctx: WorldContext, providers: dict) -> DashboardEngine:
+    return DashboardEngine(ctx, providers)
 
 
 class WorldSwitchError(Exception):
-    """code: "world_not_found" | "ingest_busy" | "world_open_failed"
-    | "world_tenant_mismatch" | "world_switching" | "rollback_reopen_failed" """
+    """code: "world_not_found" | "world_busy" | "world_protected" | "worlds_unavailable"
+    | "world_open_failed" | "rollback_reopen_failed" """
 
     def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code = code
         self.detail = detail
-
-
-def registry_path_for(config) -> str:
-    env = os.environ.get("STARLING_WORLDS_REGISTRY")
-    if env:
-        return env
-    return os.path.join(os.path.dirname(config.db_path), "worlds.json")
-
-
-def bootstrap_worlds(config):
-    """建立/读取注册表，并把 config 原地改写成活动世界（db_path + tenant）。
-
-    返回注册表路径。库路径没有父目录（`:memory:`、空串、裸文件名）时无处安放
-    注册表，整个跳过并返回 None：不写任何文件、不改 config，调用方据此让
-    `app.state.worlds` 保持 None（路由回 503 worlds_unavailable）。这个判断必须先于
-    STARLING_WORLDS_REGISTRY 环境变量，否则测试里的 :memory: 会被登记成
-    `<cwd>/:memory:` 这个默认世界。"""
-    db_path = config.db_path
-    if not db_path or db_path == ":memory:" or not os.path.dirname(db_path):
-        return None
-    registry_path = registry_path_for(config)
-    _core.world_ensure_registry(registry_path, config.db_path, config.tenant)
-    reg = _core.world_load_registry(registry_path)
-    entry = reg["worlds"][reg["active"]]
-    if (os.path.abspath(config.db_path) != entry["db_path"]
-            or config.tenant != entry["tenant"]):
-        # 注册表优先于 starling.json / STARLING_DASH_DB：已存在的注册表里 default 的路径
-        # 不会被改写。静默换库有写错库的风险，至少让它在日志里可见。
-        logger.warning("worlds registry %s overrides config: db_path %s -> %s, tenant %s -> %s",
-                       registry_path, config.db_path, entry["db_path"],
-                       config.tenant, entry["tenant"])
-    if reg["active"] != reg["default"]:
-        # 重启时活动世界不是默认世界：它的引擎马上会按这里的 config 建起来（run_dashboard.py
-        # 急切建、lifespan 或首个命令惰性建），绕过了切换时的租户校验。在这里补上，不满足
-        # 就拒绝启动（world_tenant_mismatch），而不是带着别的租户的数据开始写。
-        # 默认世界（原地的 dashboard.db）不在此校验：它早于世界管理，既有部署与测试里可以
-        # 按租户过滤地存多个租户；切换回默认世界时仍按 §2.1 校验。
-        _core.world_verify_tenant(entry["db_path"], entry["tenant"])
-    config.db_path = entry["db_path"]
-    config.tenant = entry["tenant"]
-    return registry_path
-
-
-def _same_db(left: str, right: str) -> bool:
-    """两个库路径是不是同一个文件。注册表存的是绝对路径，但 live config 可能带着另一种
-    写法（符号链接目录、相对路径），所以按真实路径比，而不是字符串。"""
-    return os.path.realpath(left) == os.path.realpath(right)
 
 
 def _now_iso() -> str:
@@ -143,31 +163,34 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# 调度线程：首轮之前的等待与每轮间隔（秒）。按时间的间隔以小时计，10 分钟一轮足够；首轮推迟
-# 一分钟，不与启动时的首屏请求、tick 抢 VACUUM 的 I/O。
-_SCHEDULER_POLL_S = 600.0
-_SCHEDULER_FIRST_DELAY_S = 60.0
-_SCHEDULER_THREAD = "starling-auto-snapshot"
+def _same_db(left: str, right: str) -> bool:
+    """两个库路径是不是同一个文件（按真实路径比：符号链接目录、相对路径）。"""
+    return os.path.realpath(left) == os.path.realpath(right)
+
+
+def _store_code(exc: BaseException) -> str | None:
+    return _core.world_store_error_code(exc) if isinstance(exc, _core.WorldStoreError) else None
 
 
 class EngineLease:
-    """一份引擎租约。`with lease as engine:` 或手动 `release()`；release 幂等。
+    """一个世界的一份引擎租约。`with lease as engine:` 或手动 `release()`；release 幂等。
 
-    release 先丢掉自己对引擎的引用、再归还计数：计数一归零，切换就会丢旧引擎并断言旧
-    Runtime 已回收，租约对象本身（可能还挂在某个栈帧或异常回溯上）不能再钉住它。
-    调用方自己的局部变量要在 release 之前清掉（见 /ws/converse、/api/config）。"""
+    release 先丢掉自己对引擎的引用、再归还计数：计数一归零，关闭就会丢引擎并断言旧 Runtime 已回收，
+    租约对象本身（可能还挂在某个栈帧或异常回溯上）不能再钉住它。调用方自己的局部变量要在 release
+    之前清掉（见 /ws/converse、/api/config）。build=False 且世界没开着时 engine 为 None。"""
 
-    __slots__ = ("_owner", "engine")
+    __slots__ = ("_owner", "world", "engine")
 
-    def __init__(self, owner, engine) -> None:
-        self._owner = owner          # WorldManager；无注册表（:memory:）时为 None，不计数
+    def __init__(self, owner, world: str, engine) -> None:
+        self._owner = owner          # WorldPool
+        self.world = world
         self.engine = engine
 
     def release(self) -> None:
         owner, self._owner = self._owner, None
         self.engine = None
         if owner is not None:
-            owner._return_lease()
+            owner._return_lease(self.world)
 
     def __enter__(self):
         return self.engine
@@ -176,250 +199,719 @@ class EngineLease:
         self.release()
 
 
-def engine_lease(state, *, build=None) -> EngineLease:
-    """路由取引擎的唯一入口。有 WorldManager 时经它发租约（切换中抛
-    WorldSwitchError("world_switching")）；没有（:memory: 等无注册表的库）时没有切换，
-    返回不计数的租约。build(config) -> engine 给出时，engine 还是 None 就惰性建一个并写回
-    app.state（命令路由用）；不给时原样返回 app.state.engine（可能是 None）。"""
-    worlds = getattr(state, "worlds", None)
-    if worlds is not None:
-        return worlds.lease(build=build)
-    engine = state.engine
-    if engine is None and build is not None:
-        engine = build(state.config)
-        state.engine = engine
-    return EngineLease(None, engine)
+def engine_lease(state, world: str | None = None, *, build: bool = True) -> EngineLease:
+    """路由取引擎的入口（Task 6 改写路由时用）：app.state.pool 上按世界发租约，world 为 None
+    时取默认世界。"""
+    pool = state.pool
+    return pool.lease(world or pool.default_world(), build=build)
 
 
-class WorldManager:
-    def __init__(self, app_state, registry_path: str, *, clock=None) -> None:
-        self._state = app_state
-        self.registry_path = registry_path
-        self.registry_dir = os.path.dirname(os.path.abspath(registry_path))
-        self.lock = threading.RLock()
-        self.workers_enabled = False
-        self.on_tick = None
-        # 切换窗口标志：activate 与活动世界回滚动引擎期间为 True（见 _switch_window）。此时新
-        # 租约一律拒绝，路由回 503 world_switching，而不是在 engine 暂时为 None 时按旧 config
-        # 惰性重建引擎。写它和发租约只在 _gate 内；rollback 开头与 GET /api/config 不加锁读。
-        self.switching = False
-        self._gate = threading.Lock()
-        self._drained = threading.Condition(self._gate)   # 租约归零时 notify
-        self._leases = 0
-        self._build_lock = threading.Lock()
-        # 「后台线程丢了」：失败路径（切换双失败、回滚活动世界后重开失败）把运行中的引擎丢成
-        # None 时置位，下一次真正新建引擎的惰性构建据此补起 tick / 摄入线程，然后清位；补起
-        # 失败则保持置位，下一次真正新建时再试。成功的切换与回滚发布新引擎时已起过线程，清位。
-        # 写它只在两处，互斥：切换窗口内持 manager.lock（窗口内租约一律拒绝，在途租约已归零，
-        # 没有惰性构建），或持租约且持 _build_lock。启动时没有引擎不算「丢了」：
-        # tick_interval_s=0 时首个请求惰性建出的引擎照旧不起摄入线程。
-        self._workers_lost = False
-        # 切换后没能回收的旧 Runtime：[(它打开的库路径, 弱引用)]。它还开着那个库的写连接。
-        # 那个库若被回滚替换，这条连接会继续写旧 inode 和它已被 unlink 的 WAL：这些写入在
-        # 恢复出来的库里没有，静默丢失，归档（旧 inode 唯一剩下的名字）也可能被改动。关掉它时
-        # SQLite 发现主文件已被换掉，不做 checkpoint、不删文件，恢复出来的库不受影响（实测）。
-        # rollback 据此拒绝。只在 manager.lock 内读写。
-        self._leaked_runtimes: list[tuple[str, weakref.ref]] = []
-        # 自动快照（W4）。clock() 返回秒精度 UTC 字符串；测试注入固定或可推进的时钟。
+class _Debounce:
+    """一个世界的去抖状态（只在 pool._lock 下读写）。timer 非 None = 窗口开着。"""
+
+    __slots__ = ("pending", "timer", "last_fire")
+
+    def __init__(self) -> None:
+        self.pending = False
+        self.timer: threading.Timer | None = None
+        self.last_fire = float("-inf")
+
+
+class _ClosingWindow:
+    """置一个世界的关闭标志（此后它的新租约一律 world_busy），任何退出路径都清标志。调用方持该世界的
+    世界锁，所以同一世界的关闭、删除、恢复互相串行，标志不会被别的窗口提前清掉。"""
+
+    __slots__ = ("_pool", "_world")
+
+    def __init__(self, pool: "WorldPool", world: str) -> None:
+        self._pool, self._world = pool, world
+
+    def __enter__(self) -> None:
+        with self._pool._lock:
+            self._pool._closing.add(self._world)
+
+    def __exit__(self, *_exc) -> None:
+        with self._pool._lock:
+            self._pool._closing.discard(self._world)
+
+
+class WorldPool:
+    def __init__(self, registry, config, *, clock=None,
+                 engine_factory: EngineFactory | None = None,
+                 on_world_changed: Callable[[str, dict], None] | None = None) -> None:
+        self._registry = registry                     # _core.WorldRegistry | None（裁定 R6）
+        self._config = config
         self._clock = clock or _now_iso
-        # 失败计数与最近一次错误（错误码与时刻）。只在 _gate 下读写（短，不做 I/O）。
+        self._factory = engine_factory or _default_factory
+        self.on_world_changed = on_world_changed
+        # 后台 tick 的广播回调 on_tick(world, stats)。app 设置；引擎起 tick 线程时绑上世界名传进去。
+        self.on_tick: Callable[[str, dict], None] | None = None
+        self._lock = threading.Lock()
+        self._drained = threading.Condition(self._lock)   # 某个世界的租约归零时 notify_all
+        self._engines: dict[str, DashboardEngine] = {}
+        self._leases: dict[str, int] = {}
+        self._closing: set[str] = set()
+        self._world_locks: dict[str, threading.RLock] = {}
+        # 没能回收的旧 Runtime：[(它打开的库路径, 弱引用)]（见模块文档「释放 C++ 写连接」）。
+        self._leaked: list[tuple[str, weakref.ref]] = []
+        self._debounce: dict[str, _Debounce] = {}
+        # 后台线程是否开着（start_background 之后）：此后新建的引擎按自己的设置起线程。
+        self._background = False
+        self._shut = False                            # close_all 之后为 True，不再发租约
+        # 自动快照失败计数与最近一次错误（码与时刻），所有世界合计。
         self._auto_failures = 0
         self._auto_last_error: str | None = None
         self._auto_last_error_at: str | None = None
-        # 按时间的调度线程与它的停止事件。start/stop 只在 lifespan（启动、关停）与测试里调用，
-        # 在 _gate 下交换句柄；join 在任何锁之外。
-        self._scheduler: threading.Thread | None = None
-        self._scheduler_stop: threading.Event | None = None
+        self._threads: dict[str, tuple[threading.Thread, threading.Event]] = {}
+        self._vector_warned = False                   # 非 sqlite 的 config 只提醒一次（裁定 R26）
+        # 发布时没起来后台线程的世界（裁定 R23）：下一次租约在世界锁内补起，补起之前引擎照常服务请求。
+        self._workers_lost: set[str] = set()
 
-    def load(self) -> dict:
-        return _core.world_load_registry(self.registry_path)
+    # ───────────────────────── 注册表与上下文 ─────────────────────────
 
-    def save(self, reg: dict) -> None:
-        _core.world_save_registry(self.registry_path, reg)
+    @property
+    def registry(self):
+        """_core.WorldRegistry；库路径没有父目录（:memory: 等）时为 None（裁定 R3、R6）。"""
+        return self._registry
 
-    def active_world(self) -> dict:
-        reg = self.load()
-        entry = dict(reg["worlds"][reg["active"]])
-        entry["name"] = reg["active"]
-        return entry
+    def _require_registry(self):
+        if self._registry is None:
+            raise WorldSwitchError("worlds_unavailable")
+        return self._registry
 
-    def persistable_config(self, cfg):
-        reg = self.load()
-        default = reg["worlds"][reg["default"]]
-        return dataclasses.replace(cfg, db_path=default["db_path"], tenant=default["tenant"])
+    def default_world(self) -> str:
+        return self._registry.default_world() if self._registry is not None else _DEFAULT_NAME
 
-    def lease(self, *, build=None) -> EngineLease:
-        """发一份引擎租约（见模块文档）。切换中抛 WorldSwitchError("world_switching")。
-
-        build 见 engine_lease。计数先于惰性构建增加：切换置位后等租约归零，也就等到了
-        正在进行的构建，构建完写回的引擎会被切换当作旧引擎接手，不会在切换之后才冒出来。
-        这个引擎可能已经补起了后台线程（见下段），_quiesce_and_drain 在等完租约之后再停一次，
-        接手的是停好线程的引擎。
-        _gate 只在计数时短暂持有（调用方可能在事件循环上），构建在 _build_lock 下进行。
-
-        失败路径丢过引擎（_workers_lost）时，真正新建了引擎的那次构建先补起后台线程、再写回
-        引擎，两步都持 _build_lock（_start_workers 自己看 workers_enabled），见
-        _restart_lost_workers。顺序不能反：先写回的话，切换的第一次 quiesce 可能读到这个引擎，
-        正赶上 Thread.start() 还没返回，join 一个没启动的线程抛 RuntimeError（路由回 500
-        internal_error）；那条线程随后启动、看到停止事件就退出，标志却已清掉，摄入或 tick 静默
-        停摆。现在第一次 quiesce 读到的要么是 None，要么是线程已经起好的引擎。补起线程用的是这次
-        构建用的同一份 config。拿到已有引擎的租约不碰标志。
-
-        只有带 build 的租约（命令路由 routes/commands.py：写入、召回、tick 等）会惰性重建，所以
-        失败之后由下一条命令请求恢复引擎和后台线程；检视路由、GET /api/worlds、/api/config、
-        /ws/converse 的租约不带 build，页面加载与整页刷新都不会重建。"""
-        with self._gate:
-            if self.switching:
-                raise WorldSwitchError("world_switching")
-            self._leases += 1
-        lease = EngineLease(self, None)
+    def _record(self, world: str) -> dict:
+        """注册表记录；不存在 → WorldSwitchError("world_not_found")。无注册表时只有默认世界，记录由
+        config 直接给出（裁定 R6）。"""
+        if self._registry is None:
+            if world != _DEFAULT_NAME:
+                raise WorldSwitchError("world_not_found", world)
+            return {"name": _DEFAULT_NAME, "dir_id": _DEFAULT_NAME,
+                    "db_path": self._config.db_path, "tenant": self._config.tenant,
+                    "settings": self._config.world_settings()}
         try:
-            engine = self._state.engine
-            if engine is None and build is not None:
-                with self._build_lock:
-                    engine = self._state.engine
-                    if engine is None:
-                        cfg = self._state.config
-                        engine = build(cfg)
-                        if self._workers_lost:
-                            self._restart_lost_workers(engine, cfg)
-                        self._state.engine = engine
+            return self._registry.get(world)
+        except _core.WorldStoreError as exc:
+            if _store_code(exc) == "world_not_found":
+                raise WorldSwitchError("world_not_found", world) from exc
+            raise
+
+    def context(self, world: str) -> WorldContext:
+        """一个世界打开引擎需要的全部输入：库、租户、C++ 补齐默认值后的设置、摄入分区目录
+        （<config.ingest_spool_root()>/<world_ingest_partition(...)>，裁定 R4）。默认世界的向量后端与路径
+        取 config（裁定 R26，默认世界「原地」），其余世界 sqlite、没有路径。"""
+        rec = self._record(world)
+        is_default = world == self.default_world()
+        partition = _core.world_ingest_partition(is_default, rec["tenant"], rec["dir_id"])
+        backend, store_path = self._vector_store(world, is_default)
+        return WorldContext(
+            name=world, dir_id=rec["dir_id"], db_path=rec["db_path"], tenant=rec["tenant"],
+            agent=self._config.agent,
+            settings=_core.world_effective_settings(rec["settings"]),
+            ingest_spool_dir=str(self._config.ingest_spool_root() / partition),
+            is_default=is_default, vector_backend=backend, vector_store_path=store_path)
+
+    def _vector_store(self, world: str, is_default: bool | None = None) -> tuple[str, str]:
+        """(向量后端, 路径)：默认世界取 config（裁定 R26），其余世界 ("sqlite", "")。快照、恢复、自动快照
+        把这个后端交给 C++，zvec 的默认世界由 C++ 拒绝（snapshot_unsupported_backend）。"""
+        if is_default is None:
+            is_default = world == self.default_world()
+        if is_default:
+            return (self._config.vector_backend or "sqlite",
+                    self._config.vector_store_path or "")
+        return "sqlite", ""
+
+    def _world_lock(self, world: str) -> threading.RLock:
+        with self._lock:
+            lock = self._world_locks.get(world)
+            if lock is None:
+                lock = self._world_locks[world] = threading.RLock()
+            return lock
+
+    # ───────────────────────── 租约 ─────────────────────────
+
+    def lease(self, world: str, *, build: bool = True) -> EngineLease:
+        """发 world 的一份租约（见模块文档）。
+
+        world 不存在 → WorldSwitchError("world_not_found")；正在关闭、恢复、删除，或池已关停 →
+        WorldSwitchError("world_busy")。build=False 且世界没开着时 lease.engine 为 None（只读检视
+        路由直接只读打开库文件用）。不论 build 与否都计入该世界的租约数：恢复与关闭等它们归零。
+
+        计数先于建引擎：关闭置标志后等租约归零，也就等到了正在进行的构建。建引擎在世界锁内、池锁
+        之外（不同世界的首次打开互不排队）；拿到世界锁之后再查一次表，并发的两个首次打开只建一个
+        引擎（Review Focus 1：同一库文件上两条写连接会互相截断 WAL）。"""
+        self._record(world)                           # world_not_found（池锁之外读注册表）
+        with self._lock:
+            if self._shut or world in self._closing:
+                raise WorldSwitchError("world_busy", world)
+            self._leases[world] = self._leases.get(world, 0) + 1
+            engine = self._engines.get(world)
+            lost = world in self._workers_lost
+        lease = EngineLease(self, world, None)
+        try:
+            if engine is None and build:
+                engine = self._build(world)
+            elif engine is not None and lost:
+                self._retry_lost_workers(world)
             lease.engine = engine
         except BaseException:
+            engine = None
             lease.release()
             raise
         return lease
 
-    def _restart_lost_workers(self, engine, cfg) -> None:
-        """lease 刚新建、还没写回的引擎补起后台线程（持 _build_lock）。cfg 是这次构建用的
-        config。起线程失败不让租约失败：记日志，标志保持置位，下一次真正新建引擎时再试；这个
-        引擎照常写回、服务请求。部分失败（tick 已起、摄入抛错）不对这个引擎重试，它要等下一次
-        成功的切换、回滚或重启才有摄入线程（spec §8.1）。"""
-        try:
-            self._start_workers(engine, cfg)
-        except Exception:  # noqa: BLE001 — 线程起不来不能连带命令请求失败
-            logger.exception("cannot restart background workers on the lazily rebuilt engine")
-            return
-        self._workers_lost = False
-
-    def disable_workers(self) -> None:
-        """lifespan 关停段调用：此后任何路径都不再起后台线程。先在任何锁之外停掉按时间的调度
-        线程（W4），再按锁序取 manager.lock（等进行中的切换、回滚收尾）、_build_lock（等进行中的
-        惰性构建连同补起线程收尾），然后关 workers_enabled。返回之前写回的引擎都在 app.state.engine
-        上，由关停段停掉它的线程；返回之后的惰性构建看到的是 False，不再起线程。"""
-        # 调度线程先停：关停一开始就不再开新一轮。放在锁块之后的话，它的 poll 若恰好在锁放开之后、
-        # stop 之前到期，就会再拍一份，join 要等这一份拍完（库大时会活过关停）。调度线程不经
-        # _start_workers，workers_enabled 管不到它，所以不必等开关关掉再停。join 在锁外：调度线程
-        # 只做非阻塞取锁，从不等我们，最多等它进行中的那一份拍完，之后它看到停止事件就退出。
-        self.stop_scheduler()
-        with self.lock, self._build_lock:
-            self.workers_enabled = False
-
-    def _return_lease(self) -> None:
-        with self._gate:
-            self._leases -= 1
-            if self._leases == 0:
+    def _return_lease(self, world: str) -> None:
+        with self._lock:
+            left = self._leases.get(world, 0) - 1
+            if left <= 0:
+                self._leases.pop(world, None)
                 self._drained.notify_all()
+            else:
+                self._leases[world] = left
 
-    def _drain_leases(self) -> None:
-        """等在途租约归零（切换窗口内调用，标志已置位，不会再有新租约）。超过
-        _LEASE_DRAIN_TIMEOUT_S 抛 ingest_busy。Condition.wait 放开 _gate，不挡归还。"""
-        deadline = time.monotonic() + _LEASE_DRAIN_TIMEOUT_S
-        with self._gate:
-            while self._leases > 0:
+    def _drain(self, world: str, timeout_s: float) -> None:
+        """等 world 的在途租约归零（调用方已置该世界的关闭标志，不会再有新租约）。超时抛
+        world_busy。Condition.wait 放开 _lock，不挡归还。"""
+        deadline = time.monotonic() + timeout_s
+        with self._lock:
+            while self._leases.get(world, 0) > 0:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise WorldSwitchError(
-                        "ingest_busy", f"{self._leases} request(s) still in flight")
+                        "world_busy", f"{self._leases.get(world, 0)} request(s) still in flight")
                 self._drained.wait(remaining)
 
-    @contextmanager
-    def _switch_window(self):
-        """activate 动引擎的整个区间：进入时置标志（此后新租约一律拒绝），任何退出路径
-        （成功、ingest_busy、world_open_failed、world_tenant_mismatch）都清标志。"""
-        with self._gate:
-            self.switching = True
+    def _acquire_for_build(self, world: str) -> threading.RLock:
+        """持租约的首次建引擎取世界锁：关闭（持世界锁等这份租约）正在进行时不能阻塞地等它，那是互等。
+        所以轮询：取得到就返回；取不到时该世界若在关闭窗口里，就 world_busy（构建作废，租约随之归还，
+        关闭的等待随即结束）；否则（快照、自动快照等短操作持着锁）稍等再试。"""
+        lock = self._world_lock(world)
+        while not lock.acquire(timeout=0.05):
+            with self._lock:
+                closing = world in self._closing or self._shut
+            if closing:
+                raise WorldSwitchError("world_busy", world)
+        return lock
+
+    def _build(self, world: str) -> DashboardEngine:
+        """持世界锁建引擎并发布（调用方持着 world 的一份租约，所以关闭等它）。"""
+        lock = self._acquire_for_build(world)
         try:
-            yield
+            with self._lock:
+                engine = self._engines.get(world)
+                closing = world in self._closing or self._shut
+            if engine is not None:
+                return engine
+            if closing:
+                raise WorldSwitchError("world_busy", world)
+            ctx = self.context(world)
+            self._refuse_leaked(ctx.db_path)          # 旧 Runtime 还开着这个库：不开第二条写连接
+            if not ctx.is_default:
+                self._verify_tenant(ctx)              # 裁定 R36：在打开库之前，拒开时什么都没建
+            engine = self._open_engine(world, ctx)
+            if not self._publish(world, engine):
+                box, engine = [engine], None          # 交出唯一的引用：回收证明要求本帧不再钉住它
+                self._discard_unpublished(box, ctx.db_path)
+                raise WorldSwitchError("world_busy", "the pool is shutting down")
+            return engine
         finally:
-            with self._gate:
-                self.switching = False
+            lock.release()
 
-    def _start_workers(self, engine, cfg) -> None:
-        if not self.workers_enabled:
-            return
-        # 每个起摄入线程的引擎都经这里（切换、回滚、失败后惰性重建）。钩子在线程起来之前挂上：
-        # 摄入线程的第一个 job 就要看到它。lifespan 启动时的引擎由 T3 经 attach_hooks 挂。
-        self.attach_hooks(engine)
-        if cfg.tick_interval_s > 0:
-            engine.start_background_tick(cfg.tick_interval_s, self.on_tick)
-        engine.start_ingest_worker()
-
-    def _restart_workers(self, engine) -> None:
-        self._start_workers(engine, self._state.config)
-
-    def activate(self, name: str) -> None:
-        """切换活动世界（spec §8.1）：校验租户 → 停线程 → 等在飞请求 → 丢旧引擎 → 建新引擎。
-
-        抛 WorldSwitchError：world_not_found（未登记）、world_tenant_mismatch（新世界的库里
-        有别的租户的行，spec §2.1，状态不前进）、ingest_busy（后台线程 5 秒内没停下，或在途
-        请求 _LEASE_DRAIN_TIMEOUT_S 内没结束，状态不前进）、world_open_failed（新世界打不开，
-        或注册表写不进去，都已回到旧世界）。
-
-        发布顺序：开新库 → 存注册表 → 发布 config/engine 并起线程。注册表是「当前是
-        哪个世界」的唯一持久记录，必须先落盘再对外生效：若先发布再存、存又失败
-        （磁盘满、目录不可写），就会出现注册表说 A、引擎实际在写 B 的分叉——此后
-        「切回 A」被当成 no-op，写入全进 B，B 的目录还能被删掉。
-
-        顺序是「先 quiesce，再等在途请求」：后台线程不是租约，quiesce 停它们；quiesce 不持
-        引擎锁 join（tick 线程在 tick() 与 _sample_backpressure() 之间、摄入线程在逐块
-        remember() 之间都会放开引擎锁再重新去拿，持锁 join 会卡满 5 秒误报 ingest_busy）。
-        线程先停，等请求的这段时间里就不会再有新的摄入 job 开始写旧世界。
-
-        等在途请求等的是租约（见模块文档），不是引擎锁：remember 的抽取段、converse 的
-        生成段都在引擎锁外，持锁段之外的请求也要等完。超时（_LEASE_DRAIN_TIMEOUT_S）恢复
-        旧引擎的后台线程，状态不前进，回 ingest_busy。
-
-        关键事实：DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个
-        引用并 gc.collect() 才会。所以这里丢引用，并断言旧 Runtime 的弱引用已失效。
-        租约归零之后已没有请求持有旧引擎；仍短暂可达（刚返回的栈帧、异常回溯）时在
-        _RUNTIME_RELEASE_GRACE_S 内重试回收，还没失效才记 warning。
-
-        切换窗口：从开始动引擎到新引擎发布（或回滚完成）之间 `self.switching` 为 True，
-        新租约一律拒绝（路由回 503 world_switching），检视路由同样回 503。否则窗口里
-        app.state.engine 暂时是 None 而 config 还是旧的，惰性建引擎会造出旧世界的引擎写回
-        app.state，与注册表、config 错位。正在进行的惰性构建持着租约，切换会等它建完。
-        """
-        with self.lock:
-            reg = self.load()
-            if name not in reg["worlds"]:
-                raise WorldSwitchError("world_not_found", name)
-            # 已是活动世界才 no-op，且要看 live config 而不只看注册表的 active：两者一旦
-            # 分叉（注册表说 A、引擎实际在写 B），只信注册表就会把「切回 A」当成已完成，
-            # 之后的写入全落进 B。库相同、租户不同同样不是「已激活」。
-            entry = reg["worlds"][name]
-            cfg = self._state.config
-            if (reg["active"] == name and self._state.engine is not None
-                    and _same_db(cfg.db_path, entry["db_path"])
-                    and cfg.tenant == entry["tenant"]):
-                return
-            with self._switch_window():
-                self._swap_engine(reg, name)
-
-    def _verify_tenant(self, entry: dict) -> None:
-        """租户不变式（spec §2.1，C++ world_verify_tenant）。在动旧引擎之前做：拒开时
-        什么都没变。库读不出按「新世界打不开」报 world_open_failed。"""
+    @staticmethod
+    def _verify_tenant(ctx: WorldContext) -> None:
+        """租户不变式（世界设计 §2.1，裁定 R36）：非默认世界第一次建引擎之前，C++ world_verify_tenant 只读
+        扫一遍库，有别的租户的行就拒绝（world_tenant_mismatch），判断全在 C++。库读不出按「打不开」报
+        world_open_failed。默认世界（原地的 dashboard.db）早于世界管理，既有部署可按租户过滤地存多个租户，
+        不核对（与旧的启动校验一致）。"""
         try:
-            _core.world_verify_tenant(entry["db_path"], entry["tenant"])
+            _core.world_verify_tenant(ctx.db_path, ctx.tenant)
         except _core.WorldStoreError as exc:
-            code = _core.world_store_error_code(exc)
-            if code == "world_tenant_mismatch":
-                raise WorldSwitchError("world_tenant_mismatch", str(exc)) from exc
-            raise WorldSwitchError("world_open_failed", str(exc)) from exc
+            code = "world_tenant_mismatch" if _store_code(exc) == "world_tenant_mismatch" \
+                else "world_open_failed"
+            raise WorldSwitchError(code, str(exc)) from exc
 
-    def _release_old_runtime(self, rt_ref, db_path: str, after: str = "switch") -> bool:
-        """丢掉引擎之后等旧 Runtime 被回收，返回是否已回收。宽限期过了仍活着就记 warning，
-        并把 (db_path, 弱引用) 记进 _leaked_runtimes（见 _refuse_leaked_runtime）。"""
+    def _publish(self, world: str, engine) -> bool:
+        """持世界锁调用：先把引擎放进表，再按后台开关起线程（裁定 R23）。顺序不能反：起线程失败时引擎若还
+        不在表上，它的 Runtime（已打开写连接，起了一半的 tick 线程还引用着它）既没发布也没登记成泄漏，
+        下一次租约会在同一个库上再建一条写连接。起线程失败只记日志、标记 workers-lost，下一次租约补起；
+        这个引擎照常服务请求。
+
+        池已关停（close_all 置了 _shut）时不放进表、返回 False，由调用方关掉这个引擎（_discard_unpublished）。
+        close_all 只关它列出那一刻表上的世界：一个已经持着世界锁、正在首次打开的世界不在表上，它若在关停之后
+        才发布，写连接就一直开着。判断与放进表在同一次持 _lock 内，所以要么在 close_all 列表之前已经在表上
+        （close_all 取世界锁等它建完再关），要么看到 _shut、不发布。"""
+        with self._lock:
+            if self._shut:
+                return False
+            self._engines[world] = engine
+            background = self._background
+        if background:
+            self._start_workers_or_mark_lost(world, engine)
+        return True
+
+    def _discard_unpublished(self, box: list, db_path: str) -> bool:
+        """关掉一个没能发布的引擎（池已关停）：摘掉池的回调、关引擎、等旧 Runtime 回收（回收不了照常登记成
+        泄漏），返回是否已回收。没起过线程（_publish 没走到起线程那一步）。
+
+        引擎装在 box（只有一个元素的列表）里交进来，这里取出后清空它：调用方的局部变量若还指着引擎，
+        回收证明永远等不到（等满宽限期、登记成泄漏，此后这个库一直 world_busy）。调用方交出之前先把
+        自己的局部变量置 None。"""
+        engine = box.pop()
+        rt_ref = weakref.ref(engine._rt)
+        engine.on_commit = None
+        engine.session_snapshot_hook = None
+        engine.close()
+        engine = None
+        return self._release_runtime(rt_ref, db_path)
+
+    def _start_workers_or_mark_lost(self, world: str, engine) -> bool:
+        """持世界锁调用。起 tick / 摄入线程；任一步失败就把已经起来的停掉（不留半套线程，补起时整套重来），
+        记日志，标记 workers-lost，返回 False。成功时清掉标记，返回 True。"""
+        try:
+            self._start_workers(world, engine)
+        except Exception as exc:  # noqa: BLE001 — 线程起不来不能连带租约失败（与旧 _restart_lost_workers 相同）
+            # 只记格式化好的文本：留着 LogRecord 的 handler（caplog、队列、内存 handler）若拿到 exc_info 或
+            # 异常对象本身（在 args 里），就经 __traceback__ 钉住持有引擎的栈帧（正在执行的帧 clear_frames
+            # 清不掉），之后关闭就证明不了 Runtime 已回收（世界一直 world_busy，直到 gc）。
+            detail = f"{type(exc).__name__}: {exc}"
+            traceback.clear_frames(exc.__traceback__)
+            exc.__traceback__ = None
+            exc = None
+            logger.error("cannot start background workers of world %s; retrying on the next "
+                         "lease: %s", world, detail)
+            if not engine.quiesce():
+                logger.warning("background threads of world %s did not stop after a failed start: %s",
+                               world, "/".join(engine.quiesce_stuck))
+            with self._lock:
+                self._workers_lost.add(world)
+            return False
+        with self._lock:
+            self._workers_lost.discard(world)
+        return True
+
+    def _retry_lost_workers(self, world: str) -> None:
+        """租约发现该世界 workers-lost：非阻塞取世界锁补起线程。世界锁被占（快照、关闭、恢复）就这次不补，
+        下一次租约再试；持租约时不能阻塞地等世界锁（见模块文档锁顺序）。补起失败同样只记日志。"""
+        lock = self._world_lock(world)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            with self._lock:
+                engine = self._engines.get(world)
+                still_lost = world in self._workers_lost
+                closing = world in self._closing or self._shut
+            if engine is None or not still_lost or closing or not self._background:
+                return
+            self._start_workers_or_mark_lost(world, engine)
+        finally:
+            engine = None
+            lock.release()
+
+    def workers_lost_worlds(self) -> list[str]:
+        """发布时没起来后台线程、等下一次租约补起的世界。"""
+        with self._lock:
+            return sorted(self._workers_lost)
+
+    def _open_engine(self, world: str, ctx: WorldContext):
+        """建引擎并挂上池的回调。失败抛 world_open_failed：清掉回溯里的栈帧，半建的 Runtime 不能被异常
+        钉住（调用方可能留着这个异常，同时为同一个库再建一个引擎）。"""
+        try:
+            engine = self._factory(ctx, self._config.providers)
+        except Exception as exc:
+            traceback.clear_frames(exc.__traceback__)
+            raise WorldSwitchError("world_open_failed", str(exc)) from exc
+        self._wire(world, engine)
+        return engine
+
+    def _wire(self, world: str, engine) -> None:
+        """挂上池的回调：统计去抖广播（on_commit）与按会话的自动快照钩子（有注册表时）。"""
+        engine.on_commit = lambda: self._note_change(world)
+        if self._registry is not None:
+            self.attach_hooks(world, engine)
+
+    def seed_engine(self, world: str, engine) -> None:
+        """把一个已经建好的引擎作为 world 的引擎放进池（create_app(engine=...)：测试与嵌入式调用方注入默认
+        世界的引擎）。不建引擎：换上池给这个世界的设置、挂上池的回调，然后与新建的引擎一样发布（_publish）。
+        create_app 在 lifespan 之前调用，后台线程还没开，所以什么都不起；之后 start_background 按世界设置起。
+
+        world 不存在 → world_not_found；池已关停、该世界正在关闭、已经有引擎，或之前的关闭留下的 Runtime
+        还开着这个库 → world_busy（同一个库上不能有两条写连接）。引擎打开的库与租户是否就是这个世界的，
+        由调用方先核对（app._require_engine_matches）。"""
+        try:
+            ctx = self.context(world)                 # world_not_found
+            with self._world_lock(world):
+                with self._lock:
+                    busy = self._shut or world in self._closing or world in self._engines
+                if busy:
+                    raise WorldSwitchError("world_busy", world)
+                self._refuse_leaked(ctx.db_path)
+                engine.set_world_settings(ctx.settings)
+                self._wire(world, engine)
+                if not self._publish(world, engine):  # 判断与放进表之间池关停了
+                    raise WorldSwitchError("world_busy", world)
+        except BaseException:
+            # 异常的回溯持有本帧：调用方留着异常时，engine 参数会钉住被拒的引擎（同 _close_engine）。
+            engine = None
+            raise
+
+    # ───────────────────────── 只读查询 ─────────────────────────
+
+    def open_worlds(self) -> list[str]:
+        with self._lock:
+            return sorted(self._engines)
+
+    def closing_worlds(self) -> list[str]:
+        with self._lock:
+            return sorted(self._closing)
+
+    def list_worlds(self, labels: dict | None = None, offset: int = 0, limit: int = 50) -> dict:
+        """注册表的一页 {"worlds": [记录], "total"}（C++ RegistryDb::list：标签全部匹配；写过的世界按最近写入
+        last_write_at 降序在前，没写过的在后，同序再按 created_at 降序、name 升序，spec §14；分页参数由 C++ 校验，
+        invalid_world_query）。只读注册表，不开任何世界的库；开着的世界的计数由调用方
+        经 live_stats 现读。"""
+        reg = self._require_registry()
+        return reg.list(labels=dict(labels or {}), offset=offset, limit=limit)
+
+    def record(self, world: str) -> dict:
+        """注册表记录（world_not_found；没有注册表时 worlds_unavailable）。"""
+        self._require_registry()
+        return self._record(world)
+
+    def db_stats(self, world: str) -> dict:
+        """世界库的完整统计（C++ world_stats：db_bytes、live_bytes、statements、engrams、holders、
+        last_write_at 等），持一份不建引擎的租约只读打开库（恢复要等它归还）。库文件不在时全 0；读不出时
+        C++ 抛 snapshot_failed。"""
+        self._require_registry()
+        with self.lease(world, build=False):
+            ctx = self.context(world)
+            return _core.world_stats(ctx.db_path, ctx.tenant)
+
+    def live_stats(self, world: str) -> dict | None:
+        """开着的世界：{"holders", "statements", "last_write_at"}（C++ world_stats，持一份不建引擎的
+        租约读库）；关着的返回 None（用注册表的缓存列）。正在关闭时同样 None。"""
+        try:
+            lease = self.lease(world, build=False)
+        except WorldSwitchError as exc:
+            if exc.code == "world_busy":
+                return None
+            raise
+        with lease as engine:
+            if engine is None:
+                return None
+            db_path, tenant = engine._db_path, engine.tenant
+            engine = None
+            stats = _core.world_stats(db_path, tenant)
+        return {"holders": stats["holders"], "statements": stats["statements"],
+                "last_write_at": stats["last_write_at"]}
+
+    # ───────────────────────── 统计缓存与去抖广播 ─────────────────────────
+
+    def _note_change(self, world: str) -> None:
+        """引擎的 on_commit（写方法成功之后，引擎锁之外）：尾沿去抖，每个世界每秒至多一次。窗口没开着
+        就立刻发并开一个窗口；窗口开着就记下 pending，窗口结束时由计时器再发一次（读那一刻的计数）。"""
+        if self.on_world_changed is None:
+            return
+        with self._lock:
+            deb = self._debounce.setdefault(world, _Debounce())
+            if deb.timer is not None:
+                deb.pending = True
+                return
+            deb.last_fire = time.monotonic()
+            deb.timer = self._arm(world)
+        self._emit_change(world)
+
+    def _arm(self, world: str) -> threading.Timer:
+        """持 _lock 调用：建一个 daemon 计时器并启动（Timer.start 只等线程起来，不碰我们的锁）。"""
+        timer = threading.Timer(_CHANGE_DEBOUNCE_S, self._debounce_tick, args=(world,))
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    def _debounce_tick(self, world: str) -> None:
+        with self._lock:
+            deb = self._debounce.get(world)
+            if deb is None:
+                return
+            if not deb.pending:
+                deb.timer = None                      # 窗口内没有新写入：关窗口
+                return
+            deb.pending = False
+            deb.last_fire = time.monotonic()
+            deb.timer = self._arm(world)              # 再开一个窗口吸收后续写入
+        self._emit_change(world)
+
+    def _emit_change(self, world: str) -> None:
+        callback = self.on_world_changed
+        if callback is None:
+            return
+        try:
+            stats = self.live_stats(world)
+            if stats is None:
+                return
+            callback(world, {"statements": stats["statements"],
+                             "last_write_at": stats["last_write_at"]})
+        except Exception:  # noqa: BLE001 — 通知失败不能连带写入或计时器线程
+            logger.exception("on_world_changed failed for %s", world)
+
+    def _cancel_debounce(self, world: str) -> None:
+        with self._lock:
+            deb = self._debounce.pop(world, None)
+        if deb is not None and deb.timer is not None:
+            deb.timer.cancel()
+
+    def _write_stats_cache(self, world: str, db_path: str, tenant: str) -> None:
+        """把库里的当前计数写进注册表缓存列。失败只记日志（缓存过期无害，下次刷新再写）。"""
+        if self._registry is None:
+            return
+        try:
+            stats = _core.world_stats(db_path, tenant)
+            self._registry.update_stats(world, stats["holders"], stats["statements"],
+                                        stats["last_write_at"], self._clock())
+        except Exception:  # noqa: BLE001 — 统计缓存是尽力而为
+            logger.warning("cannot write stats cache for %s", world, exc_info=True)
+
+    def refresh_stats(self) -> None:
+        """30 秒统计刷新的一轮：每个开着的世界，持一份不建引擎的租约读库、写缓存列。正在关闭的跳过
+        （关闭自己会写）。"""
+        for world in self.open_worlds():
+            try:
+                lease = self.lease(world, build=False)
+            except WorldSwitchError:
+                continue
+            with lease as engine:
+                if engine is None:
+                    continue
+                db_path, tenant = engine._db_path, engine.tenant
+                engine = None
+                self._write_stats_cache(world, db_path, tenant)
+
+    # ───────────────────────── 设置 ─────────────────────────
+
+    def sync_default_settings(self) -> None:
+        """registry.replace_settings_sections(默认世界, config.world_settings())：启动时与每次 POST
+        /api/config 保存后调用。config 是默认世界设置的权威来源，所以用整段替换而不是逐叶合并（裁定 R27）：
+        改绑到另一个 provider 之后不留旧 provider 的叶子，gist 少了的键同步后也没了。background 仍逐叶合并，
+        config 不带 auto_snapshot、ingest（裁定 R16）。替换在 C++ 的注册表锁内一次完成。开着的默认世界引擎
+        换上新设置（endpoint 核对按新地址做）；适配器由保存配置的路由按改动的角色热换，与改之前一样。"""
+        reg = self._require_registry()
+        default = reg.default_world()
+        merged = reg.replace_settings_sections(default, self._config.world_settings())
+        backend = self._config.vector_backend or "sqlite"
+        if backend != "sqlite":
+            with self._lock:
+                warn, self._vector_warned = not self._vector_warned, True
+            if warn:
+                # 裁定 R26：世界设置只收 sqlite。默认世界照常按 config 的后端打开，新世界一律 sqlite，
+                # 快照、恢复由 C++ 拒绝（snapshot_unsupported_backend）。
+                logger.warning("vector_backend=%r applies to the default world only; new worlds use "
+                               "sqlite, and snapshots of the default world are refused", backend)
+        with self._lock:
+            engine = self._engines.get(default)
+        if engine is not None:
+            engine.set_world_settings(_core.world_effective_settings(merged))
+
+    # ───────────────────────── 后台线程 ─────────────────────────
+
+    def _start_workers(self, world: str, engine) -> None:
+        """按该世界的 settings.background 起 tick / 摄入线程（钩子已在 _open_engine 挂好）。"""
+        background = engine._settings["background"]
+        interval = float(background["tick_interval_s"])
+        if interval > 0:
+            on_tick = self.on_tick
+            engine.start_background_tick(
+                interval, (lambda stats: on_tick(world, stats)) if on_tick is not None else None)
+        if background["ingest"]:
+            engine.start_ingest_worker()
+
+    def start_background(self, *, stats_interval_s: float = _STATS_REFRESH_S,
+                         scheduler_poll_s: float = _SCHEDULER_POLL_S,
+                         scheduler_first_delay_s: float = _SCHEDULER_FIRST_DELAY_S) -> None:
+        """每个开着的世界按自己的 settings.background 起 tick / 摄入；此后新建的引擎也起。起按时间的
+        自动快照调度线程与 30 秒统计刷新线程（有注册表时）。已开着时是 no-op。"""
+        with self._lock:
+            if self._background or self._shut:
+                return
+            self._background = True
+            worlds = list(self._engines)
+        for world in worlds:
+            with self._world_lock(world):             # 与关闭、恢复互斥：不给正在被丢的引擎起线程
+                with self._lock:
+                    engine = self._engines.get(world)
+                if engine is not None:
+                    self._start_workers_or_mark_lost(world, engine)
+                engine = None
+        if self._registry is not None:
+            self._start_thread(_SCHEDULER_THREAD, self._scheduler_loop,
+                               scheduler_poll_s, scheduler_first_delay_s)
+            self._start_thread(_STATS_THREAD, self._stats_loop, stats_interval_s, stats_interval_s)
+
+    def stop_background(self, timeout_s: float = 5.0) -> None:
+        """停调度与统计线程（任何锁之外 join），再停每个开着的世界的 tick / 摄入线程。此后新建的引擎
+        不起线程。
+
+        每个世界持它的世界锁 quiesce（与 start_background 一样）：正在首次打开的世界在 _publish 里读到后台
+        开着、放进表之后、起线程之前，世界锁一直在它手里；不取世界锁的话，这里可能先 quiesce 了一个还没有
+        线程的引擎，随后它才把线程起来，关停之后线程还在跑。"""
+        with self._lock:
+            self._background = False
+            threads = list(self._threads.values())
+            self._threads.clear()
+            worlds = list(self._engines)
+        for _thread, stop in threads:
+            stop.set()
+        for thread, _stop in threads:
+            thread.join(timeout_s)
+            if thread.is_alive():
+                logger.warning("%s did not stop within %.1fs", thread.name, timeout_s)
+        for world in worlds:
+            with self._world_lock(world):
+                with self._lock:
+                    engine = self._engines.get(world)
+                if engine is not None and not engine.quiesce(timeout_s):
+                    logger.warning("background threads of world %s did not stop: %s",
+                                   world, "/".join(engine.quiesce_stuck))
+                engine = None
+
+    def _start_thread(self, name: str, target, poll_s: float, first_delay_s: float) -> None:
+        stop = threading.Event()
+        thread = threading.Thread(target=target, args=(stop, poll_s, first_delay_s),
+                                  name=name, daemon=True)
+        thread.start()
+        with self._lock:
+            self._threads[name] = (thread, stop)
+
+    def _stats_loop(self, stop: threading.Event, poll_s: float, first_delay_s: float) -> None:
+        if stop.wait(first_delay_s):
+            return
+        while True:
+            try:
+                self.refresh_stats()
+            except Exception:  # noqa: BLE001 — 保活
+                logger.exception("stats refresh round failed")
+            if stop.wait(poll_s):
+                return
+
+    def _scheduler_loop(self, stop: threading.Event, poll_s: float, first_delay_s: float) -> None:
+        if stop.wait(first_delay_s):
+            return
+        while True:
+            try:
+                self.auto_snapshot_round(stop)
+            except Exception:  # noqa: BLE001 — 保活：单轮出错不终结调度
+                logger.exception("auto snapshot scheduler round failed")
+            if stop.wait(poll_s):
+                return
+
+    # ───────────────────────── 关闭 ─────────────────────────
+
+    def begin_drain(self) -> None:
+        """关停的第一步（D-P2-6）：每个开着的世界的引擎进 DRAINING，写门转为拒绝，之后才停摄入、停 tick、
+        关引擎（顺序见 app 的 lifespan）。每个世界持一份不建引擎的租约调用，正在关闭的世界跳过。引擎的
+        begin_drain 不拿引擎锁，在途的长请求挡不住它。关停路径：一个世界出错只记日志，不挡别的世界。"""
+        for world in self.open_worlds():
+            try:
+                with self.lease(world, build=False) as engine:
+                    if engine is not None:
+                        engine.begin_drain()
+                    engine = None
+            except WorldSwitchError:
+                continue
+            except Exception:  # noqa: BLE001 — 关停路径
+                logger.exception("cannot drain world %s at shutdown", world)
+
+    def close_world(self, world: str, timeout_s: float | None = None) -> None:
+        """关一个世界：等该世界租约归零、停线程、丢引擎、写统计缓存（Review Focus 2）。之后的 lease 会重新
+        建引擎。默认世界不在这里关（world_protected；只在关停时由 close_all 关）。没开着时什么都不做。
+        超时（缺省 _LEASE_DRAIN_TIMEOUT_S，调用时读，与恢复、删除一致）或线程停不下 → world_busy，引擎
+        原样留着。"""
+        if world == self.default_world():
+            raise WorldSwitchError("world_protected", "the default world closes only at shutdown")
+        self._record(world)
+        with self._world_lock(world), _ClosingWindow(self, world):
+            self._close_engine(world, _LEASE_DRAIN_TIMEOUT_S if timeout_s is None else timeout_s)
+
+    def close_all(self, timeout_s: float | None = None) -> None:
+        """关停：此后 lease 一律 world_busy；停后台线程，逐个关闭全部世界（含默认世界）。幂等。"""
+        if timeout_s is None:
+            timeout_s = _LEASE_DRAIN_TIMEOUT_S
+        with self._lock:
+            self._shut = True
+        self.stop_background()
+        for world in self.open_worlds():
+            try:
+                with self._world_lock(world), _ClosingWindow(self, world):
+                    self._close_engine(world, timeout_s)
+            except Exception:  # noqa: BLE001 — 关停路径：一个世界关不掉不挡别的世界
+                logger.exception("cannot close world %s at shutdown", world)
+        with self._lock:
+            worlds = list(self._debounce)
+        for world in worlds:
+            self._cancel_debounce(world)
+
+    def _close_engine(self, world: str, timeout_s: float) -> bool:
+        """关闭窗口内调用（持世界锁、标志已置）：停线程 → 等租约归零 → 再停一次线程 → 丢引擎、确认 Runtime
+        已回收 → 写统计缓存。返回 Runtime 是否已回收（没开着时 True）。
+
+        顺序是「先 quiesce，再等租约」：后台线程不是租约，quiesce 停它们，等租约的这段时间里就不会再有
+        新的摄入 job 开始写。第二次 quiesce 针对此刻表上的引擎（建引擎在世界锁内，我们持着它，实际上就是
+        同一个；无条件再停一次，正确性不靠这个推理，没有线程时 quiesce 直接返回 True）。
+
+        超时或线程停不下：恢复后台线程（后台开着时）、引擎原样留在表上，抛 world_busy。"""
+        # 每个 raise 之前先丢掉本帧对引擎的引用：异常的回溯持有本帧，调用方（路由、测试）留着异常时，
+        # 本帧的 engine 局部变量会钉住这个引擎，下一次关闭就丢不掉它的 Runtime（同库第二条写连接）。
+        with self._lock:
+            engine = self._engines.get(world)
+        if engine is not None and not engine.quiesce():
+            busy = self._quiesce_failed(world, engine)
+            engine = None
+            raise busy
+        try:
+            self._drain(world, timeout_s)
+        except WorldSwitchError as exc:
+            if engine is not None:
+                self._restart_after_failed_close(world, engine)
+            engine = None
+            raise exc from None
+        with self._lock:
+            engine = self._engines.get(world)
+        if engine is None:
+            self._cancel_debounce(world)
+            return True
+        if not engine.quiesce():
+            busy = self._quiesce_failed(world, engine)
+            engine = None
+            raise busy
+        db_path, tenant = engine._db_path, engine.tenant
+        rt_ref = weakref.ref(engine._rt)
+        engine.on_commit = None
+        engine.session_snapshot_hook = None
+        with self._lock:
+            self._engines.pop(world, None)
+            self._workers_lost.discard(world)
+        engine.close()
+        engine = None
+        self._cancel_debounce(world)
+        released = self._release_runtime(rt_ref, db_path)
+        self._write_stats_cache(world, db_path, tenant)
+        return released
+
+    def _quiesce_failed(self, world: str, engine) -> WorldSwitchError:
+        """后台线程没停下：恢复线程、引擎原样留着，返回要抛的 world_busy（detail 点名卡住的线程）。"""
+        stuck = "/".join(engine.quiesce_stuck) or "background"
+        self._restart_after_failed_close(world, engine)
+        return WorldSwitchError("world_busy", f"{stuck} thread did not stop in 5s")
+
+    def _restart_after_failed_close(self, world: str, engine) -> None:
+        """关闭没成（world_busy）、引擎留在表上：把停掉的线程补回来。补不起来就标记 workers-lost，
+        下一次租约再试；不能盖掉 world_busy。"""
+        if self._background:
+            self._start_workers_or_mark_lost(world, engine)
+
+    def _release_runtime(self, rt_ref, db_path: str) -> bool:
+        """丢掉引擎之后等旧 Runtime 被回收，返回是否已回收。宽限期过了仍活着就记 warning，并把
+        (db_path, 弱引用) 记进 _leaked（见模块文档「释放 C++ 写连接」）。"""
         gc.collect()
         deadline = time.monotonic() + _RUNTIME_RELEASE_GRACE_S
         while rt_ref() is not None and time.monotonic() < deadline:
@@ -427,457 +919,375 @@ class WorldManager:
             gc.collect()
         if rt_ref() is None:
             return True
-        # C++ 连接没释放：同进程里会暂时有第二条写连接
-        logger.warning("old runtime still referenced after %s", after)
-        self._prune_leaked_runtimes()
-        self._leaked_runtimes.append((db_path, rt_ref))
+        logger.warning("runtime of %s still referenced after close; its write connection "
+                       "stays open until it is collected", db_path)
+        with self._lock:
+            self._leaked = [(path, ref) for path, ref in self._leaked if ref() is not None]
+            self._leaked.append((db_path, rt_ref))
         return False
 
-    def _prune_leaked_runtimes(self) -> None:
-        self._leaked_runtimes = [(path, ref) for path, ref in self._leaked_runtimes
-                                 if ref() is not None]
-
-    def _refuse_leaked_runtime(self, db_path: str) -> None:
-        """之前的切换或回滚留下的旧 Runtime 还开着 db_path 的写连接时抛 ingest_busy。先 gc 并
-        摘掉已回收的条目。在动任何引擎或文件之前调用。"""
+    def _refuse_leaked(self, db_path: str) -> None:
+        """之前的关闭留下的旧 Runtime 还开着 db_path 的写连接时抛 world_busy。先 gc 并摘掉已回收的条目。
+        在动任何引擎或文件之前调用。"""
+        with self._lock:
+            if not self._leaked:
+                return
         gc.collect()
-        self._prune_leaked_runtimes()
-        if any(_same_db(path, db_path) for path, _ref in self._leaked_runtimes):
+        with self._lock:
+            self._leaked = [(path, ref) for path, ref in self._leaked if ref() is not None]
+            held = any(_same_db(path, db_path) for path, _ref in self._leaked)
+        if held:
             raise WorldSwitchError(
-                "ingest_busy", "old runtime still referenced: an earlier switch or rollback left "
-                               "a write connection open on this database")
+                "world_busy", "an earlier close left a write connection open on this database")
 
-    def _quiesce_and_drain(self) -> None:
-        """停当前引擎的后台线程，等在途租约归零，再对此刻的引擎停一次后台线程（切换窗口内
-        调用）。任一步失败：恢复后台线程、引擎原样留在 app.state 上，抛 ingest_busy。activate
-        与 rollback 共用。
+    # ───────────────────────── 世界管理（Task 6 的路由调用这些） ─────────────────────────
 
-        第二次 quiesce 针对在途的惰性构建：lease 先补起线程、再写回引擎，所以第一次读到的要么是
-        None（构建还在进行），要么是线程已经起好的引擎，不会是正在起线程的引擎（那样 join 一个
-        没启动的线程会抛 RuntimeError）。读到 None 时，等租约期间构建按 _workers_lost 补起 tick /
-        摄入线程并写回引擎，切换随后把它当旧引擎接手。租约已归零、新租约一律拒绝，此刻的引擎就是
-        要接手的那个，所以无条件再停一次（没有线程时 quiesce 直接返回 True）。不按「与第一次读到
-        的是不是同一个」来决定停不停：那样正确性就要靠 lease 内部的顺序，省下的只是一次空转的
-        quiesce。不在 lease 里看 switching 来跳过补起：那要在持 _build_lock 时取 _gate，与锁序
-        相反；不加锁读照样有竞态。"""
-        quiesced = self._state.engine
-        if quiesced is not None and not quiesced.quiesce():
-            # 后台线程没停下：恢复后台线程，状态不前进。码保持 ingest_busy（前端按
-            # 这个字符串映射），detail 点名实际卡住的线程。
-            stuck = "/".join(getattr(quiesced, "quiesce_stuck", ())) or "background"
-            self._restart_workers(quiesced)
-            raise WorldSwitchError("ingest_busy", f"{stuck} thread did not stop in 5s")
-        try:
-            self._drain_leases()
-        except WorldSwitchError:
-            if quiesced is not None:
-                self._restart_workers(quiesced)
-            raise
-        late = self._state.engine
-        if late is not None and not late.quiesce():
-            stuck = "/".join(getattr(late, "quiesce_stuck", ())) or "background"
-            self._restart_workers(late)
-            raise WorldSwitchError("ingest_busy", f"{stuck} thread did not stop in 5s")
+    def create_world(self, name: str, label: str, *, labels: dict | None = None,
+                     overrides: dict | None = None,
+                     auto_snapshot: dict | None = None) -> dict:
+        """建世界（C++ create_world：设置是默认世界当前设置的值拷贝，overrides 覆盖）。auto_snapshot
+        {"on_session", "interval_hours"} 给出时放进 overrides 的 background.auto_snapshot（C++ 校验，
+        invalid_auto_snapshot）。不打开引擎。返回注册表记录。"""
+        reg = self._require_registry()
+        merged = dict(overrides or {})
+        if auto_snapshot is not None:
+            background = dict(merged.get("background") or {})
+            background["auto_snapshot"] = {"on_session": auto_snapshot["on_session"],
+                                           "interval_hours": auto_snapshot["interval_hours"]}
+            merged["background"] = background
+        # 裁定 R40：客户端给了设置（或旧字段 auto_snapshot）时，provider 地址表交给 C++，合并、核对继承来的
+        # endpoint、写在同一次持注册表锁内完成（spec §8.3）；地址不同就 endpoint_changed、什么都不写。同步默认
+        # 世界设置取同一把锁，插不进中间。没给设置时照旧只继承默认世界（它由同步与 config 保持一致）。
+        return reg.create(name, label, dict(labels or {}), merged or None, self._clock(),
+                          provider_endpoints=self._provider_endpoints() if merged else None)
 
-    def _swap_engine(self, reg: dict, name: str) -> None:
-        """activate 的主体，调用时已持管理锁并处于切换窗口内（标志已置位）。
-        engine 与 config 都在租约归零之后才定稿：等待期间惰性构建可能刚写回一个引擎，
-        在途的配置请求也可能刚改过 config。"""
-        self._verify_tenant(reg["worlds"][name])
-        self._quiesce_and_drain()
-        old_engine = self._state.engine
-        old_cfg = self._state.config
-        new_cfg = dataclasses.replace(old_cfg)
-        new_cfg.db_path = reg["worlds"][name]["db_path"]
-        new_cfg.tenant = reg["worlds"][name]["tenant"]
-        if old_engine is not None:
-            rt_ref = weakref.ref(old_engine._rt)
-            old_db = old_engine._db_path
-            self._state.engine = None
-            old_engine = None
-            self._release_old_runtime(rt_ref, old_db)
-        try:
-            new_engine = DashboardEngine(new_cfg)
-        except Exception as exc:
-            self._rollback(old_cfg, str(exc), exc)           # 必抛
-        # 先落盘再发布。新引擎此时还没起线程；存失败就丢掉它（丢引用 + gc 释放它的
-        # C++ 写连接），再走与「新库打不开」同一条回滚路径，码仍是 world_open_failed，
-        # 前端「已留在原世界」的提示依然成立。
-        try:
-            self.save(_core.world_set_active(reg, name))
-        except Exception as exc:
-            new_engine = None
-            gc.collect()
-            self._rollback(old_cfg, f"registry write failed: {exc}", exc)   # 必抛
-        self._state.config = new_cfg
-        self._state.engine = new_engine
-        self._start_workers(new_engine, new_cfg)
-        self._workers_lost = False
+    def _provider_endpoints(self) -> dict[str, dict]:
+        """{provider 名: {"provider": 种类, "base_url": 地址}}（starling.json 的 provider 注册表），交给 C++ 核对客户端
+        写的设置里继承来的 endpoint（裁定 R40、R51）。只给当前值，比较在 C++；不含密钥。遍历前先拍快照（见
+        config.provider_endpoints）。"""
+        return provider_endpoints(self._config.providers)
 
-    def _rollback(self, old_cfg, detail: str, cause: Exception) -> None:
-        """新世界没能生效：回到旧世界并抛 world_open_failed。回滚本身也可能失败（旧库
-        同样打不开）——此时 engine 留 None、config 仍是旧世界，置 _workers_lost，下一条命令
-        请求惰性重建并补起后台线程（见 lease）；对调用方仍然是 WorldSwitchError（路由只映射
-        它），不让裸异常漏出去。"""
-        try:
-            self._state.engine = DashboardEngine(old_cfg)
-        except Exception as rollback_exc:
-            self._state.engine = None
-            self._workers_lost = True
-            raise WorldSwitchError(
-                "world_open_failed",
-                f"{detail}; rollback to the previous world also failed: {rollback_exc}",
-            ) from cause
-        self._start_workers(self._state.engine, old_cfg)
-        self._workers_lost = False
-        raise WorldSwitchError("world_open_failed", detail) from cause
+    def delete_world(self, world: str) -> None:
+        """删世界：先关（等租约、停线程、丢引擎），旧 Runtime 回收不了就拒绝（world_busy，什么都不删），
+        再由 C++ 删注册项与目录。默认世界由 C++ 拒绝（world_protected），引擎不动。全程持世界锁、处于
+        关闭窗口：删的途中没有新租约能把它重新打开。"""
+        reg = self._require_registry()
+        if world == reg.default_world():
+            reg.remove(world)                         # C++ 抛 world_protected
+            return
+        rec = self._record(world)
+        with self._world_lock(world), _ClosingWindow(self, world):
+            if not self._close_engine(world, _LEASE_DRAIN_TIMEOUT_S):
+                raise WorldSwitchError(
+                    "world_busy", "the closed world's runtime is still referenced")
+            self._refuse_leaked(rec["db_path"])
+            reg.remove(world)
 
-    def create(self, name: str, label: str, auto_snapshot: dict | None = None) -> dict:
-        """auto_snapshot：None 用新世界的默认值（按会话开、按时间关），否则
-        {"on_session": bool, "interval_hours": int}，由 C++ 校验（invalid_auto_snapshot）。"""
-        with self.lock:
-            reg = self.load()
-            out = _core.world_create(reg, self.registry_dir, name, label, _now_iso(),
-                                     auto_snapshot=auto_snapshot)
-            self.save(out["registry"])
-            entry = dict(out["world"])
-            entry["name"] = name
-            return entry
-
-    def delete(self, name: str) -> None:
-        """删世界（目录整个删掉）。C++ 已拒绝删 default 和注册表里的活动世界；这里再按
-        live config 补一道：引擎此刻正在写的库，不论注册表怎么说都不能删——删了目录，
-        进程仍在往已 unlink 的 inode 里写，重启后数据就没了。"""
-        with self.lock:
-            reg = self.load()
-            entry = reg["worlds"].get(name)
-            if entry is not None and _same_db(self._state.config.db_path, entry["db_path"]):
-                raise _core.WorldStoreError(
-                    f"world_protected: world '{name}' is the one the live engine is writing to")
-            self.save(_core.world_delete(reg, self.registry_dir, name))
-
-    def take_snapshot(self, name: str, note: str) -> dict:
-        """拍快照。是否支持当前向量后端由 C++ 判（snapshot_unsupported_backend）。
-
-        C++ 返回时新快照文件已落盘（保留策略也可能已删掉旧快照文件）；注册表存不下来时
-        删掉新文件再把错误抛出去，否则它没有登记、列不出来。已被保留策略删掉的旧快照
-        回不来：它们的注册项仍在旧注册表里，列表把它们标成 missing，可以照常删除。"""
-        with self.lock:
-            reg = self.load()
-            backend = getattr(self._state.config, "vector_backend", "sqlite")
-            out = _core.world_take_snapshot(reg, name, "manual", "manual", note,
+    def take_snapshot(self, world: str, note: str) -> dict:
+        """手动快照（C++ take_snapshot，作用于整个世界；vector_backend 取该世界的设置，是否支持由 C++ 判）。
+        持世界锁：C++ 要求按世界串行化快照、恢复、修剪。"""
+        reg = self._require_registry()
+        backend = self._vector_backend(world)
+        with self._world_lock(world):
+            out = _core.world_take_snapshot(reg, world, "manual", "manual", note,
                                             vector_backend=backend)
-            try:
-                self.save(out["registry"])
-            except Exception:
-                try:
-                    _core.world_discard_snapshot_file(out["registry"], name,
-                                                      out["snapshot"]["id"])
-                except Exception:  # noqa: BLE001 — 补偿失败不能盖掉原始错误
-                    logger.exception("cannot discard unregistered snapshot %s",
-                                     out["snapshot"]["id"])
-                raise
-            return out["snapshot"]
+        return out["snapshot"]
 
-    def delete_snapshot(self, name: str, snapshot_id: str) -> None:
-        with self.lock:
-            reg = self.load()
-            self.save(_core.world_delete_snapshot(reg, name, snapshot_id))
+    def delete_snapshot(self, world: str, snapshot_id: str) -> None:
+        reg = self._require_registry()
+        self._record(world)
+        with self._world_lock(world):
+            _core.world_delete_snapshot(reg, world, snapshot_id)
 
-    # ---- 自动快照（W4，设计稿 §4.3） ----
+    def snapshots(self, world: str) -> list[dict]:
+        """该世界的快照条目，最新在前（注册表登记顺序）。"""
+        reg = self._require_registry()
+        self._record(world)
+        return reg.snapshots(world)
 
-    def set_auto_snapshot(self, name: str, on_session: bool, interval_hours: int) -> dict:
-        """改一个世界的自动快照配置并落盘，返回新配置 {"on_session", "interval_hours"}。
-        world_not_found / invalid_auto_snapshot 由 C++ 抛（_core.WorldStoreError），注册表不动。"""
-        with self.lock:
-            reg = _core.world_set_auto_snapshot(self.load(), name, on_session, interval_hours)
-            self.save(reg)
-            return dict(reg["worlds"][name]["auto_snapshot"])
+    def list_sessions(self, world: str, limit: int = 200) -> dict:
+        """会话清单（C++ 只读打开该世界的库）：持一份不建引擎的租约，恢复要等它归还。"""
+        reg = self._require_registry()
+        with self.lease(world, build=False):
+            return _core.world_list_sessions(reg, world, limit)
+
+    def archives(self, world: str) -> list[dict]:
+        """回滚归档 [{"name", "size_bytes"}]，最新在前。只读，不开库，不持世界锁。"""
+        reg = self._require_registry()
+        self._record(world)
+        return _core.world_list_archives(reg, world)
+
+    def purge_archives(self, world: str) -> int:
+        """删掉该世界的全部回滚归档，返回删掉的文件数。"""
+        reg = self._require_registry()
+        self._record(world)
+        with self._world_lock(world):
+            return _core.world_purge_archives(reg, world)
+
+    def update_settings(self, world: str, overrides: dict) -> tuple[dict, list[str]]:
+        """把部分设置 overrides 合并进 world 的设置（C++ update_world_settings：逐叶合并、null 清除、校验、核对
+        继承来的 endpoint 地址（裁定 R40），读—合并—核对—写在注册表锁内；非法或 endpoint_changed 时什么都不写），
+        返回 (实际生效的完整设置, 重嵌入提示)。世界开着时引擎
+        换上新设置，并按变了的 endpoint 段重建适配器（engine.apply_world_settings，裁定 R35）。
+
+        默认世界只收 _DEFAULT_WORLD_EDITABLE 里的键，其余 → invalid_settings，什么都不写：那些段归 config，
+        下一次同步会覆盖。
+
+        持世界锁（可能等几秒，调用方在工作线程里调）：建引擎（读注册表里的设置）也持世界锁，所以一个正在
+        首次打开的世界要么在合并之前建完（这里换上新设置），要么在合并之后才读到设置，不会建出一个带着旧
+        设置、又没被这里看见的引擎。关闭同样持世界锁，持锁期间表上的引擎不会被丢。这里不持租约（持租约的
+        代码不得阻塞地等世界锁）。"""
+        reg = self._require_registry()
+        self._record(world)                           # world_not_found：未知世界名不建世界锁
+        if world == reg.default_world():
+            self._require_default_world_editable(overrides)
+        with self._world_lock(world):
+            # 裁定 R40：合并、核对继承来的 endpoint、写都在 C++ 的同一次持锁内；endpoint_changed 时什么都不写。
+            merged = reg.update_settings(world, overrides,
+                                         provider_endpoints=self._provider_endpoints())
+            settings = _core.world_effective_settings(merged)
+            with self._lock:
+                engine = self._engines.get(world)
+            warnings: list[str] = []
+            if engine is not None:
+                warnings = engine.apply_world_settings(settings)
+            engine = None
+        return settings, warnings
+
+    def reconfirm_endpoints(self, world: str, *, config_lock=None) -> tuple[dict, list[str]]:
+        """重新确认端点（裁定 R53）：把 starling.json 里各 provider 此刻的 endpoint（不含密钥，与 world_settings 同一套
+        字段规则）交给 C++ reconfirm_world_endpoints，世界里引用某个 provider 的角色整段换成它此刻的 endpoint，
+        provider 已被删掉的角色解绑。返回 (实际生效的完整设置, 重嵌入提示)。开着的世界按变了的角色热换适配器
+        （apply_world_settings，与 PUT 设置同一条路，裁定 R35），但只在嵌入的模型或维度变了时重嵌入（裁定 R58）：只换了
+        地址的嵌入只重建适配器，解绑的嵌入换成占位，两者都不删向量。
+
+        默认世界拒绝，码与 PUT 改它的 endpoint 相同（invalid_settings）：它的端点归 config，同步时自动跟上。
+        持世界锁，理由同 update_settings。
+
+        config_lock（app.state.config_lock，裁定 R59 N-3）：各 provider 此刻的 endpoint 表在这把锁内拷出。POST /api/config
+        持着它原地改 provider 条目（种类、地址、密钥依次写），不持锁拷就可能拷到改了一半的条目（新种类配旧地址）。锁顺序见
+        模块文档：config_lock 排在世界锁之前，所以这里只在取世界锁之前短暂持它，拷完即放，不在持世界锁时取。"""
+        reg = self._require_registry()
+        self._record(world)                           # world_not_found
+        if world == reg.default_world():
+            raise WorldSwitchError(
+                "invalid_settings", "the default world's endpoints come from the dashboard config")
+        with config_lock if config_lock is not None else contextlib.nullcontext():
+            current = {name: provider_endpoint_settings(name, prov or {})
+                       for name, prov in list(self._config.providers.items())}
+        with self._world_lock(world):
+            merged = reg.reconfirm_endpoints(world, current)
+            settings = _core.world_effective_settings(merged)
+            with self._lock:
+                engine = self._engines.get(world)
+            warnings: list[str] = []
+            if engine is not None:
+                # 裁定 R58：只有嵌入的模型或维度变了才重嵌入；只换地址、或嵌入角色被解绑，向量原样留着。
+                warnings = engine.apply_world_settings(settings, reconfirm=True)
+            engine = None
+        return settings, warnings
+
+    @staticmethod
+    def _require_default_world_editable(overrides: dict) -> None:
+        for section, value in overrides.items():
+            allowed = _DEFAULT_WORLD_EDITABLE.get(section)
+            if allowed is None or not isinstance(value, dict) or set(value) - allowed:
+                raise WorldSwitchError(
+                    "invalid_settings",
+                    f"the default world's {section!r} settings come from the dashboard config")
+
+    def set_auto_snapshot(self, world: str, on_session: bool, interval_hours: int) -> dict:
+        """改一个世界的自动快照配置（C++ 在注册表锁内合并），返回新配置 {"on_session", "interval_hours"}。
+        world_not_found / invalid_auto_snapshot 由 C++ 抛。开着的引擎换上新的设置引用。"""
+        reg = self._require_registry()
+        self._record(world)                           # world_not_found：未知世界名不建世界锁
+        # 裁定 R42：持世界锁，与 update_settings 串行。否则它可能落在 update_settings 写完注册表、还没把新设置
+        # 交给引擎之间，先把合并后的设置（含新 endpoint）换上引擎，apply_world_settings 随后看不出变化、不重建
+        # 适配器。路由在工作线程里调，不持租约，按锁顺序可以等世界锁。
+        with self._world_lock(world):
+            _core.world_set_auto_snapshot(reg, world, on_session, interval_hours)
+            settings = _core.world_effective_settings(reg.get(world)["settings"])
+            with self._lock:
+                engine = self._engines.get(world)
+            if engine is not None:
+                engine.set_world_settings(settings)
+            engine = None
+        return dict(settings["background"]["auto_snapshot"])
 
     def auto_snapshot_status(self) -> dict:
-        """{"failures", "last_error", "last_error_at"}：自 manager 建起以来的失败次数、最近一次
+        """{"failures", "last_error", "last_error_at"}：自池建起以来所有世界的自动快照失败次数、最近一次
         失败的错误码与时刻。busy 与跳过不算失败。"""
-        with self._gate:
+        with self._lock:
             return {"failures": self._auto_failures, "last_error": self._auto_last_error,
                     "last_error_at": self._auto_last_error_at}
 
-    def attach_hooks(self, engine) -> None:
-        """给引擎挂上按会话的自动快照钩子（在它起摄入线程之前）。"""
-        engine.session_snapshot_hook = self._make_session_hook()
+    def _vector_backend(self, world: str) -> str:
+        self._record(world)                           # world_not_found
+        return self._vector_store(world)[0]
 
-    def _make_session_hook(self):
-        def hook(session_id: str) -> None:
-            # 摄入线程上、写入之前、不持 engine._lock 时调用。busy → 放回 spool（T3 的
-            # _ingest_drain_once 接住）；拍了、跳过、失败都照常返回，摄入继续。
-            # 最外层兜底：只有 SessionSnapshotDeferred 往外抛。其余异常（记失败本身出错、日志 handler
-            # 抛异常之类的 bug）记 exception 后照常返回，钩子坏了不能变成摄入 job 的失败（用户裁定：
-            # 快照失败照常摄入）。
+    # ───────────────────────── 恢复（只停这一个世界，spec §7.2） ─────────────────────────
+
+    def rollback(self, world: str, snapshot_id: str) -> dict:
+        """把 world 恢复到快照 snapshot_id（丢掉快照之后的一切）。替换、校验、归档都在 C++
+        （world_rollback）；被替换的库留在 <世界目录>/archive/。返回 {"world", "snapshot_id", "archived",
+        "reopened"}（reopened：恢复前开着、恢复后已重新打开）。
+
+        只停被恢复的世界：持它的世界锁、置它的关闭标志、等它的租约（含只读检视）归零、停它的线程、丢它
+        的引擎并确认 Runtime 已回收，然后才调 C++；别的世界的租约与写入照常（需求 §7 第 1b 条）。
+
+        抛错：C++ 的码（snapshot_not_found / snapshot_corrupt / world_tenant_mismatch / insufficient_disk /
+        snapshot_failed / snapshot_unsupported_backend / world_in_use）是 _core.WorldStoreError，库原样不动；
+        world_busy（在途请求 _LEASE_DRAIN_TIMEOUT_S 内不结束、线程停不下、Runtime 回收不了或之前的关闭
+        留下的 Runtime 还开着这个库，库未动）；world_open_failed（库未动，但重开引擎失败）；
+        rollback_reopen_failed（库已替换，重开失败）。后两种引擎不在表上，下一次 lease 重新建。
+        动引擎之前先跑 C++ 的只读预检（world_check_rollback）：不改输入重试也过不了的错误直接抛出，引擎、
+        线程、库都不动，也不进关闭窗口。"""
+        reg = self._require_registry()
+        rec = self._record(world)
+        backend = self._vector_backend(world)
+        _core.world_check_rollback(reg, world, snapshot_id, vector_backend=backend)
+        with self._world_lock(world), _ClosingWindow(self, world):
+            self._refuse_leaked(rec["db_path"])
+            with self._lock:
+                was_open = world in self._engines
+            if not self._close_engine(world, _LEASE_DRAIN_TIMEOUT_S):
+                busy = WorldSwitchError(
+                    "world_busy", "old runtime still referenced; the database was not replaced")
+                # 旧 Runtime 还活着：不能再开第二条写连接，所以不重开（下一次 lease 被 _refuse_leaked 挡住，
+                # 直到它被回收）。
+                raise busy
             try:
-                if self._session_trigger_off():
+                result = _core.world_rollback(reg, world, snapshot_id, vector_backend=backend)
+            except Exception as exc:
+                self._reopen_after_rollback(world, was_open, exc)   # C++ 保证库未动；原样抛出
+                raise
+            # 审查 T5-1：库已换成快照，注册表里的统计缓存还是回滚前（关闭时写的）的计数。照关闭的写法刷一次，
+            # 关着的世界在列表上立刻显示回滚后的计数。失败只记日志（缓存是尽力而为）。
+            self._write_stats_cache(world, rec["db_path"], rec["tenant"])
+            reopened = self._reopen_after_rollback(world, was_open, None)
+        return {"world": world, "snapshot_id": snapshot_id,
+                "archived": bool(result["archive_path"]), "reopened": reopened}
+
+    def _reopen_after_rollback(self, world: str, was_open: bool, cause: Exception | None) -> bool:
+        """恢复的每个出口（持世界锁、在关闭窗口内）：恢复前开着就按注册表重建引擎、起线程（打开时会跑
+        迁移，旧 schema 的快照会补齐）。返回世界此刻是否开着（按实际结果，不按恢复前的状态）：恢复前关着、
+        或恢复途中池关停了（建好的引擎不发布、关掉），都是 False。重建失败：引擎不在表上，下一次 lease
+        重新建。码按库有没有被替换来分：cause 为 None（替换成功之后）→ rollback_reopen_failed；其余出口 →
+        world_open_failed（链到 cause）。重建成功则返回，由调用方抛 cause 或返回结果。"""
+        if not was_open:
+            return False
+        try:
+            engine = self._open_engine(world, self.context(world))
+        except Exception as exc:
+            if cause is None:
+                detail = f"rollback applied, but the world cannot be reopened: {exc}"
+                logger.error("world rollback (%s): %s", world, detail)
+                raise WorldSwitchError("rollback_reopen_failed", detail) from exc
+            detail = f"{cause}; reopening the world also failed: {exc}"
+            logger.error("world rollback (%s): %s", world, detail)
+            raise WorldSwitchError("world_open_failed", detail) from cause
+        # 起线程失败只标记 workers-lost（裁定 R23）。恢复途中池关停了：不发布，关掉它（世界留在关着的状态，
+        # 恢复本身照常算成功或照常抛 cause）。
+        if self._publish(world, engine):
+            engine = None
+            return True
+        box, engine = [engine], None
+        self._discard_unpublished(box, self.context(world).db_path)
+        return False
+
+    # ───────────────────────── 自动快照（W4） ─────────────────────────
+
+    def attach_hooks(self, world: str, engine) -> None:
+        """给引擎挂上按会话的自动快照钩子（在它起摄入线程之前）。"""
+        engine.session_snapshot_hook = self._make_session_hook(world)
+
+    def _make_session_hook(self, world: str):
+        def hook(session_id: str) -> None:
+            # 摄入线程上、写入之前、不持 engine._lock 时调用。busy → 放回 spool（_ingest_drain_once 接住）；
+            # 拍了、跳过、失败都照常返回，摄入继续。最外层兜底：只有 SessionSnapshotDeferred 往外抛，
+            # 钩子坏了不能变成摄入 job 的失败（用户裁定：快照失败照常摄入）。
+            try:
+                if self._session_trigger_off(world):
                     return
-                if self._auto_snapshot("session", session_id) == "busy":
+                if self._auto_snapshot(world, "session", session_id) == "busy":
                     raise SessionSnapshotDeferred(session_id)
             except SessionSnapshotDeferred:
                 raise
             except Exception:  # noqa: BLE001 — 后台路径：只记录，不外抛
                 try:
-                    logger.exception("session auto snapshot hook failed (%s)", session_id)
+                    logger.exception("session auto snapshot hook failed (%s, %s)", world, session_id)
                 except Exception:  # noqa: BLE001 — 日志本身也坏了：照样不能连带摄入
                     pass
         return hook
 
-    def _session_trigger_off(self) -> bool:
-        """钩子的提前退出：不取 manager.lock 读一次注册表，活动世界的 auto_snapshot.on_session 为
-        False 时返回 True，钩子直接返回，不取锁也不推迟摄入。默认世界只按时间，没有这一步的话，它的
-        每个摄入 job 都会因为无关的管理操作（手动快照、删除、清理归档、非活动世界的回滚、调度线程自己
-        的按时间快照）持着 manager.lock 而被放回 spool。
-
-        锁外读是安全的：worlds.json 是 tmp + rename 原子替换的，读到的不是旧文件就是新文件。这里只
-        决定「肯定不用拍」；读到开着就走持锁路径，在锁内重新 load 再判（配置在这之间被关掉时 C++ 回
-        disabled）。读失败（registry_corrupt、瞬时读错）返回 False，也走持锁路径：不算失败、不跳过，
-        由持锁路径去拍或记失败。"""
+    def _session_trigger_off(self, world: str) -> bool:
+        """钩子的提前退出：不取世界锁读一次注册表，该世界的 auto_snapshot.on_session 为 False 就返回 True，
+        不取锁也不推迟摄入（否则每个摄入 job 都会因无关的管理操作持着世界锁而被放回 spool）。只决定
+        「肯定不用拍」：读到开着就走持锁路径，C++ 按当时的配置重新判（被关掉时回 disabled）。读失败
+        返回 False，同样走持锁路径。"""
         try:
-            reg = self.load()
-            return not reg["worlds"][reg["active"]]["auto_snapshot"]["on_session"]
+            settings = _core.world_effective_settings(self._registry.get(world)["settings"])
+            return not settings["background"]["auto_snapshot"]["on_session"]
         except Exception:  # noqa: BLE001 — 提前退出读不到不是失败，交给持锁路径
             return False
 
-    def _auto_snapshot(self, trigger_kind: str, session_id: str = "", *,
-                       blocking: bool = False) -> str:
-        """两种触发共用的核心，返回 "taken:<id>" | "skipped:<原因>" | "busy" | "failed"。
-
-        后台调用方用默认的 blocking=False：manager.lock 被占（切换、回滚、手动快照）就返回
-        "busy"，从不等。取到锁之后确认 live config 写的库就是注册表里活动世界的库（不一致是
-        切换或回滚失败路径留下的分叉，拍了也是给错的世界拍，跳过 world_moved），再交给 C++。
-        拍了就存注册表；存失败删掉新文件（同 take_snapshot）。修剪卡住时 C++ 不拍、返回 refused 与
-        部分修剪后的注册表（Codex I-3 / r2 R2-2）：先存下它（已删文件的条目随之摘掉），再按
-        snapshot_failed 计一次失败，返回 "failed"。任何异常都计为失败、记 warning、返回 "failed"，
-        不往外抛：这是后台线程，失败不能连带摄入或调度线程。"""
-        if not self.lock.acquire(blocking=blocking):
+    def _auto_snapshot(self, world: str, trigger_kind: str, session_id: str = "") -> str:
+        """两种触发共用的核心，返回 "taken:<id>" | "skipped:<原因>" | "busy" | "failed"。非阻塞取该世界的
+        世界锁（关闭、恢复、手动快照持着它就 busy，从不等）。修剪卡住时 C++ 不拍、返回 refused，按
+        snapshot_failed 计一次失败。任何异常都计为失败、记 warning、返回 "failed"，不往外抛：这是后台路径。"""
+        lock = self._world_lock(world)
+        if not lock.acquire(blocking=False):
             return "busy"
         now = None
         try:
             now = self._clock()
-            reg = self.load()
-            active = reg["active"]
-            if not self._live_db_is(reg["worlds"][active]["db_path"]):
-                return "skipped:world_moved"
-            backend = getattr(self._state.config, "vector_backend", "sqlite")
-            out = _core.world_take_auto_snapshot(reg, active, trigger_kind, now, session_id,
-                                                 vector_backend=backend)
-            refused = out.get("refused")
-            if refused:
-                # 卡住的条目之前排着的 victim 文件已删、注册项已摘：不存就会在 worlds.json 里留下文件
-                # 已不在的条目，且每次触发都重演一遍。没有写新快照文件，存失败也无需补偿（外层照记失败）。
-                self.save(out["registry"])
-                logger.warning("auto snapshot (%s) refused: %s", trigger_kind, refused)
+            out = _core.world_take_auto_snapshot(self._registry, world, trigger_kind, now, session_id,
+                                                 vector_backend=self._vector_backend(world))
+            if out.get("refused"):
+                logger.warning("auto snapshot (%s, %s) refused: %s", world, trigger_kind,
+                               out["refused"])
                 self._count_auto_failure("snapshot_failed", now)
                 return "failed"
             snap = out["snapshot"]
             if snap is None:
                 return f"skipped:{out['skipped']}"
-            try:
-                self.save(out["registry"])
-            except Exception:
-                try:
-                    _core.world_discard_snapshot_file(out["registry"], active, snap["id"])
-                except Exception:  # noqa: BLE001 — 补偿失败不能盖掉原始错误
-                    logger.exception("cannot discard unregistered auto snapshot %s", snap["id"])
-                raise
             return f"taken:{snap['id']}"
         except Exception as exc:  # noqa: BLE001 — 后台路径：只记录，不外抛（用户裁定）
-            self._record_auto_failure(trigger_kind, exc, now)
+            # 错误码进状态（GET /api/worlds 外露），全文只进日志：C++ 的 detail 里有服务器路径。
+            # 只把格式化好的文本交给日志：留着 LogRecord 的 handler 拿到异常对象（在 args 里）就经它的回溯钉住
+            # 栈帧，帧的 f_back 一路通到调用钩子的引擎方法（self 就是引擎），之后关闭这个世界就等不到旧
+            # Runtime 回收（同 _start_workers_or_mark_lost）。非领域异常照旧带回溯。
+            domain = isinstance(exc, (_core.WorldStoreError, WorldSwitchError))
+            code = (exc.code if isinstance(exc, WorldSwitchError)
+                    else _store_code(exc) if domain else "internal_error")
+            logger.warning("auto snapshot (%s, %s) failed: %s", world, trigger_kind, str(exc),
+                           exc_info=not domain)
+            exc = None
+            self._count_auto_failure(code, now)
             return "failed"
         finally:
-            self.lock.release()
-
-    def _live_db_is(self, db_path: str) -> bool:
-        """live config 指着的库、以及引擎（在的话）正在写的库，都是 db_path。调用方持 manager.lock：
-        引擎只在 manager.lock 内被换掉（切换、回滚），或在它为 None 时由惰性构建写回。"""
-        engine_db = getattr(self._state.engine, "_db_path", None)
-        live = [self._state.config.db_path] + ([engine_db] if engine_db else [])
-        return all(_same_db(path, db_path) for path in live)
-
-    def _record_auto_failure(self, trigger_kind: str, exc: Exception, now: str | None) -> None:
-        # 错误码进状态（GET /api/worlds、/api/ingest_status 外露），全文只进日志：C++ 的 detail 里有
-        # 服务器路径。非 WorldStoreError（存注册表的 OSError 等）按 internal_error 记，与路由一致。
-        domain = isinstance(exc, _core.WorldStoreError)
-        code = _core.world_store_error_code(exc) if domain else "internal_error"
-        # 领域错误的文本已说清原因；其余（OSError、Bug）带上回溯。
-        logger.warning("auto snapshot (%s) failed: %s", trigger_kind, exc, exc_info=not domain)
-        self._count_auto_failure(code, now)
+            lock.release()
 
     def _count_auto_failure(self, code: str, now: str | None) -> None:
-        """失败计数、最近一次错误码与时刻（GET /api/worlds、/api/ingest_status 外露的只有码）。"""
         if now is None:
             now = _now_iso()        # 注入的时钟本身抛了：时刻退回真实时钟
-        with self._gate:
+        with self._lock:
             self._auto_failures += 1
             self._auto_last_error = code
             self._auto_last_error_at = now
 
-    def start_scheduler(self, poll_s: float = _SCHEDULER_POLL_S,
-                        first_delay_s: float = _SCHEDULER_FIRST_DELAY_S) -> None:
-        """起按时间的调度线程（daemon，名为 starling-auto-snapshot）：先等 first_delay_s，此后每
-        poll_s 秒调一次 _auto_snapshot("interval")。要不要拍由 C++ 判（间隔、内容标记），busy 就等
-        下一轮。等待一律用 Event.wait，stop_scheduler 立刻唤醒。已在跑时是 no-op。"""
-        # 在 _gate 内 start 再挂句柄：stop_scheduler 拿到的句柄一定是已启动的线程（join 一个没启动的
-        # 线程会抛 RuntimeError），并发的两次 start 也只有一个线程。Thread.start() 只等线程起来，
-        # 新线程起来之前不碰 _gate（先 Event.wait），所以这里不会卡住。
-        with self._gate:
-            if self._scheduler is not None:
-                return
-            stop = threading.Event()
-            thread = threading.Thread(target=self._scheduler_loop, args=(stop, poll_s, first_delay_s),
-                                      name=_SCHEDULER_THREAD, daemon=True)
-            thread.start()
-            self._scheduler, self._scheduler_stop = thread, stop
-
-    def stop_scheduler(self, timeout_s: float = 5.0) -> None:
-        """停调度线程并 join（任何锁之外）。没在跑时是 no-op。线程只非阻塞取 manager.lock，
-        最坏情况是正赶上一份 VACUUM：join 等到 timeout_s 仍未退出就记 warning（它是 daemon，
-        拍完这一份就看到停止事件退出）。"""
-        with self._gate:
-            thread, stop = self._scheduler, self._scheduler_stop
-            self._scheduler = self._scheduler_stop = None
-        if thread is None:
-            return
-        stop.set()
-        thread.join(timeout_s)
-        if thread.is_alive():
-            logger.warning("auto snapshot scheduler did not stop within %.1fs", timeout_s)
-
-    def _scheduler_loop(self, stop: threading.Event, poll_s: float, first_delay_s: float) -> None:
-        if stop.wait(first_delay_s):
-            return
+    def auto_snapshot_round(self, stop: threading.Event | None = None) -> dict:
+        """按时间的一轮（裁定 R19）：遍历注册表里的全部世界，逐个调 _auto_snapshot("interval")，要不要拍由
+        C++ 判。返回 {世界名: 结果}。关着的世界不打开引擎（C++ 只读源库、VACUUM INTO）。stop 置位时提前结束。"""
+        reg = self._require_registry()
+        results: dict[str, str] = {}
+        offset = 0
         while True:
-            # _auto_snapshot 自己吞掉快照的异常；busy 什么都不做，等下一轮。外层的 except 只是保活
-            # （记失败本身出错之类的 bug），单轮出错不终结调度。
-            try:
-                self._auto_snapshot("interval")
-            except Exception:  # noqa: BLE001 — 保活
-                logger.exception("auto snapshot scheduler round failed")
-            if stop.wait(poll_s):
-                return
-
-    # ---- 回滚语义 A 与归档（W3，spec §5.1） ----
-
-    def rollback(self, name: str, snapshot_id: str) -> dict:
-        """把世界 name 恢复到快照 snapshot_id（丢掉快照之后的一切）。替换、校验、归档都在
-        C++（world_rollback）；注册表不变，被替换的库留在 <世界 home>/archive/。
-
-        返回 {"world", "snapshot_id", "archived", "active"}。active 看 live config 指着哪个
-        库（与 delete 同一判据），不看注册表的 active，也不看引擎在不在：引擎还是 None 时，
-        窗口外的惰性构建同样会在回滚中途打开这个库。
-
-        抛错：world_switching（切换窗口已打开：切换或另一次活动世界回滚正在进行；不排队等
-        管理锁）；world_not_found 与 C++ 的码
-        （snapshot_not_found / snapshot_corrupt / world_tenant_mismatch / insufficient_disk /
-        snapshot_failed / snapshot_unsupported_backend / world_in_use）是 _core.WorldStoreError，
-        原样抛出，失败时目标库原样不动；ingest_busy（之前的切换留下的旧 Runtime 还开着这个库、
-        后台线程停不下、在途请求不结束，或旧 Runtime 回收不了，库未动）；world_open_failed
-        （库未动，但活动世界的引擎重建失败）；rollback_reopen_failed（库已替换成快照的内容，
-        但活动世界的引擎重建失败）。后两种 engine 都留 None，下一条命令请求惰性重建，并补起
-        tick / 摄入线程（_workers_lost，见 lease）。
-
-        动引擎之前先调 C++ 的预检（world_check_rollback，只读、什么都不动）：不存在的快照、缺失
-        或不是普通文件的快照文件、不支持的向量后端、磁盘不足，这几种不改输入重试也过不了，在
-        这里直接原样抛出，活动世界的引擎、线程、库文件都不动，也不进切换窗口。预检通过之后
-        world_rollback 仍会再查一遍，以它为准。
-
-        C++ 的连接探测（world_in_use）只是纵深防御。它看得见哪些连接取决于库的日志模式（在生产库
-        副本上实测）：WAL 库上读过库的闲置连接（只读、读写都算）与开着的读事务都看得见；
-        rollback-journal（delete）模式的库上只看得见开着的读事务；只打开、从没读过的连接两种模式
-        都看不见。恢复出来的库是 VACUUM INTO 的产物，引擎打开它之前一直是 delete 模式。别的进程
-        对 dashboard 管的库开写连接不在支持的使用方式之内；进程内的安全靠这里：在切换窗口内停
-        线程、等租约（打开这个库的每条路径都持租约，见模块文档）、丢引擎，旧 Runtime 的弱引用
-        失效了才调 C++，失效不了就不动文件（切换时这里只记 warning；回滚替换的是同一个库文件，
-        必须严格）；切换遗留的 Runtime 还开着这个库就拒绝（_refuse_leaked_runtime）。活动世界的
-        每个出口都按原 config 重建引擎、起线程（打开时会跑迁移，旧 schema 的快照会补齐）；
-        app.state.config 不变。"""
-        with self._gate:
-            if self.switching:
-                raise WorldSwitchError("world_switching")
-        with self.lock:
-            reg = self.load()
-            entry = reg["worlds"].get(name)
-            if entry is None:
-                raise _core.WorldStoreError(f"world_not_found: {name}")
-            backend = getattr(self._state.config, "vector_backend", "sqlite")
-            # 停引擎之前的只读预检（C++），失败原样抛出。
-            _core.world_check_rollback(reg, self.registry_dir, name, snapshot_id,
-                                       vector_backend=backend)
-            self._refuse_leaked_runtime(entry["db_path"])
-            active = _same_db(self._state.config.db_path, entry["db_path"])
-            if active:
-                with self._switch_window():
-                    result = self._rollback_live_world(reg, name, snapshot_id)
-            else:
-                # 没有引擎在写它（上面已排除切换遗留的旧 Runtime）。
-                result = _core.world_rollback(reg, self.registry_dir, name, snapshot_id,
-                                              vector_backend=backend)
-            return {"world": name, "snapshot_id": snapshot_id,
-                    "archived": bool(result["archive_path"]), "active": active}
-
-    def _rollback_live_world(self, reg: dict, name: str, snapshot_id: str) -> dict:
-        """rollback 的活动世界路径，调用时已持管理锁并处于切换窗口内。config 在租约归零之后
-        才定稿（与 _swap_engine 同理）。"""
-        self._quiesce_and_drain()                 # ingest_busy：引擎原样、线程已恢复
-        cfg = self._state.config
-        engine = self._state.engine
-        if engine is not None:
-            rt_ref = weakref.ref(engine._rt)
-            db_path = engine._db_path
-            self._state.engine = None
-            engine = None
-            if not self._release_old_runtime(rt_ref, db_path, after="rollback"):
-                busy = WorldSwitchError(
-                    "ingest_busy", "old runtime still referenced; the database was not replaced")
-                self._reopen_live_world(cfg, busy)
-                raise busy
-        backend = getattr(cfg, "vector_backend", "sqlite")
-        try:
-            result = _core.world_rollback(reg, self.registry_dir, name, snapshot_id,
-                                          vector_backend=backend)
-        except Exception as exc:
-            self._reopen_live_world(cfg, exc)     # C++ 已保证目标库未动；原样抛出
-            raise
-        self._reopen_live_world(cfg, None)
-        return result
-
-    def _reopen_live_world(self, cfg, cause: Exception | None) -> None:
-        """回滚活动世界的每个出口：按原 config 重建引擎、起线程。重建失败时 engine 留 None、
-        置 _workers_lost，下一条命令请求惰性重建并补起后台线程（见 lease）。码按库有没有被替换
-        来分：
-        - cause 为 None（替换成功之后）：库已是快照的内容，抛 rollback_reopen_failed，链到
-          重建的异常。路由仍广播 world_rolled_back，前端整页刷新。
-        - 其余出口（C++ 失败、弱引用拒绝、遗留 Runtime 拒绝）：库未动，抛 world_open_failed，
-          链到 cause。
-        重建成功则返回，由调用方抛 cause 或返回结果。"""
-        try:
-            engine = DashboardEngine(cfg)
-        except Exception as exc:
-            self._state.engine = None
-            self._workers_lost = True
-            # 路由只回码，detail 不进响应，所以在这里留日志。
-            if cause is None:
-                detail = f"rollback applied, but the world cannot be reopened: {exc}"
-                logger.error("world rollback: %s", detail)
-                raise WorldSwitchError("rollback_reopen_failed", detail) from exc
-            detail = f"{cause}; reopening the world also failed: {exc}"
-            logger.error("world rollback: %s", detail)
-            raise WorldSwitchError("world_open_failed", detail) from cause
-        self._state.engine = engine
-        self._start_workers(engine, cfg)
-        self._workers_lost = False
-
-    def archives(self, name: str, reg: dict | None = None) -> list[dict]:
-        """该世界 archive/ 下的回滚归档 [{"name", "size_bytes"}]，最新在前。只读，不持管理锁，
-        不打开库。reg 给出时直接用（GET /api/worlds 已经读过注册表），否则重读。"""
-        return _core.world_list_archives(self.load() if reg is None else reg,
-                                         self.registry_dir, name)
-
-    def purge_archives(self, name: str) -> int:
-        """删除该世界的全部回滚归档，返回删掉的文件数。"""
-        with self.lock:
-            return _core.world_purge_archives(self.load(), self.registry_dir, name)
+            page = reg.list(offset=offset, limit=_LIST_PAGE)
+            for rec in page["worlds"]:
+                if stop is not None and stop.is_set():
+                    return results
+                results[rec["name"]] = self._auto_snapshot(rec["name"], "interval")
+            offset += _LIST_PAGE
+            if not page["worlds"] or offset >= page["total"]:
+                return results

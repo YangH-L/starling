@@ -3,6 +3,8 @@ import { tick } from 'svelte';
 import { render, fireEvent } from '@testing-library/svelte';
 import { ApiError } from '$lib/api';
 import { lastWsEvent } from '$lib/health';
+import { page } from '$app/state';
+import { noteDefaultWorld } from '$lib/world.svelte';
 
 const toastError = vi.fn();
 const toastSuccess = vi.fn();
@@ -14,7 +16,7 @@ vi.mock('$lib/ui/toast', () => ({
 	}
 }));
 
-const list = vi.fn();
+const detail = vi.fn();
 const listSessions = vi.fn();
 const rollback = vi.fn();
 vi.mock('$lib/worlds', async (orig) => {
@@ -23,7 +25,7 @@ vi.mock('$lib/worlds', async (orig) => {
 		...real,
 		worldsApi: {
 			...real.worldsApi,
-			list: (...a: unknown[]) => list(...a),
+			detail: (...a: unknown[]) => detail(...a),
 			listSessions: (...a: unknown[]) => listSessions(...a),
 			rollback: (...a: unknown[]) => rollback(...a)
 		}
@@ -40,17 +42,21 @@ const settle = async () => {
 	await tick();
 };
 
-const world = (name: string, active: boolean, label = '') => ({
-	name, label, tenant: name, created_at: '', active,
+// 世界详情(GET /api/worlds/{name}):open = 引擎现在开着。
+const world = (name: string, open: boolean, label = '') => ({
+	name, label, labels: {}, tenant: name, created_at: '', open, holders: 0, last_write_at: null,
 	db_bytes: 0, live_bytes: 0, statements: 0, engrams: 0, snapshots: 0, snapshot_bytes: 0,
 	archives: 0, archive_bytes: 0, auto_snapshot: { on_session: true, interval_hours: 0 }
 });
-
-// 活动世界故意不放第一位:默认选中要跟活动世界走,而不是跟下拉框的第一项走。
-const WORLDS = {
-	active: 'default', default: 'default', snapshot_retention: 5,
-	auto_snapshot_status: { failures: 0, last_error: null, last_error_at: null },
-	worlds: [world('sim-1', false), world('default', true, '主世界')]
+const WORLDS: Record<string, ReturnType<typeof world>> = {
+	default: world('default', true, '主世界'),
+	'sim-1': world('sim-1', false)
+};
+const mockDetail = () =>
+	detail.mockReset().mockImplementation(async (n: string) => WORLDS[n]);
+// 选中的世界在 URL ?world= 里(顶栏选择器写它);没写就是默认世界。
+const at = (world?: string) => {
+	(page as { url: URL }).url = new URL(world ? `http://localhost/sessions?world=${world}` : 'http://localhost/sessions');
 };
 
 const ANCHORED: SessionRow & { anchor: NonNullable<SessionRow['anchor']> } = {
@@ -74,7 +80,6 @@ const button = (root: ParentNode, text: string) =>
 		| undefined;
 const inBody = (text: string) => button(document.body, text);
 const apiErr = (status: number, detail: string) => new ApiError(status, '', `${status} ${detail}`);
-const worldSelect = (c: HTMLElement) => c.querySelector('select[name="sessions-world"]') as HTMLSelectElement;
 const bodyRows = (c: HTMLElement) => [...c.querySelectorAll('tbody tr')];
 const cells = (tr: Element) => [...tr.children] as HTMLElement[];
 const rollbackButtons = (c: HTMLElement) =>
@@ -82,63 +87,47 @@ const rollbackButtons = (c: HTMLElement) =>
 const confirmInput = () =>
 	document.body.querySelector('input[name="world-rollback-confirm"]') as HTMLInputElement;
 
-describe('/sessions 默认世界与切换', () => {
+describe('/sessions 当前世界（顶栏选的，URL ?world=）', () => {
 	beforeEach(() => {
-		list.mockReset().mockResolvedValue(WORLDS);
+		mockDetail();
+		at();
+		noteDefaultWorld('default');
 		listSessions.mockReset().mockImplementation(async (w: string) => sessionsOf(w));
 		lastWsEvent.set(null);
 	});
 
-	it('默认显示活动世界（不是下拉框第一项），按契约的 limit=200 取清单', async () => {
+	it('没有 ?world= 时是默认世界，按契约的 limit=200 取清单', async () => {
 		const { container } = render(Sessions);
 		await settle();
 		expect(listSessions).toHaveBeenCalledTimes(1);
 		expect(listSessions).toHaveBeenCalledWith('default', 200);
-		expect(worldSelect(container).value).toBe('default');
+		expect(detail).toHaveBeenCalledWith('default');
+		expect(container.textContent).toContain('世界：default');
+		// 页面不再有自己的世界下拉
+		expect(container.querySelector('select')).toBeNull();
 	});
 
-	it('下拉框列出全部世界，带可见标签；切到别的世界时重取该世界的清单', async () => {
+	it('?world=sim-1 时取 sim-1 的清单', async () => {
+		at('sim-1');
 		listSessions.mockImplementation(async (w: string) =>
 			w === 'sim-1' ? sessionsOf('sim-1', [UNANCHORED]) : sessionsOf(w)
 		);
 		const { container } = render(Sessions);
 		await settle();
-		const sel = worldSelect(container);
-		expect(container.querySelector(`label[for="${sel.id}"]`)?.textContent).toBe('世界');
-		expect([...sel.options].map((o) => o.value)).toEqual(['sim-1', 'default']);
-		expect(bodyRows(container).length).toBe(2);
-
-		await fireEvent.change(sel, { target: { value: 'sim-1' } });
-		await settle();
+		expect(listSessions).toHaveBeenCalledTimes(1);
 		expect(listSessions).toHaveBeenLastCalledWith('sim-1', 200);
 		expect(bodyRows(container).length).toBe(1);
 		expect(cells(bodyRows(container)[0])[0].textContent?.trim()).toBe('chat-2026-10');
 		expect(rollbackButtons(container).length).toBe(0);
 	});
 
-	it('切换后先前世界的慢响应不会覆盖当前世界的清单', async () => {
-		let releaseDefault!: () => void;
-		listSessions.mockImplementation((w: string) =>
-			w === 'default'
-				? new Promise((r) => (releaseDefault = () => r(sessionsOf('default'))))
-				: Promise.resolve(sessionsOf('sim-1', [UNANCHORED]))
-		);
-		const { container } = render(Sessions);
-		await settle();
-		await fireEvent.change(worldSelect(container), { target: { value: 'sim-1' } });
-		await settle();
-		releaseDefault();
-		await settle();
-		expect(bodyRows(container).length).toBe(1);
-	});
-
 	it('清单加载失败：显示中文错误与重试', async () => {
 		listSessions.mockReset()
-			.mockRejectedValueOnce(apiErr(503, 'world_switching'))
+			.mockRejectedValueOnce(apiErr(503, 'world_busy'))
 			.mockImplementation(async (w: string) => sessionsOf(w));
 		const { container } = render(Sessions);
 		await settle();
-		expect(container.textContent).toContain('正在切换世界，请稍后再试');
+		expect(container.textContent).toContain('世界正在关闭或恢复，请稍后再试');
 		await fireEvent.click(button(container, '重试')!);
 		await settle();
 		expect(bodyRows(container).length).toBe(2);
@@ -152,22 +141,35 @@ describe('/sessions 默认世界与切换', () => {
 		);
 	});
 
-	it('世界列表加载失败：显示加载失败', async () => {
-		list.mockReset().mockRejectedValue(new Error('500 boom'));
+	it('世界不存在（?world= 写错）：显示中文错误而不是裸错误码', async () => {
+		at('nope');
+		detail.mockReset().mockRejectedValue(apiErr(404, 'world_not_found'));
+		listSessions.mockReset().mockRejectedValue(apiErr(404, 'world_not_found'));
+		const { container } = render(Sessions);
+		await settle();
+		expect(container.textContent).toContain('世界不存在');
+		expect(container.textContent).not.toContain('world_not_found');
+	});
+
+	it('世界详情加载失败：显示加载失败', async () => {
+		detail.mockReset().mockRejectedValue(new Error('500 boom'));
 		const { container } = render(Sessions);
 		await settle();
 		expect(container.textContent).toContain('加载失败');
-		expect(listSessions).not.toHaveBeenCalled();
 	});
 
-	it('收到会改变记忆的 ws 事件时重取清单；recall 不重取', async () => {
+	it('当前世界的 world_changed 重取清单；recall 与别的世界的消息不重取', async () => {
 		render(Sessions);
 		await settle();
 		const before = listSessions.mock.calls.length;
-		lastWsEvent.set({ type: 'recall', payload: {} });
+		lastWsEvent.set({ type: 'recall', world: 'default', payload: {} });
 		await settle();
 		expect(listSessions.mock.calls.length).toBe(before);
-		lastWsEvent.set({ type: 'statement_added', payload: {} });
+		// 别的世界的消息不触发重取
+		lastWsEvent.set({ type: 'world_changed', world: 'sim-1', payload: {} });
+		await settle();
+		expect(listSessions.mock.calls.length).toBe(before);
+		lastWsEvent.set({ type: 'world_changed', world: 'default', payload: {} });
 		await settle();
 		expect(listSessions.mock.calls.length).toBeGreaterThan(before);
 		expect(listSessions).toHaveBeenLastCalledWith('default', 200);
@@ -176,7 +178,9 @@ describe('/sessions 默认世界与切换', () => {
 
 describe('/sessions 表格', () => {
 	beforeEach(() => {
-		list.mockReset().mockResolvedValue(WORLDS);
+		mockDetail();
+		at();
+		noteDefaultWorld('default');
 		listSessions.mockReset().mockImplementation(async (w: string) => sessionsOf(w));
 	});
 
@@ -318,7 +322,9 @@ describe('/sessions 表格', () => {
 describe('/sessions 回滚到会话之前', () => {
 	const reload = vi.fn();
 	beforeEach(() => {
-		list.mockReset().mockResolvedValue(WORLDS);
+		mockDetail();
+		at();
+		noteDefaultWorld('default');
 		listSessions.mockReset().mockImplementation(async (w: string) => sessionsOf(w));
 		rollback.mockReset();
 		reload.mockReset();
@@ -353,13 +359,14 @@ describe('/sessions 回滚到会话之前', () => {
 		expect(text).toContain(
 			'该世界在这份快照之后写入的所有记忆都会被丢弃。当前的库会改名保留在该世界的 archive 目录，可手动恢复。'
 		);
-		expect(text).toContain('完成后页面会自动刷新'); // 活动世界
+		expect(text).toContain('这个世界现在开着'); // 引擎开着：提示会重建引擎
+		expect(text).not.toContain('页面会自动刷新');
 		expect(rollback).not.toHaveBeenCalled();
 	});
 
 	it('确认名不一致时不能提交（含绕过 disabled）；一致后调用同一个回滚 API', async () => {
 		rollback.mockResolvedValue({
-			world: 'default', snapshot_id: ANCHORED.anchor.snapshot_id, archived: true, active: true
+			world: 'default', snapshot_id: ANCHORED.anchor.snapshot_id, archived: true, reopened: true
 		});
 		const { container } = render(Sessions);
 		await settle();
@@ -383,9 +390,8 @@ describe('/sessions 回滚到会话之前', () => {
 		await settle();
 		expect(rollback).toHaveBeenCalledTimes(1);
 		expect(rollback).toHaveBeenCalledWith('default', '20261027T185959Z-ab12', 'default');
-		// 活动世界:整页刷新,按钮在重载前不复位
-		expect(reload).toHaveBeenCalledTimes(1);
-		expect(inBody('确认回滚')!.disabled).toBe(true);
+		// 引擎在服务端重建,页面不整页刷新
+		expect(reload).not.toHaveBeenCalled();
 	});
 
 	it('输入过确认名后关掉抽屉，重新打开时输入框为空、确认键禁用', async () => {
@@ -404,17 +410,16 @@ describe('/sessions 回滚到会话之前', () => {
 		expect(rollback).not.toHaveBeenCalled();
 	});
 
-	it('非活动世界回滚成功：toast、关确认、重取清单，不整页刷新', async () => {
+	it('回滚成功（世界没开着）：toast、关确认、重取清单，不整页刷新', async () => {
 		rollback.mockResolvedValue({
-			world: 'sim-1', snapshot_id: ANCHORED.anchor.snapshot_id, archived: true, active: false
+			world: 'sim-1', snapshot_id: ANCHORED.anchor.snapshot_id, archived: true, reopened: false
 		});
+		at('sim-1');
 		const { container } = render(Sessions);
-		await settle();
-		await fireEvent.change(worldSelect(container), { target: { value: 'sim-1' } });
 		await settle();
 		const before = listSessions.mock.calls.length;
 		await openRollback(container);
-		expect(document.body.textContent).not.toContain('完成后页面会自动刷新');
+		expect(document.body.textContent).not.toContain('这个世界现在开着');
 		await fireEvent.input(confirmInput(), { target: { value: 'sim-1' } });
 		await tick();
 		await fireEvent.click(inBody('确认回滚')!);
@@ -441,7 +446,7 @@ describe('/sessions 回滚到会话之前', () => {
 		expect(rollbackButtons(container).every((b) => b.disabled)).toBe(true);
 		await fireEvent.click(inBody('确认回滚')!);
 		expect(rollback).toHaveBeenCalledTimes(1);
-		resolve({ world: 'default', snapshot_id: 's', archived: true, active: true });
+		resolve({ world: 'default', snapshot_id: 's', archived: true, reopened: true });
 		await settle();
 	});
 

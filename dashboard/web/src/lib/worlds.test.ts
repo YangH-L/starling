@@ -3,7 +3,7 @@ import * as tok from './token';
 import { ApiError } from './api';
 import {
 	worldsApi, isValidWorldName, formatBytes, worldErrorMessage, apiDetail,
-	parseIntervalHours, autoSnapshotLabel, snapshotReasonLabel, shortId
+	parseIntervalHours, describeError, autoSnapshotLabel, snapshotReasonLabel, shortId, parseLabels
 } from './worlds';
 
 let calls: Array<[string, RequestInit]> = [];
@@ -16,10 +16,10 @@ beforeEach(() => {
 	}) as unknown as typeof fetch;
 });
 
-describe('世界名校验（与后端 is_valid_world_name 同一规则）', () => {
-	it.each(['default', 'sim-1', 'a_b', '0abc', 'a'.repeat(32)])('接受 %s', (n) =>
+describe('世界名校验（首字符字母或数字，其后 [A-Za-z0-9._-]，1–128，区分大小写）', () => {
+	it.each(['default', 'sim-1', 'a_b', '0abc', 'Run-A.1', 'Up', 'a'.repeat(128)])('接受 %s', (n) =>
 		expect(isValidWorldName(n)).toBe(true));
-	it.each(['', '-x', 'Up', 'a b', '../x', 'a/b', 'a'.repeat(33)])('拒绝 %s', (n) =>
+	it.each(['', '-x', '.x', '_x', 'a b', '../x', 'a/b', 'a'.repeat(129)])('拒绝 %s', (n) =>
 		expect(isValidWorldName(n)).toBe(false));
 });
 
@@ -33,10 +33,9 @@ describe('formatBytes', () => {
 });
 
 describe('worldsApi 路径与方法', () => {
-	it('list/create/activate/remove/snapshot', async () => {
+	it('list/create/remove/snapshot', async () => {
 		await worldsApi.list();
 		await worldsApi.create('sim-1', '模拟');
-		await worldsApi.activate('sim-1');
 		await worldsApi.remove('sim-1', 'sim-1');
 		await worldsApi.snapshots('sim-1');
 		await worldsApi.snapshot('sim-1', 'n');
@@ -44,14 +43,13 @@ describe('worldsApi 路径与方法', () => {
 		expect(calls.map(([p, i]) => `${i.method ?? 'GET'} ${p}`)).toEqual([
 			'GET /api/worlds',
 			'POST /api/worlds',
-			'POST /api/worlds/sim-1/activate',
 			'DELETE /api/worlds/sim-1?confirm=sim-1',
 			'GET /api/worlds/sim-1/snapshots',
 			'POST /api/worlds/sim-1/snapshots',
 			'DELETE /api/worlds/sim-1/snapshots/id%201'
 		]);
 		expect(JSON.parse(String(calls[1][1].body))).toEqual({ name: 'sim-1', label: '模拟' });
-		expect(JSON.parse(String(calls[5][1].body))).toEqual({ note: 'n' });
+		expect(JSON.parse(String(calls[4][1].body))).toEqual({ note: 'n' });
 	});
 });
 
@@ -142,7 +140,7 @@ describe('错误文案', () => {
 			'后台任务或在途请求暂时停不下来，未做任何改动，请稍后再试'
 		);
 		expect(worldErrorMessage('world_open_failed')).toBe(
-			'引擎打开失败，数据库未改动（切换时已留在原世界）；下一次写入、召回或在「队列」页手动 tick 时会自动重建，仍异常请查看服务日志'
+			'世界打不开，请稍后再试或查看服务日志'
 		);
 		expect(worldErrorMessage('insufficient_disk')).toBe(
 			'磁盘空间不足：快照需要至少 3 倍于数据量、回滚需要至少 2 倍于快照大小的可用空间'
@@ -164,7 +162,7 @@ describe('错误文案', () => {
 		expect(worldErrorMessage('world_tenant_mismatch')).toBe(
 			'该世界的数据库里有其他租户的数据，拒绝打开'
 		);
-		expect(worldErrorMessage('world_switching')).toBe('正在切换世界，请稍后再试');
+		expect(worldErrorMessage('world_switching')).toBe('操作失败：world_switching');
 		expect(worldErrorMessage('internal_error')).toBe('服务器内部错误');
 	});
 	it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])(
@@ -271,5 +269,88 @@ describe('自动快照与会话的显示辅助（W4）', () => {
 	it('shortId 取前 N 位', () => {
 		expect(shortId('0123456789abcdef', 8)).toBe('01234567');
 		expect(shortId('abc', 8)).toBe('abc');
+	});
+});
+
+describe('worldsApi 多世界（第 1 期）', () => {
+	it('activate 已去掉', () => {
+		expect('activate' in worldsApi).toBe(false);
+	});
+	it('list：按标签过滤与分页拼成 label.<key>=<value>&offset=&limit=', async () => {
+		await worldsApi.list({ labels: { env: 'prod', 'team x': 'a&b' }, offset: 50, limit: 25 });
+		expect(calls[0][0]).toBe('/api/worlds?label.env=prod&label.team%20x=a%26b&offset=50&limit=25');
+		await worldsApi.list();
+		expect(calls[1][0]).toBe('/api/worlds');
+	});
+	it('detail / close / updateSettings 路径与方法', async () => {
+		await worldsApi.detail('Run-A');
+		await worldsApi.close('Run-A');
+		await worldsApi.updateSettings('Run-A', { background: { auto_snapshot: { on_session: true, interval_hours: 0 } } });
+		expect(calls.map(([p, i]) => `${i.method ?? 'GET'} ${p}`)).toEqual([
+			'GET /api/worlds/Run-A',
+			'POST /api/worlds/Run-A/close',
+			'PUT /api/worlds/Run-A/settings'
+		]);
+		expect(JSON.parse(String(calls[2][1].body))).toEqual({
+			background: { auto_snapshot: { on_session: true, interval_hours: 0 } }
+		});
+	});
+	it('reconfirm：POST /settings/reconfirm（裁定 R53），世界名经编码', async () => {
+		await worldsApi.reconfirm('Run A');
+		expect(calls.map(([p, i]) => `${i.method ?? 'GET'} ${p}`)).toEqual([
+			'POST /api/worlds/Run%20A/settings/reconfirm'
+		]);
+	});
+	it('create：带 labels 时发 labels；没传 auto_snapshot 就不发这个字段', async () => {
+		await worldsApi.create('sim-2', '', undefined, { env: 'test' });
+		expect(JSON.parse(String(calls[0][1].body))).toEqual({
+			name: 'sim-2',
+			label: '',
+			labels: { env: 'test' }
+		});
+	});
+	it.each([
+		['world_busy', '世界正在关闭或恢复，请稍后再试'],
+		['world_not_found', '世界不存在'],
+		['world_not_initialized', '这个世界的库文件不见了'],
+		['endpoint_changed', '供应商地址改了，到「世界」页对这个世界点「重新确认端点」'],
+		['labels_immutable', '标签建好后不能改'],
+		['invalid_settings', '设置不合法'],
+		['world_tenant_mismatch', '该世界的数据库里有其他租户的数据，拒绝打开']
+	])('错误码 %s 的中文文案', (code, text) => expect(worldErrorMessage(code)).toBe(text));
+});
+
+describe('parseLabels', () => {
+	it('解析 key=value,逗号或空白分隔', () => {
+		expect(parseLabels('')).toEqual({});
+		expect(parseLabels('env=prod')).toEqual({ env: 'prod' });
+		expect(parseLabels('env=prod, team=x  k=v')).toEqual({ env: 'prod', team: 'x', k: 'v' });
+		expect(parseLabels('a=b=c')).toEqual({ a: 'b=c' });
+	});
+	it('不是 key=value 的段返回 null', () => {
+		for (const t of ['env', '=x', 'env=', 'a=b,c']) expect(parseLabels(t)).toBeNull();
+	});
+});
+
+describe('describeError 与 worlds_unavailable', () => {
+	it('worlds_unavailable 有中文文案', () => {
+		expect(worldErrorMessage('worlds_unavailable')).toBe('世界注册表暂时不可用，请稍后再试');
+	});
+	it('已知世界错误码给中文；其他错误保持原 message', () => {
+		for (const [code, text] of [
+			['world_not_found', '世界不存在'],
+			['world_busy', '世界正在关闭或恢复，请稍后再试'],
+			['world_not_initialized', '这个世界的库文件不见了'],
+			['worlds_unavailable', '世界注册表暂时不可用，请稍后再试']
+		])
+			expect(describeError(new ApiError(404, '/x', `404 ${code}`))).toBe(text);
+		expect(describeError(new ApiError(500, '/x', '500 boom'))).toBe('500 boom');
+		// 裁定 R59:interact 的 remember / recall 经 describeError,409 endpoint_changed 给中文提示。
+		expect(describeError(new ApiError(409, '/api/w/w1/remember', '409 endpoint_changed'))).toBe(
+			worldErrorMessage('endpoint_changed')
+		);
+		expect(worldErrorMessage('endpoint_changed')).toContain('重新确认端点');
+		expect(describeError(new Error('plain'))).toBe('plain');
+		expect(describeError('str')).toBe('str');
 	});
 });

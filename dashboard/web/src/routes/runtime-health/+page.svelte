@@ -1,19 +1,20 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { describeError } from '$lib/worlds';
+	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent } from '$lib/world.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import { Card, Badge, Skeleton, EmptyState } from '$lib/components/ui';
 	import { stateTone, isHealthy, nonZeroMetrics, type RuntimeHealthResponse } from '$lib/runtime_health';
 
 	// D4 (/plan-design-review): reuse createQuery + existing WS tick refetch. No new WS event types.
-	const q = createQuery(() => api.get<RuntimeHealthResponse>('/api/runtime_health'));
+	const q = createQuery(() => api.get<RuntimeHealthResponse>(worldPath('/api/runtime_health')));
 	$effect(() => {
 		q.refetch();
 	});
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	const healthy = $derived(q.data != null && isHealthy(q.data));
@@ -22,7 +23,7 @@
 <PageHeader title="运行时健康" subtitle="RuntimeHealth 状态机 + 转换事件(只读)" />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<Skeleton class="h-24 w-full" />
 {:else if q.data}

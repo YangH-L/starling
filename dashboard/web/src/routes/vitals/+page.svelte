@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { api } from '$lib/api';
+	import { describeError } from '$lib/worlds';
+	import { api, worldPath } from '$lib/api';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { refetchOnEvent, withWorld } from '$lib/world.svelte';
 	import { allHealthy, lagTone, type VitalsResponse } from '$lib/vitals';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import StatCard from '$lib/components/StatCard.svelte';
@@ -10,12 +11,12 @@
 
 	// Decision A (/plan-design-review): reuse createQuery + the existing WS tick
 	// event to refetch. No new WS event types, no realtime.py change.
-	const q = createQuery(() => api.get<VitalsResponse>('/api/vitals'));
+	const q = createQuery(() => api.get<VitalsResponse>(worldPath('/api/vitals')));
 	$effect(() => {
 		q.refetch();
 	});
 	$effect(() => {
-		if (mutatesMemory($lastWsEvent)) q.refetch();
+		if (refetchOnEvent($lastWsEvent)) q.refetch();
 	});
 
 	const healthy = $derived(q.data != null && allHealthy(q.data));
@@ -32,7 +33,7 @@
 />
 
 {#if q.error}
-	<EmptyState title="加载失败" description={q.error.message} />
+	<EmptyState title="加载失败" description={describeError(q.error)} />
 {:else if q.loading && !q.data}
 	<div class="grid grid-cols-2 gap-3 md:grid-cols-4">
 		{#each Array(4) as _}<Skeleton class="h-20 w-full" />{/each}
@@ -92,7 +93,7 @@
 				<ul class="divide-y divide-border">
 					{#each q.data.volatile_stuck as s}
 						<li class="flex items-center justify-between gap-3 py-2 text-sm">
-							<a href="/statements" title={s.id} class="flex min-w-0 items-center gap-2">
+							<a href={withWorld('/statements')} title={s.id} class="flex min-w-0 items-center gap-2">
 								<Badge tone="brand">{s.id.slice(0, 8)}…</Badge>
 								<span class="truncate">
 									{s.subject_id} <span class="text-subtle">{s.predicate}</span> {s.object_value}
@@ -168,7 +169,7 @@
 				<ul class="divide-y divide-border">
 					{#each q.data.overdue_windows as w}
 						<li class="flex items-center justify-between gap-3 py-2 text-sm">
-							<a href="/statements" title={w.stmt_id}><Badge tone="brand">{w.stmt_id.slice(0, 8)}…</Badge></a>
+							<a href={withWorld('/statements')} title={w.stmt_id}><Badge tone="brand">{w.stmt_id.slice(0, 8)}…</Badge></a>
 							<span class="shrink-0 text-xs tabular-nums text-muted">deadline {w.close_deadline}</span>
 						</li>
 					{/each}

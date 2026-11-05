@@ -2,7 +2,8 @@
 	import { untrack } from 'svelte';
 	import { createQuery } from '$lib/query.svelte';
 	import { lastWsEvent } from '$lib/health';
-	import { mutatesMemory } from '$lib/ws';
+	import { shouldRefetch } from '$lib/feed';
+	import { explicitWorld, setWorld } from '$lib/world.svelte';
 	import { toast } from '$lib/ui/toast';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import AutoSnapshotFields from '$lib/components/AutoSnapshotFields.svelte';
@@ -23,26 +24,36 @@
 		autoSnapshotLabel,
 		formatBytes,
 		isValidWorldName,
-		NEW_WORLD_AUTO_SNAPSHOT,
 		parseIntervalHours,
+		parseLabels,
 		shortId,
 		snapshotReasonLabel,
 		worldErrorMessage,
 		worldsApi,
+		type AutoSnapshotConfig,
 		type SnapshotRow,
 		type WorldRow
 	} from '$lib/worlds';
 
 	// W1–W4 — 世界管理:一个世界 = 一个库文件 + 一个租户(HTTP 契约见 $lib/worlds)。
-	const q = createQuery(() => worldsApi.list());
+	// 列表按标签过滤(label.<key>=<value>,多个同时满足)并分页(offset/limit,后端回 total)。
+	const PAGE_SIZE = 25;
+	let filterText = $state(''); // 输入框里的原文
+	let appliedFilter = $state<Record<string, string>>({}); // 点「过滤」后生效的
+	let offset = $state(0);
+	let filterInvalid = $derived(parseLabels(filterText) === null);
+	const q = createQuery(() =>
+		worldsApi.list({ labels: appliedFilter, offset, limit: PAGE_SIZE })
+	);
 	$effect(() => {
 		q.refetch();
 	});
-	// world_switched / snapshot_created / world_rolled_back 都归入 mutatesMemory 的「会改变可见状态」一侧
-	// (只有 recall 是纯读,见 $lib/ws),所以这一个判据同时覆盖这几种事件。
+	// snapshot_created / world_rolled_back / world_changed 都归入 mutatesMemory 的「会改变可见状态」一侧
+	// (只有 recall 是纯读,见 $lib/ws),所以一个判据同时覆盖它们。世界列表对所有世界的变化都关心
+	// (语句数、最近写入、快照数都显示在行上),所以不按 world 过滤(shouldRefetch 的 null)。
 	// 快照抽屉开着时一并重取它的列表;抽屉状态用 untrack 读,免得开关抽屉本身触发重取。
 	$effect(() => {
-		if (!mutatesMemory($lastWsEvent)) return;
+		if (!shouldRefetch($lastWsEvent, null)) return;
 		untrack(() => {
 			void q.refetch();
 			if (snapOpen && snapWorld) void loadSnaps(snapWorld);
@@ -51,6 +62,27 @@
 
 	let worlds = $derived(q.data?.worlds ?? []);
 	let defaultName = $derived(q.data?.default ?? '');
+	let total = $derived(q.data?.total ?? 0);
+	let pageFrom = $derived(worlds.length ? offset + 1 : 0);
+	let pageTo = $derived(offset + worlds.length);
+	// 删除后本页可能空了而前面还有:退回最后一页。
+	$effect(() => {
+		if (q.data && worlds.length === 0 && offset > 0)
+			offset = Math.max(0, Math.floor((Math.max(total, 1) - 1) / PAGE_SIZE) * PAGE_SIZE);
+	});
+
+	function applyFilter() {
+		const f = parseLabels(filterText);
+		if (f === null) return;
+		appliedFilter = f;
+		offset = 0;
+	}
+	function clearFilter() {
+		filterText = '';
+		appliedFilter = {};
+		offset = 0;
+	}
+	const labelPairs = (w: WorldRow) => Object.entries(w.labels ?? {});
 	let retention = $derived(q.data?.snapshot_retention);
 	// W4:自动快照失败只记录、不影响摄入;有失败时在页面顶部提示一次。
 	let autoStatus = $derived(q.data?.auto_snapshot_status);
@@ -63,71 +95,85 @@
 
 	const errText = (e: unknown) => worldErrorMessage(apiDetail(e));
 	const worldTitle = (w: WorldRow) => (w.label ? `${w.name} · ${w.label}` : w.name);
+	// 列表行不带库文件大小和原始数据条数(要打开库才有,几百个世界时撑不住),只给语句数与最近写入。
 	const statsLine = (w: WorldRow) =>
-		`语句 ${w.statements} · 原始数据 ${w.engrams} · 活数据 ${formatBytes(w.live_bytes)} · ` +
-		`文件 ${formatBytes(w.db_bytes)} · 快照 ${w.snapshots} 份（${formatBytes(w.snapshot_bytes)}）`;
-	// 默认世界和活动世界不可删;后端同样拒绝(world_protected),前端不给入口。
-	const isDeletable = (w: WorldRow) => !w.active && w.name !== defaultName;
+		`语句 ${w.statements} · 认知体 ${w.holders} · 最近写入 ${w.last_write_at || '—'} · ` +
+		`快照 ${w.snapshots} 份（${formatBytes(w.snapshot_bytes)}）`;
+	// 默认世界不可删;后端同样拒绝(world_protected),前端不给入口。
+	const isDeletable = (w: WorldRow) => w.name !== defaultName;
 
 	// ── 新建 ──────────────────────────────────────────────────────────────
 	let newName = $state('');
 	let newLabel = $state('');
-	let newOnSession = $state(NEW_WORLD_AUTO_SNAPSHOT.on_session);
-	let newHours = $state<number | string | null>(NEW_WORLD_AUTO_SNAPSHOT.interval_hours);
+	let newLabels = $state('');
+	// 自动快照的初值取默认世界当前的设置(spec §8.2):新世界默认继承它。
+	// 只有用户改了才随请求发 auto_snapshot,没改就不发,由后端继承。
+	let defaultAuto = $state<AutoSnapshotConfig | null>(null);
+	let defaultAutoFor = '';
+	const FALLBACK_AUTO: AutoSnapshotConfig = { on_session: false, interval_hours: 0 };
+	let newOnSession = $state(FALLBACK_AUTO.on_session);
+	let newHours = $state<number | string | null>(FALLBACK_AUTO.interval_hours);
+	$effect(() => {
+		const name = defaultName;
+		if (!name || name === defaultAutoFor) return;
+		defaultAutoFor = name;
+		void worldsApi
+			.detail(name)
+			.then((d) => {
+				const a = d.settings?.background?.auto_snapshot;
+				if (!a) return;
+				defaultAuto = { on_session: a.on_session, interval_hours: a.interval_hours };
+				// 表单还停在保守初值(用户没动过)时,用默认世界的设置覆盖它。
+				if (newOnSession === FALLBACK_AUTO.on_session && newHours === FALLBACK_AUTO.interval_hours) {
+					newOnSession = a.on_session;
+					newHours = a.interval_hours;
+				}
+			})
+			.catch(() => {
+				/* 取不到就用保守初值且不发 auto_snapshot,让后端继承 */
+			});
+	});
 	let creating = $state(false);
 	let nameValid = $derived(isValidWorldName(newName));
 	// 空输入不标红:还没写不算写错,只是不能提交。
 	let nameInvalid = $derived(newName !== '' && !nameValid);
 	let newHoursParsed = $derived(parseIntervalHours(newHours));
-	let canCreate = $derived(nameValid && newHoursParsed !== null && !creating);
+	let newLabelsParsed = $derived(parseLabels(newLabels));
+	let canCreate = $derived(
+		nameValid && newHoursParsed !== null && newLabelsParsed !== null && !creating
+	);
+	// 自动快照字段与默认世界的设置(取不到时是保守初值)不同才算「改过」。
+	let autoChanged = $derived.by(() => {
+		const base = defaultAuto ?? FALLBACK_AUTO;
+		return newOnSession !== base.on_session || newHoursParsed !== base.interval_hours;
+	});
 
 	async function doCreate() {
 		const hours = newHoursParsed;
-		if (!canCreate || hours === null) return; // 函数级守卫:不依赖按钮的 disabled
+		const labels = newLabelsParsed;
+		if (!canCreate || hours === null || labels === null) return; // 函数级守卫:不依赖按钮的 disabled
 		const name = newName;
 		creating = true;
 		try {
-			await worldsApi.create(name, newLabel.trim(), {
-				on_session: newOnSession,
-				interval_hours: hours
-			});
+			await worldsApi.create(
+				name,
+				newLabel.trim(),
+				autoChanged ? { on_session: newOnSession, interval_hours: hours } : undefined,
+				labels
+			);
 			toast.success(`已创建世界「${name}」`);
 			newName = '';
 			newLabel = '';
-			newOnSession = NEW_WORLD_AUTO_SNAPSHOT.on_session;
-			newHours = NEW_WORLD_AUTO_SNAPSHOT.interval_hours;
+			newLabels = '';
+			const base = defaultAuto ?? FALLBACK_AUTO;
+			newOnSession = base.on_session;
+			newHours = base.interval_hours;
 			await q.refetch();
 		} catch (e) {
 			toast.error(errText(e));
 		} finally {
 			creating = false;
 		}
-	}
-
-	// ── 切换 ──────────────────────────────────────────────────────────────
-	let switchOpen = $state(false);
-	let switchTarget = $state('');
-	let switching = $state<string | null>(null);
-
-	function askSwitch(name: string) {
-		switchTarget = name;
-		switchOpen = true;
-	}
-
-	async function doSwitch() {
-		const name = switchTarget;
-		if (!name || switching !== null) return;
-		switching = name;
-		try {
-			await worldsApi.activate(name);
-		} catch (e) {
-			toast.error(errText(e));
-			switching = null;
-			return;
-		}
-		// 成功后不复位 switching:页面马上整页重载,别让按钮在重载前的空档里重新可点。
-		// 其他页面都按旧世界缓存了数据;整页刷新是唯一可靠的清法(spec §8:切换后新请求都走新引擎)。
-		location.reload();
 	}
 
 	// ── 自动快照设置(W4,抽屉) ──────────────────────────────────────────
@@ -166,18 +212,46 @@
 		}
 	}
 
+	// ── 重新确认端点(裁定 R53,ConfirmDialog) ─────────────────────────────
+	// 供应商的地址或种类改了之后,继承它的世界一律 endpoint_changed;这一步把默认配置里各供应商此刻的地址
+	// 复制进该世界引用它们的角色(供应商已删除的角色解绑)。默认世界的端点跟着配置走,不给入口。
+	let reconfirmOpen = $state(false);
+	let reconfirmTarget = $state('');
+	let reconfirming = $state<string | null>(null);
+
+	function askReconfirm(name: string) {
+		reconfirmTarget = name;
+		reconfirmOpen = true;
+	}
+
+	async function doReconfirm() {
+		const name = reconfirmTarget;
+		if (!name || reconfirming !== null) return;
+		reconfirming = name;
+		try {
+			const row = await worldsApi.reconfirm(name);
+			toast.success(`已为「${name}」重新确认端点`);
+			// 非致命提示(如嵌入供应商拒绝了重嵌入):保存已成功,但不能静默吞掉(裁定 R58)。
+			for (const w of row?.warnings ?? []) toast.warning(w);
+			await q.refetch();
+		} catch (e) {
+			toast.error(errText(e));
+		} finally {
+			reconfirming = null;
+		}
+	}
+
 	// ── 删除(抽屉 + 手输世界名) ─────────────────────────────────────────
 	let deleteOpen = $state(false);
 	let deleteTarget = $state('');
 	let deleteConfirm = $state('');
 	let deleting = $state(false);
 	let deleteRow = $derived(worlds.find((w) => w.name === deleteTarget));
-	// 抽屉开着时列表可能因 ws 事件刷新(目标恰好成了活动世界),所以每次都按最新行重判。
+	// 抽屉开着时列表可能因 ws 事件刷新,所以每次都按最新行重判。
 	let canDelete = $derived(
 		!!deleteRow &&
 			isDeletable(deleteRow) &&
 			deleteConfirm === deleteRow.name &&
-			switching === null &&
 			!deleting
 	);
 
@@ -194,6 +268,8 @@
 		try {
 			await worldsApi.remove(name, deleteConfirm);
 			toast.success(`已删除世界「${name}」`);
+			// 删的恰好是顶栏选着的世界:回到默认世界,免得各页对着已删除的世界 404。
+			if (explicitWorld() === name) setWorld(defaultName);
 			deleteOpen = false;
 			deleteConfirm = '';
 			await q.refetch();
@@ -294,9 +370,7 @@
 		const t = rollbackTarget;
 		return t ? worlds.find((w) => w.name === t.world) : undefined;
 	});
-	let snapRowBusy = $derived(
-		rollingBack !== null || removingSnap !== null || snapshotting || switching !== null
-	);
+	let snapRowBusy = $derived(rollingBack !== null || removingSnap !== null || snapshotting);
 	const snapSummary = (snap: SnapshotRow) =>
 		`${snap.created_at} · ${snapshotReasonLabel(snap.reason)} · ${formatBytes(snap.size_bytes)}` +
 		(snap.note ? ` · ${snap.note}` : '');
@@ -317,12 +391,11 @@
 			purgeRow.archives > 0 &&
 			purgeConfirm === purgeRow.name &&
 			!purging &&
-			switching === null &&
 			rollingBack === null
 	);
 
-	// 任一会动库文件或引擎的请求在途时,世界行上的切换/清理/删除按钮一律禁用。
-	let worldBusy = $derived(switching !== null || deleting || rollingBack !== null || purging);
+	// 任一会动库文件或引擎的请求在途时,世界行上的清理/删除按钮一律禁用。
+	let worldBusy = $derived(deleting || rollingBack !== null || purging);
 
 	function askPurge(name: string) {
 		purgeTarget = name;
@@ -350,7 +423,7 @@
 
 <PageHeader
 	title="世界"
-	subtitle="一个世界 = 一个数据库文件 + 一个租户。切换世界会重建引擎；快照是该世界库的紧凑只读副本，可以回滚到它。"
+	subtitle="一个世界 = 一个数据库文件 + 一个租户。所有世界同时在线，用顶栏的选择器看某个世界；快照是该世界库的紧凑只读副本，可以回滚到它。"
 />
 
 {#if q.error && !q.data}
@@ -372,14 +445,53 @@
 		</p>
 	{/if}
 
+	<form
+		class="mb-3 flex flex-wrap items-end gap-2"
+		onsubmit={(e) => {
+			e.preventDefault();
+			applyFilter();
+		}}
+	>
+		<Field
+			label="按标签过滤"
+			for="world-label-filter"
+			hint="key=value，多个用逗号分隔，需同时满足"
+			error={filterInvalid ? '每段都要写成 key=value' : ''}
+		>
+			{#snippet children(f)}
+				<Input
+					id="world-label-filter"
+					name="world-label-filter"
+					bind:value={filterText}
+					invalid={f.invalid}
+					aria-describedby={f.describedBy}
+					placeholder="env=prod"
+					autocomplete="off"
+					class="max-w-64"
+				/>
+			{/snippet}
+		</Field>
+		<Button type="submit" variant="soft" disabled={filterInvalid}>过滤</Button>
+		{#if Object.keys(appliedFilter).length}
+			<Button variant="secondary" onclick={clearFilter}>清除过滤</Button>
+		{/if}
+	</form>
+
 	<div class="space-y-3">
 		{#each worlds as w (w.name)}
 			<Card title={worldTitle(w)}>
 				{#snippet actions()}
-					{#if w.active}<Badge tone="brand">当前</Badge>{/if}
+					{#if w.open}<Badge tone="info">已打开</Badge>{/if}
 					{#if w.name === defaultName}<Badge tone="neutral">默认</Badge>{/if}
 					{#if w.stats_error}<Badge tone="warn">统计不可用</Badge>{/if}
 				{/snippet}
+				{#if labelPairs(w).length}
+					<p class="mb-1 flex flex-wrap gap-1" aria-label={`${w.name} 的标签`}>
+						{#each labelPairs(w) as [k, v] (k)}
+							<Badge tone="neutral">{k}={v}</Badge>
+						{/each}
+					</p>
+				{/if}
 				<p class="text-xs tabular-nums text-muted">{statsLine(w)}</p>
 				{#if w.archives > 0}
 					<p class="mt-1 text-xs tabular-nums text-muted">
@@ -392,15 +504,11 @@
 					</p>
 				{/if}
 				<div class="mt-3 flex flex-wrap gap-2">
-					{#if !w.active}
-						<Button
-							variant="soft"
-							aria-label={`切换到此世界 ${w.name}`}
-							loading={switching === w.name}
-							disabled={worldBusy}
-							onclick={() => askSwitch(w.name)}>切换到此世界</Button
-						>
-					{/if}
+					<a
+						href={`/?world=${encodeURIComponent(w.name)}`}
+						class="inline-flex items-center rounded-control border border-border px-3 py-1.5 text-sm text-fg hover:bg-brand-tint"
+						aria-label={`查看世界 ${w.name}`}>查看</a
+					>
 					<Button
 						variant="secondary"
 						aria-label={`快照 ${w.name}`}
@@ -421,6 +529,15 @@
 							onclick={() => askPurge(w.name)}>清理归档</Button
 						>
 					{/if}
+					{#if w.name !== defaultName}
+						<Button
+							variant="secondary"
+							aria-label={`重新确认端点 ${w.name}`}
+							loading={reconfirming === w.name}
+							disabled={reconfirming !== null || worldBusy}
+							onclick={() => askReconfirm(w.name)}>重新确认端点</Button
+						>
+					{/if}
 					{#if isDeletable(w)}
 						<Button
 							variant="secondary"
@@ -432,6 +549,27 @@
 				</div>
 			</Card>
 		{/each}
+
+		{#if worlds.length === 0}
+			<EmptyState
+				title={Object.keys(appliedFilter).length ? '没有符合标签的世界' : '还没有世界'}
+			/>
+		{/if}
+		<div class="flex items-center justify-between gap-2 text-xs tabular-nums text-subtle">
+			<span>第 {pageFrom}–{pageTo} 个，共 {total} 个</span>
+			<span class="flex gap-2">
+				<Button
+					variant="secondary"
+					disabled={offset === 0 || q.loading}
+					onclick={() => (offset = Math.max(0, offset - PAGE_SIZE))}>上一页</Button
+				>
+				<Button
+					variant="secondary"
+					disabled={offset + PAGE_SIZE >= total || q.loading}
+					onclick={() => (offset = offset + PAGE_SIZE)}>下一页</Button
+				>
+			</span>
+		</div>
 
 		<Card
 			title="新建世界"
@@ -447,7 +585,7 @@
 				<Field
 					label="名称"
 					for="world-name"
-					hint="小写字母或数字开头，可含下划线和连字符，最长 32 个字符"
+					hint="字母或数字开头，其后可含字母、数字、点、下划线和连字符，最长 128 个字符，区分大小写"
 					error={nameInvalid ? worldErrorMessage('invalid_world_name') : ''}
 				>
 					{#snippet children(f)}
@@ -472,11 +610,31 @@
 						class="max-w-64"
 					/>
 				</Field>
+				<Field
+					label="标签"
+					for="world-labels"
+					hint="可选，key=value，多个用逗号分隔；建好后不能改"
+					error={newLabelsParsed === null ? '每段都要写成 key=value' : ''}
+				>
+					{#snippet children(f)}
+						<Input
+							id="world-labels"
+							name="world-labels"
+							bind:value={newLabels}
+							invalid={f.invalid}
+							aria-describedby={f.describedBy}
+							placeholder="env=test"
+							autocomplete="off"
+							class="max-w-64"
+						/>
+					{/snippet}
+				</Field>
 				<AutoSnapshotFields
 					idPrefix="world-new"
 					bind:onSession={newOnSession}
 					bind:hours={newHours}
 				/>
+				<p class="text-xs text-subtle">自动快照的初值是默认世界当前的设置；不改就沿用它。</p>
 				<Button type="submit" variant="soft" loading={creating} disabled={!canCreate}
 					>新建世界</Button
 				>
@@ -484,14 +642,6 @@
 		</Card>
 	</div>
 {/if}
-
-<ConfirmDialog
-	bind:open={switchOpen}
-	title={`切换到 ${switchTarget}？`}
-	description="切换会停止当前世界的后台维护与摄入，并重建引擎。"
-	confirmLabel="切换"
-	onconfirm={doSwitch}
-/>
 
 <Drawer bind:open={deleteOpen} title={`删除世界 ${deleteTarget}`}>
 	{#if deleteRow}
@@ -613,6 +763,14 @@
 	onconfirm={doRemoveSnap}
 />
 
+<ConfirmDialog
+	bind:open={reconfirmOpen}
+	title={`重新确认「${reconfirmTarget}」的端点？`}
+	description={`将把默认配置里各供应商当前的设置（地址、种类、模型）复制到世界「${reconfirmTarget}」引用它们的角色上，嵌入端点也可能随之改变；已删除的供应商对应的角色会解绑。若嵌入的模型或维度变了，世界「${reconfirmTarget}」的记忆会全部重新嵌入；只改了地址不会。客户端单独指定的端点不受影响。`}
+	confirmLabel="确认"
+	onconfirm={doReconfirm}
+/>
+
 <WorldRollbackDrawer
 	bind:open={rollbackOpen}
 	bind:busy={rollbackBusy}
@@ -620,7 +778,6 @@
 	row={rollbackRow}
 	snapshot={rollbackTarget?.snap ?? null}
 	summary={rollbackTarget ? snapSummary(rollbackTarget.snap) : ''}
-	blocked={switching !== null}
 	onsuccess={() => q.refetch()}
 />
 
