@@ -125,7 +125,6 @@ cd dashboard/web && npm ci && cd -
 **Files:**
 - Modify: `bindings/python/bind_13_memory_ops.cpp`（`memory_pending_events`、`memory_abandon_event`、`memory_digest`、`memory_next_seq`）
 - Modify: `python/starling/_memory_core.py`（`abandon_event` 传 holder）、`python/starling/memory.py`（`PendingEvent` 加 `holder: str = ""`，放最后，带默认值以保持位置构造兼容）
-- Modify: `python/starling/dashboard/engine.py`（只改它转发 `pending_events` / `abandon_event` 的地方，以及看板 `remember_event` 传 holder 的地方）
 - Test: `tests/python/test_memory_events.py`（已有，追加）、`tests/python/test_gil_release.py`（追加）
 
 **Interfaces:**
