@@ -304,6 +304,10 @@
 	{:else if !loaded}
 		<Skeleton class="h-24 w-full" />
 	{/if}
+	<!-- 审查 M-3:下面的供应商与角色只作用于默认世界和以后新建的世界;页尾的危险区却跟着 ?world= 走。 -->
+	<p class="text-xs text-muted" data-testid="settings-scope-note">
+		这里的供应商与角色只改默认世界和以后新建的世界；已有世界的端点在「世界」页重新确认。
+	</p>
 	<Card title="角色绑定" description="把每个任务绑定到一个已配 provider。">
 		<div class="grid gap-3 sm:grid-cols-3">
 			<Field label="extraction(抽取)" for="role-ex" hint="remember 抽取记忆用">

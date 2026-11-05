@@ -413,8 +413,12 @@ WorldPage RegistryDb::list(const WorldQuery& query) const {
         bind_labels(stmt);
         if (stmt.step_row()) { page.total = sqlite3_column_int64(stmt.raw(), 0); }
     }
+    // spec §14：按最近写入时刻降序（审查 M-1）。last_write_at 是统计缓存列（关闭时与每 30 秒刷新），空串 = 从没写过，
+    // 排在最后；再按建世界时刻降序、名字升序兜底。空串在这一列里就是「没有值」（列 NOT NULL DEFAULT ''），所以用
+    // last_write_at = '' 而不是 NULLS LAST。
     const std::string sql = std::string("SELECT ") + kWorldColumns + " FROM worlds w" + where +
-                            " ORDER BY created_at DESC, name ASC LIMIT ? OFFSET ?";
+                            " ORDER BY last_write_at = '' ASC, last_write_at DESC, created_at DESC, "
+                            "name ASC LIMIT ? OFFSET ?";
     pst::Stmt stmt(impl_->db(), sql.c_str());
     const int used = bind_labels(stmt);
     sqlite3_bind_int64(stmt.raw(), used + 1, query.limit);

@@ -153,11 +153,11 @@ private:
 //      时补旧的默认值：默认世界 {false, 24}，其余 {true, 0})，导入的世界保持原来的自动快照行为
 //      （新设置的默认值是 {false, 24}，不写明的话非默认世界会从按会话变成按时间）。默认世界的
 //      db_path 照 worlds.json 原样保留（不在 worlds/ 布局之内，今天是 ~/.starling/dashboard.db）。
-//   4. rename(registry.db.importing, registry.db)。
-//   5. rename(worlds.json, worlds.json.imported-<compact_now>)（名字被占用就加 -<4 hex> 重试）。
+//   4. rename(registry.db.importing, registry.db)，然后 fsync 数据目录（审查 T2-1：第 4 步的改名落盘之后才做第 5 步）。
+//   5. rename(worlds.json, worlds.json.imported-<compact_now>)（名字被占用就加 -<4 hex> 重试），再 fsync 数据目录。
 // 第 4 步之前任何失败：删掉 registry.db.importing 与旁车，worlds.json 逐字节不变，抛
 // registry_corrupt（原码不是 registry_corrupt 时写在消息里，例如 invalid_retention）。
-// 第 5 步失败：registry.db 已就位、可以用，worlds.json 留在原处；抛 registry_corrupt 说明情况
+// 第 4 步之后的 fsync 失败或第 5 步失败：registry.db 已就位、可以用，worlds.json 留在原处；抛 registry_corrupt 说明情况
 // （下次调用见到 registry.db 就什么都不做，留着的 worlds.json 无害）。
 // 不加锁：调用方保证同一个数据目录只有一个进程在导入（服务启动时、打开 RegistryDb 之前调用）。
 void import_worlds_json(const std::filesystem::path& data_dir);

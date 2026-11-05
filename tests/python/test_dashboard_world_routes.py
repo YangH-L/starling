@@ -1283,3 +1283,14 @@ def test_reconfirm_unbinds_a_role_whose_provider_was_deleted(tmp_path, monkeypat
         assert "extraction" not in resp.json()["settings"]
         resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth"})
         assert (resp.status_code, resp.json()) == (409, {"detail": "llm_not_configured"})
+
+
+def test_world_list_sorts_by_last_write_then_creation(client):
+    """spec §14（审查 M-1）：写过的世界按最近写入降序在前（排序按注册表缓存列），没写过的在后。"""
+    pool = _pool(client)
+    for name in ("a1", "a2", "a3"):
+        assert client.post("/api/worlds", json={"name": name, "labels": {"set": "m1"}}).status_code == 200
+    pool.registry.update_stats("a1", 1, 1, "2099-02-01T00:00:00Z", "2099-02-01T00:00:00Z")
+    pool.registry.update_stats("a3", 1, 1, "2099-03-01T00:00:00Z", "2099-03-01T00:00:00Z")
+    names = [w["name"] for w in client.get("/api/worlds", params={"label.set": "m1"}).json()["worlds"]]
+    assert names == ["a3", "a1", "a2"]

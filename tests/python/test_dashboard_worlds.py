@@ -689,6 +689,20 @@ def test_rollback_closed_world_restores_snapshot_and_keeps_it_closed(pool_reg):
     assert _count(db) == 2
 
 
+def test_rollback_refreshes_the_closed_worlds_cached_count(pool_reg):
+    """审查 T5-1：关着的世界回滚之后，列表（注册表缓存列）立刻显示回滚后的计数，不是回滚前关闭时写的那份。"""
+    pool, reg = pool_reg
+    pool.create_world("sim-1", "")
+    snap = _write_snapshot_write(pool, "sim-1")
+    pool.close_world("sim-1")
+    assert reg.get("sim-1")["statements"] == 2               # 关闭时写的缓存
+    pool.rollback("sim-1", snap["id"])
+    assert "sim-1" not in pool.open_worlds()
+    assert reg.get("sim-1")["statements"] == 1
+    rows = {w["name"]: w for w in pool.list_worlds({}, 0, 50)["worlds"]}
+    assert rows["sim-1"]["statements"] == 1
+
+
 def test_rollback_open_world_rebuilds_engine_and_restarts_workers(tmp_path):
     pool, reg = _pool(tmp_path, _cfg(tmp_path, tick_interval_s=60.0))
     try:

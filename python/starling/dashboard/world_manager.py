@@ -1147,6 +1147,9 @@ class WorldPool:
             except Exception as exc:
                 self._reopen_after_rollback(world, was_open, exc)   # C++ 保证库未动；原样抛出
                 raise
+            # 审查 T5-1：库已换成快照，注册表里的统计缓存还是回滚前（关闭时写的）的计数。照关闭的写法刷一次，
+            # 关着的世界在列表上立刻显示回滚后的计数。失败只记日志（缓存是尽力而为）。
+            self._write_stats_cache(world, rec["db_path"], rec["tenant"])
             reopened = self._reopen_after_rollback(world, was_open, None)
         return {"world": world, "snapshot_id": snapshot_id,
                 "archived": bool(result["archive_path"]), "reopened": reopened}

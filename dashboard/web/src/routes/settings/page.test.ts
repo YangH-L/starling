@@ -129,6 +129,16 @@ describe('设置页:配置加载门(数据丢失防线)', () => {
 		expect(post.mock.calls[0][0]).toBe('/api/config');
 	});
 
+	it('角色绑定上方说明作用范围:只改默认世界与以后新建的世界(审查 M-3)', async () => {
+		get.mockResolvedValue(CONFIG);
+		const { container } = render(Settings);
+		await settle();
+		const note = container.querySelector('[data-testid="settings-scope-note"]');
+		expect(note?.textContent?.trim()).toBe(
+			'这里的供应商与角色只改默认世界和以后新建的世界；已有世界的端点在「世界」页重新确认。'
+		);
+	});
+
 	it('重试成功后解除封锁(一次失败不该永久锁死这页)', async () => {
 		// 只让 /api/config 先失败一次;危险区的世界详情请求也走 get,按路径区分。
 		let cfgCalls = 0;

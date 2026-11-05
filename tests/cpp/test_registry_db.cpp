@@ -195,11 +195,19 @@ TEST(RegistryDb, ListFiltersByLabelsAndPages) {
     ASSERT_EQ(page.worlds.size(), 2U);
 
     const auto all = reg.list(WorldQuery{.limit = 500});
-    for (std::size_t idx = 1; idx < all.worlds.size(); ++idx) {
+    for (std::size_t idx = 1; idx < all.worlds.size(); ++idx) {   // 没人写过：按建世界时刻降序
         EXPECT_GE(all.worlds[idx - 1].created_at, all.worlds[idx].created_at);
     }
     EXPECT_EQ(all.worlds.front().name, "r2-3");
     EXPECT_EQ(page.worlds.front().name, all.worlds[2].name);
+    // spec §14（审查 M-1）：写过的世界按最近写入降序排在前面，没写过的（last_write_at 为空）在后。
+    reg.update_stats("r1-0", 1, 1, "2099-02-01T00:00:00Z", kNow);
+    reg.update_stats("r1-2", 1, 1, "2099-03-01T00:00:00Z", kNow);
+    const auto by_write = reg.list(WorldQuery{.limit = 500});
+    ASSERT_GE(by_write.worlds.size(), 3U);
+    EXPECT_EQ(by_write.worlds[0].name, "r1-2");
+    EXPECT_EQ(by_write.worlds[1].name, "r1-0");
+    EXPECT_EQ(by_write.worlds[2].name, "r2-3");          // 其余照旧按建世界时刻
     EXPECT_EQ(code_of([&] { (void)reg.list(WorldQuery{.limit = 0}); }), "invalid_world_query");
     EXPECT_EQ(code_of([&] { (void)reg.list(WorldQuery{.limit = 501}); }), "invalid_world_query");
 }

@@ -166,15 +166,29 @@ def test_concurrent_first_lease_builds_one_engine(tmp_path, monkeypatch):
 
 
 def test_concurrent_first_lease_of_different_worlds_builds_in_parallel(tmp_path, monkeypatch):
-    """建引擎按世界持锁，不持池锁：w1 建引擎时 w2 的首次打开不排在它后面。"""
+    """建引擎按世界持锁，不持池锁：w1 建引擎时 w2 的首次打开不排在它后面。
+
+    计时判据（审查 M-8）：两个世界都在建引擎的 sleep 里重叠，用的是「同时在 sleep 里的世界数」（不受机器快慢影响），
+    另外比墙钟：并行的总时长要明显小于串行的总和（每次建引擎 2 秒 sleep + 真实构造，串行至少 4 秒），留 1.5 秒以上的
+    余量给加载重的 CI。"""
     pool, _reg, _c = _pool(tmp_path)
     try:
         pool.create_world("w1", "")
         pool.create_world("w2", "")
         real_init = DashboardEngine.__init__
+        sleep_s = 2.0
+        state = {"inside": 0, "peak": 0}
+        guard = threading.Lock()
 
         def slow_init(self, ctx, *args, **kwargs):
-            time.sleep(0.5)
+            with guard:
+                state["inside"] += 1
+                state["peak"] = max(state["peak"], state["inside"])
+            try:
+                time.sleep(sleep_s)
+            finally:
+                with guard:
+                    state["inside"] -= 1
             real_init(self, ctx, *args, **kwargs)
 
         monkeypatch.setattr(DashboardEngine, "__init__", slow_init)
@@ -189,8 +203,10 @@ def test_concurrent_first_lease_of_different_worlds_builds_in_parallel(tmp_path,
         for t in threads:
             t.start()
         for t in threads:
-            t.join(10)
-        assert time.monotonic() - start < 0.9          # 串行的话至少 1.0 秒
+            t.join(30)
+        elapsed = time.monotonic() - start
+        assert state["peak"] == 2, state               # 两次建引擎确实同时在进行
+        assert elapsed < 2 * sleep_s * 0.8, elapsed    # 串行至少 2 × sleep_s
         assert sorted(pool.open_worlds()) == ["w1", "w2"]
     finally:
         pool.close_all()
