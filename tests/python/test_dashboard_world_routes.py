@@ -1180,3 +1180,49 @@ def test_kind_change_with_an_empty_base_url_refuses_the_inherited_endpoint(tmp_p
         assert all(key != "sk-new" for _kind, _url, key in built), built
         # 默认世界跟着 config 走：按新种类、新密钥照常写。
         assert client.post("/api/remember", json={"text": "Carol owns billing"}).status_code == 200
+
+
+# ───────────────────────── 裁定 R52：开着的非默认世界用 provider 当前的密钥 ─────────────────────────
+
+def test_key_only_config_edit_reaches_an_open_non_default_world(tmp_path, monkeypatch):
+    """审查 I-1：默认世界与 w1 都开着，w1 继承 p。POST /api/config 只换 p 的密钥（地址、种类不变）。以前只有默认世界
+    重建适配器，w1 一直带着旧密钥。现在 w1 下一次 remember 按新密钥建适配器。"""
+    built: list = []
+    _cfg, client = _recording_client(tmp_path, monkeypatch, built,
+                                     {"provider": "openai", "model": "m1",
+                                      "base_url": "http://h.example", "api_key": "sk-old"})
+    with client:
+        pool = _pool(client)
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+        assert sorted(pool.open_worlds()) == ["default", "w1"]
+        resp = client.post("/api/config", json={"providers": {"p": {"api_key": "sk-new"}}})
+        assert resp.status_code == 200, resp.text
+        assert "sk-" not in resp.text
+        built.clear()
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth 2"}).status_code == 200
+        assert ("openai", "http://h.example", "sk-new") in built, built
+        assert all(key != "sk-old" for _kind, _url, key in built), built
+        built.clear()                                   # 指纹已对上：不再重建
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth 3"}).status_code == 200
+        assert built == []
+
+
+def test_removed_key_makes_an_open_world_refuse_like_an_unconfigured_role(tmp_path, monkeypatch):
+    """p 的密钥被删掉（地址不变）：w1 下一次 remember 按「没有密钥」重建，抽取为 None，回 409 llm_not_configured，
+    不再用旧密钥。"""
+    built: list = []
+    cfg, client = _recording_client(tmp_path, monkeypatch, built,
+                                    {"provider": "openai", "model": "m1",
+                                     "base_url": "http://h.example", "api_key": "sk-old"})
+    with client:
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+        built.clear()
+        cfg.providers["p"].pop("api_key")              # POST /api/config 的空密钥是「保留」，这里直接删
+        resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 2"})
+        assert (resp.status_code, resp.json()) == (409, {"detail": "llm_not_configured"}), resp.text
+        assert built == []
+        with _pool(client).lease("w1", build=False) as eng:
+            assert eng.llm is None
+        eng = None

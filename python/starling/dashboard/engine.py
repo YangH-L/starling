@@ -30,6 +30,7 @@ RLock → supervisor-mutex; NEVER the reverse.
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -241,6 +242,14 @@ class SessionSnapshotDeferred(Exception):
     不计重试次数，下一轮再来。快照失败不抛这个（照常摄入，只记录失败）。"""
 
 
+def _key_fingerprint(api_key: str | None) -> str | None:
+    """密钥的 sha256 十六进制摘要（裁定 R52），没有密钥时 None。只在引擎内存里比较用：不记日志、不进注册表、
+    不进 HTTP 响应。"""
+    if not api_key:
+        return None
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
 def endpoint_api_key(endpoint: dict, providers: dict) -> str | None:
     """一个世界 endpoint 调用时用的密钥（spec §8.3）：provider_name 非空时取 providers 里该 provider 当前
     保存的密钥，为空（客户端显式给的端点）时取服务进程的 OPENAI_API_KEY。引擎建适配器与世界详情的
@@ -305,6 +314,9 @@ class DashboardEngine:
         # 直接 eng.llm = fake，或角色没有 endpoint）。用到适配器之前核对的是这个，不是 _settings 里的：设置
         # 被换了却没重建适配器时，按旧 endpoint 建的适配器（带着密钥指着旧地址）不能被新设置的核对放行。
         self._built_endpoints: dict[str, dict | None] = {}
+        # 裁定 R52：每个角色的适配器建时用的密钥的指纹（_key_fingerprint）。与 _built_endpoints 同时记、同时丢。
+        # 地址核对通过之后再比 provider 此刻的密钥指纹，不同（换了密钥、删了密钥、新加了密钥）就重建该角色。
+        self._built_key_fps: dict[str, str | None] = {}
         rt = _runtime._build_local_store_sqlite_runtime(Path(ctx.db_path))
         try:
             rt.start()
@@ -436,6 +448,20 @@ class DashboardEngine:
             self._rebuild_role(role)
             return
         self._check_endpoint(self._built_endpoints.get(role, ep), role)
+        # 裁定 R52（spec §8.3「调用时用该 provider 当前保存的密钥」）：地址没变，但密钥换了或删了，就按当前密钥重建。
+        # 删了密钥时重建出来的是 None（嵌入是占位），调用方照常报 llm_not_configured。
+        if self._key_stale(role):
+            self._rebuild_role(role)
+
+    def _key_stale(self, role: str) -> bool:
+        """role 的适配器建时的密钥指纹与 provider 此刻的密钥指纹不同（裁定 R52）。不是从设置建的适配器（测试替身）
+        没有记录，永不算过期。"""
+        if role not in self._built_key_fps:
+            return False
+        ep = self._source_endpoint(role)
+        # 与 _endpoint_cfg 同一取法：没有 endpoint 的角色不带密钥（不取服务进程的 OPENAI_API_KEY）。
+        current = endpoint_api_key(ep, self._providers) if ep else None
+        return self._built_key_fps[role] != _key_fingerprint(current)
 
     def _rebuild_role(self, role: str) -> None:
         """按 _settings 重建 role 的适配器（持 self._lock，地址已核对过）。chat 跟着重建：它可能回退到抽取的
@@ -462,7 +488,8 @@ class DashboardEngine:
         attr = {"extraction": "llm", "chat": "chat_llm", "consolidation": "consolidation_llm"}[role]
         stale = role in self._built_endpoints and \
             self._built_endpoints[role] != self._source_endpoint(role)
-        if stale or getattr(self._core, attr) is not None:
+        # 密钥指纹变了（裁定 R52）也要走一遍：没有适配器、provider 刚加上密钥时，按新密钥建出来。
+        if stale or getattr(self._core, attr) is not None or self._key_stale(role):
             self._require_endpoint_unchanged(role)
         return getattr(self._core, attr)
 
@@ -471,7 +498,7 @@ class DashboardEngine:
         请求，不核对；但设置已换成另一个 endpoint 时照样按新设置核对并重建（裁定 R41）。"""
         stale = ("embedding" in self._built_endpoints
                  and self._built_endpoints["embedding"] != self._settings.get("embedding"))
-        if self._embedder_live or stale:
+        if self._embedder_live or stale or self._key_stale("embedding"):
             self._require_endpoint_unchanged("embedding")
 
     def set_world_settings(self, settings: dict) -> None:
@@ -551,16 +578,19 @@ class DashboardEngine:
         with self._lock:
             self._core.llm = value
             self._built_endpoints.pop("extraction", None)
+            self._built_key_fps.pop("extraction", None)
 
-    def _record_built(self, role: str) -> None:
-        """记下 role 的适配器刚按哪个 endpoint 建（_source_endpoint 的此刻值），见 _built_endpoints。"""
+    def _record_built(self, role: str, cfg: dict) -> None:
+        """记下 role 的适配器刚按哪个 endpoint 建（_source_endpoint 的此刻值，见 _built_endpoints）与建时用的密钥的
+        指纹（cfg 的 api_key，见 _built_key_fps）。"""
         self._built_endpoints[role] = self._source_endpoint(role)
+        self._built_key_fps[role] = _key_fingerprint(cfg.get("api_key"))
 
     def set_llm(self, llm_cfg: dict) -> None:
         with self._lock:
             self._core.llm = (_build_chat_adapter(llm_cfg)
                               if llm_cfg.get("api_key") else None)
-            self._record_built("extraction")
+            self._record_built("extraction", llm_cfg)
 
     def set_chat(self, chat_cfg: dict) -> None:
         """Build the chat-role adapter (converse). Unbound chat falls back to
@@ -569,7 +599,7 @@ class DashboardEngine:
         with self._lock:
             self._core.chat_llm = (_build_chat_adapter(chat_cfg)
                                    if chat_cfg.get("api_key") else None)
-            self._record_built("chat")                 # 没绑 chat 时记下的是抽取的 endpoint
+            self._record_built("chat", chat_cfg)       # 没绑 chat 时记下的是抽取的 endpoint
 
     def set_consolidation(self, cons_cfg: dict) -> None:
         """#38-C: build the consolidation-role adapter that judges NORM gists in
@@ -579,7 +609,7 @@ class DashboardEngine:
         with self._lock:
             self._core.consolidation_llm = (_build_chat_adapter(cons_cfg)
                                             if cons_cfg.get("api_key") else None)
-            self._record_built("consolidation")
+            self._record_built("consolidation", cons_cfg)
 
     def set_gist_thresholds(self, thresholds: dict) -> None:
         """#38-C v2 threshold surface: override the NORM-gist K / T / confidence floor /
@@ -611,7 +641,7 @@ class DashboardEngine:
             emb = (_build_embed_adapter(emb_cfg) if emb_cfg.get("api_key")
                    else _core.StubEmbeddingAdapter(8))
             self._core.set_embedder(emb)
-            self._record_built("embedding")
+            self._record_built("embedding", emb_cfg)
             if reembed:
                 return self._reembed()
         return None
