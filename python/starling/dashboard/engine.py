@@ -124,6 +124,16 @@ def _now_iso() -> str:
 logger = logging.getLogger(__name__)
 
 
+def _dead_letter_text(exc: BaseException) -> str:
+    """摄入 job 进 failed/ 时 .error 旁车写的文本。endpoint_changed 只写码（裁定 R54，spec §16：不留地址）；
+    其余照旧写异常文本的前 1000 个字符。"""
+    if isinstance(exc, _core.WorldStoreError):
+        code = _core.world_store_error_code(exc)
+        if code == "endpoint_changed":
+            return code
+    return str(exc)[:1000]
+
+
 def _tick_did_work(stats: dict) -> bool:
     """tick 这一轮有没有做事。stage_timings_ms 总在（9 项）、DEGRADED 时 stages_skipped 非空，两者都不算
     （否则每个空闲的 DEGRADED 轮都会误发心跳，3b L8）。"""
@@ -287,6 +297,10 @@ class DashboardEngine:
         # 写方法成功之后调用一次（WorldPool 设置，用于统计去抖广播）。在引擎锁之外调用。
         self.on_commit = None
         self._embedder_live = False             # rebuild_embedder 设置
+        # 裁定 R54：最近一次 tick 的嵌入端点是否被拒（endpoint_changed → 只跳过嵌入阶段），与后台循环上次记日志时
+        # 的状态。只在 tick（持 self._lock）里写；后台循环按两者是否不同决定记不记一次日志。
+        self.embedding_refused = False
+        self._embedding_refusal_logged = False
         # 裁定 R41：每个角色的适配器是按哪个 endpoint 建的（建与重建时记下；None = 不是从设置建的，例如测试
         # 直接 eng.llm = fake，或角色没有 endpoint）。用到适配器之前核对的是这个，不是 _settings 里的：设置
         # 被换了却没重建适配器时，按旧 endpoint 建的适配器（带着密钥指着旧地址）不能被新设置的核对放行。
@@ -954,14 +968,44 @@ class DashboardEngine:
                                      holder=holder)
 
     def tick(self, now: str) -> dict:
-        """后台维护一轮。嵌入阶段走 embedding 端点，先核对继承来的地址（占位嵌入不核对）。做了事（任一计数非零）
-        就通知一次 on_commit（与 _loop 的 did_work 同一判据）。"""
+        """后台维护一轮。嵌入阶段走 embedding 端点，先核对继承来的地址（占位嵌入不核对）。核对不过
+        （endpoint_changed，裁定 R54）只跳过嵌入阶段（C++ tick_all 的 skip_embed，stages_skipped 记 "embed"），
+        承诺触发、grounding、回放、投影、出箱照常跑；是否被拒记在 embedding_refused（后台循环据此按状态变化记一次
+        日志）。做了事（任一计数非零）就通知一次 on_commit（与 _loop 的 did_work 同一判据）。"""
         with self._lock:
-            self._require_embedding_unchanged()
-            stats = self._core.tick(now)
+            skip_embed = not self._embedding_usable()
+            stats = self._core.tick(now, skip_embed=skip_embed)
         if _tick_did_work(stats):
             self._notify_commit()
         return stats
+
+    def _embedding_usable(self) -> bool:
+        """持 self._lock。嵌入端点此刻能不能用：_require_embedding_unchanged 抛 endpoint_changed → False，其余照常
+        抛出。结果记在 embedding_refused。"""
+        try:
+            self._require_embedding_unchanged()
+        except _core.WorldStoreError as exc:
+            if _core.world_store_error_code(exc) != "endpoint_changed":
+                raise
+            self.embedding_refused = True
+            return False
+        self.embedding_refused = False
+        return True
+
+    def _log_embedding_state(self) -> None:
+        """后台循环每轮 tick 之后调：embedding_refused 与上次记日志时不同才记一次（变为被拒记 warning，恢复记
+        info），不逐轮记。只点名世界，不带地址与密钥（spec §16）。"""
+        refused = self.embedding_refused
+        if refused == self._embedding_refusal_logged:
+            return
+        self._embedding_refusal_logged = refused
+        if refused:
+            logger.warning("world %s: embedding endpoint changed (endpoint_changed); background "
+                           "embedding is paused until the endpoint is re-confirmed, other "
+                           "maintenance continues", self._ctx.name)
+        else:
+            logger.info("world %s: embedding endpoint usable again; background embedding resumed",
+                        self._ctx.name)
 
     def forget(self, ids, *, now=None) -> dict:
         with self._lock:
@@ -1134,6 +1178,8 @@ class DashboardEngine:
                 except Exception:  # noqa: BLE001 — 保活:单轮失败不终结调度
                     logger.exception("background tick failed")
                     continue
+                # 裁定 R54：嵌入端点被拒只跳过嵌入阶段（tick 不抛），按状态变化记一次日志，不逐轮记。
+                self._log_embedding_state()
                 # stage_timings_ms is always present (9 entries) and stages_skipped is
                 # non-empty under DEGRADED — exclude both from the work-check, else
                 # every idle DEGRADED tick spuriously fires a WS heartbeat (3b L8).
@@ -1410,7 +1456,7 @@ class DashboardEngine:
                 return self._requeue_unless_cleared(claimed, job_path, generation, job)
             (sp / "failed").mkdir(exist_ok=True)
             claimed.rename(sp / "failed" / job_path.name)
-            (sp / "failed" / (job_path.name + ".error")).write_text(str(exc)[:1000])
+            (sp / "failed" / (job_path.name + ".error")).write_text(_dead_letter_text(exc))
             return "done"
 
     def start_ingest_worker(self, poll_interval_s: float = 2.0) -> None:

@@ -82,8 +82,7 @@ py::dict record_out(const gov::WorldRecord& rec) {
 gov::ProviderEndpoint provider_endpoint_in(const py::handle& obj) {
     const auto dict = py::reinterpret_borrow<py::dict>(obj);
     const auto field = [&dict](const char* key) {
-        if (!dict.contains(key)) { return std::string(); }
-        const py::object val = dict[key];
+        const py::object val = dict.attr("get")(key);
         return val.is_none() ? std::string() : val.cast<std::string>();
     };
     return gov::ProviderEndpoint{.provider = field("provider"), .base_url = field("base_url")};

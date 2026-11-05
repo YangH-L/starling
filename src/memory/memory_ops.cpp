@@ -681,7 +681,8 @@ TickOutcome tick_all(persistence::SqliteAdapter& adapter,
                      embedding::EmbeddingWorker& worker,
                      prospective::PolicyEngine& policy,
                      std::string_view now_iso,
-                     RuntimeHealth health) {
+                     RuntimeHealth health,
+                     bool skip_embed) {
     auto& conn = adapter.connection();
     TickOutcome t;
 
@@ -698,7 +699,8 @@ TickOutcome tick_all(persistence::SqliteAdapter& adapter,
 
     // P3.c LW.2: gate each stage through the load-shedding policy. Skipped stages
     // record their label in stages_skipped instead of running (LOCKED L8/OQ-LW.6).
-    if (governance::should_run_stage(governance::TickStage::Embed, health)) {
+    // skip_embed(裁定 R54):嵌入端点不可用时只跳过这一段,同一个 "embed" 标签。
+    if (!skip_embed && governance::should_run_stage(governance::TickStage::Embed, health)) {
         governance::StageTimer timer("embed", sink);
         t.embedded = worker.tick_one_batch(conn, now_iso).embedded;
     } else {

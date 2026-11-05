@@ -179,11 +179,14 @@ def test_inherited_endpoint_change_refuses_every_call_that_uses_it(tmp_path, mon
                            emb_providers)
     assert isinstance(eng2.recall("auth"), list)
     emb_providers["p"]["base_url"] = "http://b"
-    for call in (lambda: eng2.recall("auth"), lambda: eng2.tick("2026-11-04T00:00:00Z"),
-                 lambda: eng2.working_set("Alice")):
+    for call in (lambda: eng2.recall("auth"), lambda: eng2.working_set("Alice")):
         with pytest.raises(_core.WorldStoreError) as ei:
             call()
         assert _core.world_store_error_code(ei.value) == "endpoint_changed"
+    # tick 不抛，只跳过嵌入阶段（裁定 R54），其余阶段照常。
+    stats = eng2.tick("2026-11-04T00:00:00Z")
+    assert stats["stages_skipped"] == ["embed"] and stats["embedded"] == 0
+    assert eng2.embedding_refused is True
 
 
 def test_endpoint_change_is_not_checked_when_no_adapter_would_send_a_key(tmp_path):
@@ -443,3 +446,113 @@ def test_role_switched_from_unbound_to_a_keyed_endpoint_is_built_on_next_use(tmp
     assert built == []
     eng.close()
     eng2.close()
+
+
+# ───────────────────────── 裁定 R54：嵌入端点被拒只跳过嵌入阶段；日志按状态变化记一次、不带地址 ─────────────────────────
+
+def _seed_due_commitment(db: str, tenant: str) -> None:
+    """建表（一次性 runtime，引擎打开之前释放），再直插一个 ACTIVE 承诺与一个已到期的 time 触发器。"""
+    import sqlite3
+    from pathlib import Path
+    from starling import runtime as rt
+    runtime = rt._build_local_store_sqlite_runtime(Path(db))
+    runtime.start()
+    del runtime
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("INSERT INTO commitments(tenant_id, stmt_id, state, broken_count, deadline, "
+                     "created_at, updated_at) VALUES(?,?,?,0,?,?,?)",
+                     (tenant, "c1", "ACTIVE", "2099-01-01T00:00:00Z",
+                      "2026-11-01T00:00:00Z", "2026-11-01T00:00:00Z"))
+        conn.execute("INSERT INTO commitment_triggers(id, commitment_stmt_id, tenant_id, kind, "
+                     "spec_json, status, created_at) VALUES('t1','c1',?,'time',?,'armed',?)",
+                     (tenant, '{"at":"2026-11-02T00:00:00Z"}', "2026-11-01T00:00:00Z"))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _stale_embedding_engine(tmp_path, monkeypatch):
+    import starling.dashboard.engine as engmod
+    monkeypatch.setattr(engmod, "_build_embed_adapter", lambda cfg: _core.StubEmbeddingAdapter(8))
+    providers = {"p": {"provider": "openai", "model": "e", "base_url": "http://old.example",
+                       "api_key": "sk-emb-secret"}}
+    emb = {"provider": "openai", "provider_name": "p", "base_url": "http://old.example",
+           "model": "e", "dim": 8}
+    db = str(tmp_path / "w1.db")
+    _seed_due_commitment(db, "w1")
+    eng = DashboardEngine(_ctx(tmp_path, {"embedding": emb}), providers)
+    providers["p"]["base_url"] = "http://new.example"          # p 挪了；w1 记的还是旧地址
+    return eng, providers
+
+
+def test_stale_embedding_endpoint_still_fires_commitments(tmp_path, monkeypatch):
+    eng, _providers = _stale_embedding_engine(tmp_path, monkeypatch)
+    try:
+        stats = eng.tick("2026-11-04T00:00:00Z")
+        assert stats["fired"] == 1                              # 承诺照常触发
+        assert stats["stages_skipped"] == ["embed"]
+        assert "embed" not in {t["stage"] for t in stats["stage_timings_ms"]}
+        assert {"policy", "outbox"} <= {t["stage"] for t in stats["stage_timings_ms"]}
+    finally:
+        eng.close()
+
+
+def test_background_loop_logs_an_endpoint_refusal_once_per_state_change(tmp_path, monkeypatch,
+                                                                         caplog):
+    """后台循环跑若干轮：变为被拒时记一次 warning，恢复时记一次 info，中间不逐轮记；日志里没有地址与密钥。"""
+    import logging
+    import threading
+    eng, providers = _stale_embedding_engine(tmp_path, monkeypatch)
+    rounds = threading.Semaphore(0)
+    real_tick = eng.tick
+
+    def counting_tick(now):
+        try:
+            return real_tick(now)
+        finally:
+            rounds.release()
+    eng.tick = counting_tick
+    caplog.set_level(logging.INFO, logger="starling.dashboard.engine")
+    try:
+        eng.start_background_tick(0.02)
+        for _ in range(5):
+            assert rounds.acquire(timeout=10)
+        providers["p"]["base_url"] = "http://old.example"     # 地址改回来：恢复
+        for _ in range(6):                                     # 至少一轮看到恢复后的状态
+            assert rounds.acquire(timeout=10)
+        eng.stop_background_tick()
+    finally:
+        eng.close()
+    records = [r for r in caplog.records if r.name == "starling.dashboard.engine"
+               and "embedding endpoint" in r.getMessage()]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.INFO], \
+        [(r.levelname, r.getMessage()) for r in records]
+    text = caplog.text
+    assert "example" not in text and "sk-emb-secret" not in text
+    assert "background tick failed" not in text
+
+
+def test_ingest_dead_letter_for_endpoint_changed_writes_only_the_code(tmp_path, monkeypatch):
+    import json
+    providers = {"p": {"provider": "openai", "model": "m", "base_url": "http://old.example",
+                       "api_key": "sk-secret"}}
+    ep = {"provider": "openai", "provider_name": "p", "base_url": "http://old.example", "model": "m"}
+    eng = DashboardEngine(_ctx(tmp_path, {"extraction": ep}), providers)
+    try:
+        eng.llm = _fake()
+        eng._ingest_max_attempts = 1
+        providers["p"]["base_url"] = "http://new.example"
+        spool = tmp_path / "spool" / "world-abc123"
+        spool.mkdir(parents=True, exist_ok=True)
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text(json.dumps(
+            {"type": "user", "message": {"role": "user", "content": "Bob owns auth"}}))
+        (spool / "s1.json").write_text(json.dumps(
+            {"session_id": "s1", "transcript_path": str(transcript), "cwd": "/proj/foo",
+             "tenant": "w1"}))
+        assert eng._ingest_drain_once() == "done"
+        error = (spool / "failed" / "s1.json.error").read_text()
+        assert error == "endpoint_changed"
+    finally:
+        eng.close()

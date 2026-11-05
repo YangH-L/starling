@@ -999,7 +999,7 @@ def test_settings_swapped_without_rebuild_never_leave_an_adapter_built_elsewhere
     重建适配器（例如 set_auto_snapshot 落在 update_settings 与 apply_world_settings 之间，apply 看不出变化）。
     下一次用到嵌入时，核对的是适配器建时的 endpoint，不是 _settings 里的；两者不同就先按 _settings 核对并重建。
     这里直接造出这种状态：引擎的嵌入适配器建在客户端地址、带着 p 的密钥（R40 之前的建世界窗口能造出来），
-    然后把 _settings 换成 p 的真实地址。tick 要么 409，要么 200 且嵌入适配器已按 p 的真实地址重建；
+    然后把 _settings 换成 p 的真实地址。tick 200，嵌入适配器已按 p 的真实地址重建；
     之后不再用建在客户端地址的那个。"""
     built: list = []
     cfg, client = _window_client(tmp_path, monkeypatch, built)
@@ -1021,13 +1021,12 @@ def test_settings_swapped_without_rebuild_never_leave_an_adapter_built_elsewhere
         uses: list = []
         real_tick = _core_tick_spy(monkeypatch, pool, uses)
         resp = client.post("/api/w/w1/tick", json={})
-        assert resp.status_code in (200, 409), resp.text
-        if resp.status_code == 409:
-            assert resp.json() == {"detail": "endpoint_changed"}
-            assert uses == []
-        else:
-            assert built and built[0] == ("http://h.example", "sk-secret-123"), built
-            assert uses and all(url == "http://h.example" for url in uses), uses
+        # 裁定 R54：tick 不因嵌入端点被拒而 409，只跳过嵌入阶段。这里 _settings 的地址是 p 的真实地址，核对通过，
+        # 所以嵌入适配器按它重建、嵌入阶段照常跑，不再用建在客户端地址的那个。
+        assert resp.status_code == 200, resp.text
+        assert "embed" not in resp.json()["stages_skipped"]
+        assert built and built[0] == ("http://h.example", "sk-secret-123"), built
+        assert uses and all(url == "http://h.example" for url in uses), uses
         del real_tick
 
 
@@ -1036,12 +1035,13 @@ def _core_tick_spy(monkeypatch, pool, uses: list):
     from starling.dashboard import engine as engmod
     real = engmod.MemoryCore.tick
 
-    def _spy(self, now):
+    def _spy(self, now, **kwargs):
         with pool.lease("w1", build=False) as eng:
             built = getattr(eng, "_built_endpoints", {}).get("embedding") or {}
-            uses.append(built.get("base_url"))
+            if not kwargs.get("skip_embed"):          # 跳过嵌入阶段的一轮不用嵌入适配器（裁定 R54）
+                uses.append(built.get("base_url"))
         eng = None
-        return real(self, now)
+        return real(self, now, **kwargs)
     monkeypatch.setattr(engmod.MemoryCore, "tick", _spy)
     return real
 
