@@ -12,15 +12,26 @@
 abandon_event: key 'ep1#3@pa' is recorded under holder(s) pa, not 'world'
 ```
 
-rise 要改的地方是 `src/actio/memory_starling.py:477-483` 的 `abandon_event`：改成以事件的 holder 开连接（`agent=holder`）再放弃。holder 可以取 `pending_events()` 里那一项的 `holder`。rise 的 key 本来就带 `@holder`（`src/actio/instance.py:209`），两个 holder 的 key 从不相同，所以下面的认领规则在 rise 自己的数据上用不到。
+rise 的 key 有两种。轮次的 key 是 `{episode_id}#{turn_index}@{holder}`，带 holder（`src/actio/instance.py:209`）。准入的 key 是 `{proposal_id}#{k}`，不带 holder（`src/mindagent/admit.py:102`）。
 
-认领规则：0039 回填不出主人的旧行 holder 是 `''`，第一个对它调 `remember_event` 或 `abandon_event` 的 holder 会把它认领过去。所以对这种行，用 `"world"` 放弃不会报错，而是把它记到 `world` 名下。这种行的 `PendingEvent.holder` 是 `''`，rise 要按 key 里的 `@holder` 去放弃。
+rise 要把端口改成 `abandon_event(world_id, holder, key)`，由调用方给 holder；`src/actio/memory_starling.py:477-482` 改成以 `agent=holder` 开连接再放弃。各调用处：
+
+- `src/mindagent/admit.py:205` 与 `:210` 传 `pid`，它们手里本来就有。
+- `src/mindagent/deployment.py:457` 传这一项的 `PendingEvent.holder`；holder 是 `''` 时（见下面的无主旧行）取 key 里的 `@holder`。为此 rise 端口的 `pending_events`（`memory_starling.py:484-489`）要返回 `(key, holder)`，不能只返回 key。
+
+不能只靠 `pending_events()` 找 holder：它只列 pending 行，不是 pending 的 key 查不到主人。`admit.py:205` 放弃的正是一条已经放弃过的 key（已放弃是空操作），在 `pending_events()` 里找不到；退回 `"world"` 就抛 `KeyError`，记一次 T2，提案留在 approved，下一 tick 再走同一路径，一直循环。
+
+rise 的 `translate_failure`（`memory_starling.py:79-94`）只留异常类名，所以点名主人的那条消息到不了 rise 的日志；要看到它，rise 得把消息留下来。
+
+认领规则：0039 回填不出主人的旧行 holder 是 `''`，从 0038 升级上来的库里会有这种行。第一个对它调 `remember_event` 或 `abandon_event` 的 holder 会把它认领过去。所以对 pending 或 abandoned 的 `''` 行，用 `"world"` 放弃不会报错，而是把行记到 `world` 名下；之后真正的主人对同一个 key 调 `remember_event`，会另开一行，这个 key 又能写了。零语句的 committed `''` 行放弃时照样抛 `EventConflict`，认领随之回滚。
 
 holder 不能为空：对空 holder 调 `remember_event` 或 `abandon_event` 抛 `ValueError`，库里不写任何东西。`''` 只留给上面说的无主旧行。
 
-**`pending_events()` 返回整个世界的 pending 事件。** 每个 holder 的都在里面，每项多一个 `holder` 字段，原有字段不变。rise 的 `pending_events`（同一文件 484-489 行）只读 `.key`，照常可用。
+**`pending_events()` 返回整个世界的 pending 事件。** 每个 holder 的都在里面，每项多一个 `holder` 字段，原有字段不变。rise 端口的 `pending_events`（同一文件 484-489 行）今天只取 `.key`，按上面的改法要连 `holder` 一起返回。
 
 **升级 Starling 的锁定版本会改一次摘要。** 进程内 `Memory.open` 第一次打开库时会把它迁到 0039。种子库原地不改，但 `library_digest` 在副本上打开、副本照样迁移，算出的摘要也是 0039 之后的。新增的 `holder_id` 列进摘要，所以库里有 pending 或 committed 事件行的，摘要会变一次；含库摘要的训练 `config_hash` 也跟着变一次。没有事件行的库摘要不变；事件行全是 abandoned 的也不变，因为摘要对 abandoned 行只记 key 和状态。另有一种情况会再变一次：回填成 `''` 的 pending 行和零语句的 committed 行，被某个 holder 认领时 `holder_id` 改了，摘要也跟着变。
+
+库迁到 0039 之后，别再用 0038 的旧锁定版本打开它。旧代码打开时不报错，但它按 `(tenant, key)` 读 `events`，会随便拿到某个 holder 的行；放弃时也会把所有 holder 同 key 的 pending 行一起改掉。
 
 **已知残留。** 两处都只在写入时开着 `attribute_first_order_mental_to_holder` 时才会出错。这个策略默认关闭，没有哪份配置打开它。
 
