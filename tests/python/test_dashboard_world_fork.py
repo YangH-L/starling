@@ -197,6 +197,24 @@ def test_fork_of_default_world_with_foreign_tenant_rows_is_409(client):
     assert "rollout-1" not in _rows(client)
     assert (set(os.listdir(worlds_root)) if os.path.isdir(worlds_root) else set()) == dirs
 
+
+def test_fork_of_a_zvec_source_is_409_unsupported_backend(client):
+    """裁定 R31 M4：分叉把来源世界的向量后端（与快照路由同一取法）交给 C++，非 sqlite 回 409
+    snapshot_unsupported_backend（与快照同一规则），什么都不登记。"""
+    pool = _pool(client)
+    assert client.post("/api/remember", json={"text": "Bob owns auth"}).status_code == 200
+    pool._config.vector_backend = "zvec"
+    try:
+        resp = client.post("/api/worlds/default/fork", json={"new_name": "rollout-1"})
+        assert (resp.status_code, resp.json()["detail"]) == (409, "snapshot_unsupported_backend")
+        assert client.post("/api/worlds/default/snapshots", json={}).json()["detail"] == \
+            "snapshot_unsupported_backend"
+    finally:
+        pool._config.vector_backend = "sqlite"
+    assert "rollout-1" not in _rows(client)
+    assert _fork(client, "default", "rollout-1")["world"]["name"] == "rollout-1"
+
+
 def test_fork_of_schema_behind_source_is_409(client):
     pool = _pool(client)
     src = _source_with_content(client)

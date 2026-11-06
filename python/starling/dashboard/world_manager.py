@@ -1040,7 +1040,9 @@ class WorldPool:
         opts = {"labels": dict(labels or {}), "retention_group": retention_group or "",
                 "reclaimable": bool(reclaimable), "seed": bool(seed), "settings": settings,
                 "now": self._clock(),
-                "provider_endpoints": self._provider_endpoints() if settings else None}
+                "provider_endpoints": self._provider_endpoints() if settings else None,
+                # 裁定 R31 M4：来源的向量后端（与快照路由同一取法），是否支持由 C++ 判。
+                "vector_backend": self._vector_backend(source)}
         if snapshot_id:
             return _core.world_fork(reg, source, new_name, {**opts, "snapshot_id": snapshot_id})
         rec = self._record(source)                    # world_not_found：未知世界名不建世界锁

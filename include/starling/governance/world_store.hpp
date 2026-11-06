@@ -44,7 +44,8 @@ private:
 //           | invalid_snapshot_kind（take_snapshot：kind 不是 manual / auto，或 kind 与 reason 不配对）
 //           | world_tenant_mismatch（verify_world_tenant：库里有别的租户的行；fork_world / fork_world_from_connection /
 //             upgrade_seed：复制出来的库里有别的租户的行，裁定 R29）
-//           | snapshot_unsupported_backend（take_snapshot / rollback_world：vector_backend 不是 sqlite）
+//           | snapshot_unsupported_backend（take_snapshot / rollback_world / fork_world / fork_world_from_connection：
+//             vector_backend 不是 sqlite）
 //           | snapshot_corrupt（rollback_world：快照文件缺失、打不开或 integrity_check 不过）
 //           | world_in_use（rollback_world：第 8 步的探测发现别的连接开着要被替换的库。WAL 库上
 //             读过库的闲置连接与开着的读事务都看得见；delete 模式的库（恢复出来、引擎还没打开
@@ -530,6 +531,9 @@ struct ForkOptions {
     bool reclaimable = false, seed = false;        // seed 蕴含 read_only
     std::string settings_overrides_json;           // 空 = 复制来源的设置
     std::string now_iso;                           // 调用方给的时刻，记作新世界的 created_at
+    // 来源的向量后端（裁定 R31 M4）：只有 "sqlite" 的向量在库文件里，其余（zvec）复制出来的世界缺向量，抛
+    // snapshot_unsupported_backend（与快照、回滚同一个判定函数），在任何文件 I/O 之前。
+    std::string vector_backend = "sqlite";
     // 客户端写设置时的 provider 地址表（裁定 R31 M3，同 RegistryDb::create_world）：给出时在登记的那次持锁内核对合并后
     // 设置里继承来的 endpoint，endpoint_changed 时不留文件、不登记。nullopt：不核对。
     std::optional<ProviderEndpoints> provider_endpoints;
@@ -547,7 +551,8 @@ struct ForkResult {
 // （spec §6.1）。opts.snapshot_id 必须为空（以快照为来源用 fork_world：快照文件建好之后不再写），否则抛
 // std::invalid_argument。顺序：
 //   1. new_name 不合规则 invalid_world_name；已被占用 world_exists；来源不存在 world_not_found；
-//      validate_world(来源)（registry_corrupt 等）；opts.settings_overrides_json 合并到来源的设置上
+//      validate_world(来源)（registry_corrupt 等）；opts.vector_backend 不是 "sqlite" → snapshot_unsupported_backend
+//      （裁定 R31 M4）；opts.settings_overrides_json 合并到来源的设置上
 //      （merge_settings，非法时 invalid_settings 等）。都在任何文件 I/O 之前。
 //   2. 来源 schema_migrations 的最高版本（表不存在算 0）低于 MigrationRunner::latest_embedded_version()
 //      → world_schema_behind。不在来源上跑迁移，来源字节不变。

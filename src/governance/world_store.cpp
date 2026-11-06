@@ -709,6 +709,16 @@ std::string digest_of_file(const fs::path& db_file, const std::string& tenant) {
     return digest_or_empty(conn, tenant);
 }
 
+// 向量在库文件之外的后端（zvec）拍出来的快照、复制出来的世界缺向量，不是完整的世界（spec §12）。快照、回滚、
+// 分叉共用这一个判定（裁定 R31 M4）。
+void require_sqlite_vectors(const std::string& vector_backend) {
+    if (vector_backend != "sqlite") {
+        throw WorldStoreError("snapshot_unsupported_backend",
+                              "vector_backend '" + vector_backend + "' keeps vectors "
+                              "outside the database file");
+    }
+}
+
 void require_valid_auto_snapshot(const AutoSnapshotConfig& config) {
     if (!interval_in_range(config.interval_hours)) {
         throw WorldStoreError("invalid_auto_snapshot",
@@ -908,11 +918,7 @@ SnapshotEntry take_snapshot(RegistryDb& reg, const std::string& world,
                               "now_iso is not YYYY-MM-DDTHH:MM:SSZ: '" + opts.now_iso + "'");
     }
     // 向量在库文件之外的后端（zvec）拍出来的快照缺向量，不是完整的世界（spec §12）。
-    if (opts.vector_backend != "sqlite") {
-        throw WorldStoreError("snapshot_unsupported_backend",
-                              "vector_backend '" + opts.vector_backend + "' keeps vectors "
-                              "outside the database file");
-    }
+    require_sqlite_vectors(opts.vector_backend);
     require_valid_retention(reg.snapshot_retention());
     // 裁定 R12：写文件、清扫残留之前先查这个世界的注册表行与布局（snapshot_dir 被手改到世界目录之外、
     // snapshots/ 外链时拒绝，清扫与 VACUUM INTO 都不会落到外部）。只读：仍在任何文件 I/O 之前。
@@ -1450,11 +1456,7 @@ RollbackTarget check_rollback_target(const RegistryDb& reg, const std::string& w
                               "world '" + world + "' is read-only and cannot be restored");
     }
     target.snap = registered_snapshot(reg, world, snapshot_id);
-    if (opts.vector_backend != "sqlite") {
-        throw WorldStoreError("snapshot_unsupported_backend",
-                              "vector_backend '" + opts.vector_backend + "' keeps vectors "
-                              "outside the database file");
-    }
+    require_sqlite_vectors(opts.vector_backend);
     // 2–3. 快照文件解析符号链接后必须仍在该世界的 snapshot_dir 之下，且是普通文件。
     require_inside_registry(target.entry.snapshot_dir, target.snap.path);
     require_snapshot_file(target.snap.path);
@@ -1970,6 +1972,7 @@ ForkPlan plan_fork(const RegistryDb& reg, const std::string& source, const std::
     ForkPlan plan;
     plan.source = reg.get(source);   // world_not_found
     validate_world(reg, source);
+    require_sqlite_vectors(opts.vector_backend);   // 裁定 R31 M4：与快照、回滚同一个判定
     plan.flags = WorldFlags{.seed = opts.seed, .read_only = opts.seed,
                             .reclaimable = opts.reclaimable,
                             .retention_group = opts.retention_group, .fork_of_world = source,

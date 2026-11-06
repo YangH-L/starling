@@ -588,4 +588,35 @@ TEST(WorldFork, ProviderEndpointsAreCheckedAtRegistration) {
     (void)fork_world(reg, "deploy-1", "rollout-2", opts);
 }
 
+// 裁定 R31 M4：分叉看向量后端，非 sqlite 抛 snapshot_unsupported_backend（与快照同一规则、同一个判定函数），
+// 在任何文件 I/O 之前。
+TEST(WorldFork, NonSqliteVectorBackendIsRefusedBeforeAnyIo) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    const WorldRecord src = world_with_statements(reg, "deploy-1", 1);
+    const SnapshotEntry snap = take_snapshot(reg, "deploy-1", SnapshotOptions{});
+    const auto dirs = world_dirs(reg);
+    ForkOptions opts = fork_opts();
+    opts.vector_backend = "zvec";
+    EXPECT_EQ(code_of([&] { (void)fork_world(reg, "deploy-1", "rollout-1", opts); }),
+              "snapshot_unsupported_backend");
+    opts.snapshot_id = snap.id;
+    EXPECT_EQ(code_of([&] { (void)fork_world(reg, "deploy-1", "rollout-1", opts); }),
+              "snapshot_unsupported_backend");
+    opts.snapshot_id.clear();
+    {
+        auto writer = persistence::SqliteAdapter::open(src.db_path);
+        EXPECT_EQ(code_of([&] {
+                      (void)fork_world_from_connection(reg, writer->connection(), "deploy-1",
+                                                       "rollout-1", opts);
+                  }),
+                  "snapshot_unsupported_backend");
+        writer->close();
+    }
+    EXPECT_EQ(world_dirs(reg), dirs);
+    EXPECT_EQ(code_of([&] { (void)reg.get("rollout-1"); }), "world_not_found");
+    opts.vector_backend = "sqlite";
+    (void)fork_world(reg, "deploy-1", "rollout-1", opts);
+}
+
 }  // namespace starling::governance
