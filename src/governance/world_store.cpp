@@ -38,6 +38,11 @@ namespace fs = std::filesystem;
 WorldStoreError::WorldStoreError(std::string code, const std::string& detail)
     : std::runtime_error(code + ": " + detail), code_(std::move(code)) {}
 const std::string& WorldStoreError::code() const noexcept { return code_; }
+WorldStoreError WorldStoreError::after_replace(std::string code, const std::string& detail) {
+    WorldStoreError err(std::move(code), detail);
+    err.replaced_ = true;
+    return err;
+}
 
 bool is_valid_world_name(std::string_view name) {
     // 世界名：首字符字母或数字，其余字母、数字、'.'、'_'、'-'，长度 1–128。
@@ -1581,22 +1586,28 @@ RollbackResult rollback_world(const RegistryDb& reg, const std::string& world,
         result.archive_path = archived.string();
         result.restored_bytes = staged_bytes;
 
-        // 12. 库已替换。在恢复后的库上算摘要（缺表时空串，裁定 R10）；条目带 digest 时必须相等，
-        //     不等说明快照文件登记之后被改过（spec §7.2）。旧条目（digest 为空）不比较。
+        // 12. 库已替换：从这里起抛出的错误都带 replaced=true（裁定 R31 M5），码不变。在恢复后的库上算摘要（缺表时
+        //     空串，裁定 R10）；条目带 digest 时必须相等，不等说明快照文件登记之后被改过（spec §7.2）。旧条目（digest
+        //     为空）不比较。
+        const std::string restored = "restored " + db_file.string() + " from snapshot '" + snap.id + "'";
         try {
+            if (opts.after_replace_for_test) { opts.after_replace_for_test(); }
             result.digest = digest_of_file(db_file, entry.tenant);
+        } catch (const WorldStoreError& replaced_err) {
+            throw WorldStoreError::after_replace(replaced_err.code(), restored + ", but " +
+                                                                       replaced_err.what());
         } catch (const std::exception& digest_err) {
-            throw WorldStoreError("snapshot_failed", "restored " + db_file.string() +
-                                                         " from snapshot '" + snap.id +
-                                                         "', but cannot compute its digest: " +
-                                                         digest_err.what());
+            throw WorldStoreError::after_replace(
+                "snapshot_failed", restored + ", but cannot compute its digest: " + digest_err.what());
+        } catch (...) {
+            throw WorldStoreError::after_replace("snapshot_failed",
+                                                 restored + ", but cannot compute its digest");
         }
         if (!snap.digest.empty() && result.digest != snap.digest) {
-            throw WorldStoreError("restore_digest_mismatch",
-                                  "restored " + db_file.string() + " from snapshot '" + snap.id +
-                                      "', but its digest " + result.digest +
-                                      " differs from the recorded " + snap.digest +
-                                      ": the snapshot file was changed after it was taken");
+            throw WorldStoreError::after_replace(
+                "restore_digest_mismatch",
+                restored + ", but its digest " + result.digest + " differs from the recorded " +
+                    snap.digest + ": the snapshot file was changed after it was taken");
         }
     } catch (const WorldStoreError&) {
         std::error_code ignore;

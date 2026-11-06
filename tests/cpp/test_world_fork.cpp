@@ -619,4 +619,50 @@ TEST(WorldFork, NonSqliteVectorBackendIsRefusedBeforeAnyIo) {
     (void)fork_world(reg, "deploy-1", "rollout-1", opts);
 }
 
+// 裁定 R31 M5、R32：回滚在替换库之后失败时，C++ 用 WorldStoreError::replaced() 告诉调用方「库已替换」，错误码保持
+// 原样。替换之前的失败 replaced() 为 false。after_replace_for_test 在 rename 之后、算摘要之前调用。
+TEST(WorldRollback, ReplacedMarkerSaysWhetherTheLibraryWasSwapped) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    const WorldRecord src = world_with_statements(reg, "deploy-1", 2);
+    const SnapshotEntry snap = take_snapshot(reg, "deploy-1", SnapshotOptions{});
+    insert_statements(src.db_path, src.tenant, 10, 1);
+    const auto replaced_of = [&](const RollbackOptions& opts) {
+        try {
+            (void)rollback_world(reg, "deploy-1", snap.id, opts);
+        } catch (const WorldStoreError& err) {
+            return std::make_pair(err.code(), err.replaced());
+        }
+        return std::make_pair(std::string("<no throw>"), false);
+    };
+
+    // 替换之前失败（before_replace 抛）：库原样不动，replaced=false。
+    RollbackOptions before;
+    before.before_replace = [](const fs::path&) { throw std::runtime_error("injected before"); };
+    const std::string sha = file_sha256(src.db_path);
+    EXPECT_EQ(replaced_of(before), std::make_pair(std::string("snapshot_failed"), false));
+    EXPECT_EQ(file_sha256(src.db_path), sha);
+
+    // 替换之后失败（after_replace_for_test 抛）：码仍是 snapshot_failed，replaced=true，库已是快照的内容。
+    RollbackOptions after;
+    after.after_replace_for_test = [] { throw std::runtime_error("injected after"); };
+    EXPECT_EQ(replaced_of(after), std::make_pair(std::string("snapshot_failed"), true));
+    EXPECT_EQ(digest_of(src.db_path, src.tenant), snap.digest);
+
+    // restore_digest_mismatch 一定是 replaced=true。
+    insert_statements(src.db_path, src.tenant, 20, 1);
+    run_sql(snap.path, "UPDATE statements SET object_value='tampered' WHERE id='st-0'");
+    EXPECT_EQ(replaced_of(RollbackOptions{}),
+              std::make_pair(std::string("restore_digest_mismatch"), true));
+
+    // 别处抛的 WorldStoreError 默认 replaced=false。
+    try {
+        (void)reg.get("nope");
+        FAIL() << "expected world_not_found";
+    } catch (const WorldStoreError& err) {
+        EXPECT_EQ(err.code(), "world_not_found");
+        EXPECT_FALSE(err.replaced());
+    }
+}
+
 }  // namespace starling::governance

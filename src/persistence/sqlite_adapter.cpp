@@ -40,6 +40,10 @@ int SqliteAdapter::schema_version() const {
     return sqlite3_column_int(query.raw(), 0);
 }
 
+bool SqliteAdapter::schema_behind() const {
+    return schema_version() < MigrationRunner::latest_embedded_version();
+}
+
 Connection& SqliteAdapter::connection() {
     if (!conn_.is_open()) {
         throw std::logic_error("adapter closed");

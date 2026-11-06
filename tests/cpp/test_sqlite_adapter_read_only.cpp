@@ -133,6 +133,25 @@ TEST(SqliteAdapterReadOnly, OpenDoesNotMigrateOrChangeBytes) {
     expect_no_new_sidecars(sidecars_before, sidecars(db));
 }
 
+// 裁定 R31 M5：「schema 落后」的判定在 C++（schema_version() < latest_embedded_version()），绑定层不比较版本号。
+TEST(SqliteAdapterReadOnly, SchemaBehindIsDecidedInCpp) {
+    const TempDir dir;
+    const fs::path old_db = dir.path() / "old.db";
+    const fs::path new_db = dir.path() / "new.db";
+    (void)make_library(old_db, /*schema_behind=*/true);
+    (void)make_library(new_db, /*schema_behind=*/false);
+    auto old_reader = SqliteAdapter::open_read_only(old_db);
+    auto new_reader = SqliteAdapter::open_read_only(new_db);
+    EXPECT_TRUE(old_reader->schema_behind());
+    EXPECT_FALSE(new_reader->schema_behind());
+    old_reader->close();
+    EXPECT_THROW((void)old_reader->schema_behind(), std::logic_error);
+    new_reader->close();
+    auto writer = SqliteAdapter::open(old_db);   // 写路径打开会迁移到最新
+    EXPECT_FALSE(writer->schema_behind());
+    writer->close();
+}
+
 TEST(SqliteAdapterReadOnly, WritesAreRejected) {
     const TempDir dir;
     const fs::path db = dir.path() / "world.db";

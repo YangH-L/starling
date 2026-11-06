@@ -158,6 +158,9 @@ class WorldSwitchError(Exception):
     """code: "world_not_found" | "world_busy" | "world_protected" | "worlds_unavailable"
     | "world_open_failed" | "rollback_reopen_failed" """
 
+    # 恢复的出口：库已经换成快照的内容（裁定 R32），路由据此广播 world_rolled_back。只有 rollback_reopen_failed 会是 True。
+    pool_replaced = False
+
     def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code = code
@@ -179,21 +182,10 @@ def _store_code(exc: BaseException) -> str | None:
     return _core.world_store_error_code(exc) if isinstance(exc, _core.WorldStoreError) else None
 
 
-def _file_identity(path: str) -> tuple[int, int] | None:
-    """库文件此刻是哪个文件（设备号, inode）；不存在时 None。恢复用 rename 原子替换库，替换前后的值不同。"""
-    try:
-        st = os.stat(path)
-    except FileNotFoundError:
-        return None
-    return st.st_dev, st.st_ino
-
-
-def _replaced_by_rollback(exc: BaseException, db_path: str, before) -> bool:
-    """world_rollback 抛出时库是不是已经换掉了（C++ 第 12 步：替换之后才失败）。restore_digest_mismatch 按定义
-    是替换之后（spec §7.2）；其余码看库文件还是不是调用之前那个（第 12 步算不出摘要的 snapshot_failed 落在这里）。
-    只观察文件，不解析 C++ 的错误文本。"""
-    return (_store_code(exc) == "restore_digest_mismatch"
-            or _file_identity(db_path) != before)
+def _replaced_by_rollback(exc: BaseException) -> bool:
+    """world_rollback 抛出时库是不是已经换掉了：C++ 的标记（WorldStoreError.replaced，裁定 R31 M5、R32），不看错误码、
+    不看文件。不是 C++ 抛的异常（没有这个属性）按 False。"""
+    return bool(getattr(exc, "replaced", False))
 
 
 class EngineLease:
@@ -634,7 +626,7 @@ class WorldPool:
                 "last_write_at": stats["last_write_at"]}
 
     def schema_behind(self, world: str, *, open_only: bool = False) -> bool | None:
-        """世界库的 schema 是否落后于本构建（spec §6.3）：schema_version() < latest_schema_version()。开着的世界
+        """世界库的 schema 是否落后于本构建（spec §6.3，C++ SqliteAdapter::schema_behind）。开着的世界
         取引擎打开时记下的值，不碰它的连接。关着的世界：open_only 时返回 None（列表不打开库，裁定 R17）；否则持
         一份不建引擎的租约，短暂只读打开库（不迁移、不改日志模式）读一次。库不在或读不出时 None。"""
         try:
@@ -656,7 +648,7 @@ class WorldPool:
             try:
                 adapter = _core.SqliteAdapter.open_read_only(db_path)
                 try:
-                    return adapter.schema_version() < _core.latest_schema_version()
+                    return adapter.schema_behind               # 判定在 C++（裁定 R31 M5）
                 finally:
                     adapter.close()
             except Exception:  # noqa: BLE001 — 坏库只是没有这个标记，详情照常给出
@@ -1245,9 +1237,10 @@ class WorldPool:
         抛错：C++ 的码是 _core.WorldStoreError，按库有没有被替换分两类（C++ rollback_world 第 12 步）：
           - 库原样不动：snapshot_not_found / snapshot_corrupt / world_tenant_mismatch / insufficient_disk /
             snapshot_unsupported_backend / world_in_use，以及替换之前的 snapshot_failed；
-          - 库已替换（_replaced_by_rollback：码是 restore_digest_mismatch，或库文件已不是调用之前那个）：
-            快照文件登记之后被改过，或第 12 步「库已替换、算不出摘要」的 snapshot_failed。照替换成功的出口刷
-            统计缓存、重开引擎，再原样抛出；重开失败报 rollback_reopen_failed（链到 C++ 的错误）。
+          - 库已替换（C++ 的 WorldStoreError.replaced 为 True，裁定 R31 M5）：快照文件登记之后被改过
+            （restore_digest_mismatch），或第 12 步「库已替换、算不出摘要」的 snapshot_failed。照替换成功的出口刷
+            统计缓存、重开引擎，再原样抛出（异常上另挂 pool_replaced=True，路由据此广播）；重开失败报
+            rollback_reopen_failed（链到 C++ 的错误，同样挂 pool_replaced=True）。
         另有 world_busy（在途请求 _LEASE_DRAIN_TIMEOUT_S 内不结束、线程停不下、Runtime 回收不了或之前的关闭
         留下的 Runtime 还开着这个库，库未动）；world_open_failed（库未动，但重开引擎失败）；
         rollback_reopen_failed（库已替换，重开失败）。后两种引擎不在表上，下一次 lease 重新建。
@@ -1267,15 +1260,16 @@ class WorldPool:
                 # 旧 Runtime 还活着：不能再开第二条写连接，所以不重开（下一次 lease 被 _refuse_leaked 挡住，
                 # 直到它被回收）。
                 raise busy
-            before = _file_identity(rec["db_path"])
             try:
-                result = _core.world_rollback(reg, world, snapshot_id, vector_backend=backend)
+                result = self._rollback_in_cpp(reg, world, snapshot_id, backend)
             except Exception as exc:
-                if not _replaced_by_rollback(exc, rec["db_path"], before):
+                if not _replaced_by_rollback(exc):
                     self._reopen_after_rollback(world, was_open, exc)   # 库未动；原样抛出
                     raise
                 # 库已换成快照文件此刻的内容（摘要对不上或算不出）：与成功出口一样刷缓存、在新库上重开，再
-                # 把 C++ 的错误原样抛出（硬错误，spec §7.2）。重开失败时 rollback_reopen_failed 链到它。
+                # 把 C++ 的错误原样抛出（硬错误，spec §7.2）。重开失败时 rollback_reopen_failed 链到它。两种出口都
+                # 在异常上挂 pool_replaced=True：路由按它广播 world_rolled_back（裁定 R32），不按错误码列表。
+                exc.pool_replaced = True
                 self._write_stats_cache(world, rec["db_path"], rec["tenant"])
                 self._reopen_after_rollback(world, was_open, None, replaced_by=exc)
                 raise
@@ -1285,6 +1279,11 @@ class WorldPool:
             reopened = self._reopen_after_rollback(world, was_open, None)
         return {"world": world, "snapshot_id": snapshot_id,
                 "archived": bool(result["archive_path"]), "reopened": reopened}
+
+    @staticmethod
+    def _rollback_in_cpp(reg, world: str, snapshot_id: str, backend: str) -> dict:
+        """调 C++ world_rollback 的唯一一处（测试替换它来注入 C++ 的失败）。"""
+        return _core.world_rollback(reg, world, snapshot_id, vector_backend=backend)
 
     def _reopen_after_rollback(self, world: str, was_open: bool, cause: Exception | None, *,
                                replaced_by: Exception | None = None) -> bool:
@@ -1302,7 +1301,9 @@ class WorldPool:
             if cause is None:
                 detail = f"rollback applied, but the world cannot be reopened: {exc}"
                 logger.error("world rollback (%s): %s", world, detail)
-                raise WorldSwitchError("rollback_reopen_failed", detail) from (replaced_by or exc)
+                reopen_failed = WorldSwitchError("rollback_reopen_failed", detail)
+                reopen_failed.pool_replaced = True          # 库已替换（裁定 R32）
+                raise reopen_failed from (replaced_by or exc)
             detail = f"{cause}; reopening the world also failed: {exc}"
             logger.error("world rollback (%s): %s", world, detail)
             raise WorldSwitchError("world_open_failed", detail) from cause

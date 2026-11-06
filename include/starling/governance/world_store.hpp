@@ -34,8 +34,15 @@ class WorldStoreError : public std::runtime_error {
 public:
     WorldStoreError(std::string code, const std::string& detail);
     [[nodiscard]] const std::string& code() const noexcept;
+    // rollback_world 替换库之后（第 11 步 rename 之后）才失败时为 true（裁定 R31 M5、R32）：库路径上已是快照的内容，
+    // 调用方按「库已替换」处理（刷统计、在新库上重开、广播）。错误码不变；restore_digest_mismatch 恒为 true。
+    // 其余错误为 false。
+    [[nodiscard]] bool replaced() const noexcept { return replaced_; }
+    // 同一个错误，标上「库已替换」。
+    [[nodiscard]] static WorldStoreError after_replace(std::string code, const std::string& detail);
 private:
     std::string code_;
+    bool replaced_ = false;
 };
 // code 取值：invalid_world_name | world_exists | world_not_found | world_protected
 //           | registry_corrupt | invalid_retention | snapshot_not_found
@@ -423,6 +430,9 @@ struct RollbackOptions {
     // 测试注入用：归档名建好之后、原子替换之前（第 10 步与第 11 步之间）调用，参数是 partial
     // 的路径。抛异常或删掉 partial 即可模拟「替换失败」。为空时不调用。
     std::function<void(const std::filesystem::path& staged)> before_replace;
+    // 仅测试用：第 11 步 rename 之后、第 12 步算摘要之前调用。抛异常即可模拟「替换之后才失败」（抛出的错误带
+    // replaced=true）。为空时不调用（生产）。
+    std::function<void()> after_replace_for_test;
 };
 
 struct RollbackResult {
@@ -497,6 +507,8 @@ void check_rollback(const RegistryDb& reg, const std::string& world,
 //      digest（非空）时两者必须相等，否则抛 restore_digest_mismatch：库已经替换（旧库在归档名下），说明
 //      快照文件在登记之后被改过，作为硬错误上报（spec §7.2）。条目的 digest 为空（第 3 期之前的条目）
 //      时不比较，照常返回恢复后的摘要。摘要算不出来抛 snapshot_failed，消息写明库已替换。
+// 第 11 步之后的任何失败（第 12 步，或 after_replace_for_test）抛出的 WorldStoreError 带 replaced()=true，码不变
+// （算不出摘要、其余非 WorldStoreError 的异常是 snapshot_failed）；之前的失败 replaced()=false（裁定 R31 M5）。
 // 第 1–9 步任何失败：目标库原样不动，partial 删掉。
 // 第 10–11 步失败：库路径上仍是旧库，摘掉归档名（经 remove_within），删掉 partial，抛
 // snapshot_failed。归档名摘不掉时它是现役库的第二个名字：记 stderr，错误信息写明不能用写

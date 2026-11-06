@@ -505,9 +505,9 @@ def build_worlds_router(require_token) -> APIRouter:
         try:
             out = await _run(pool.rollback, name, body.snapshot_id)
         except HTTPException as exc:
-            if exc.detail in ("rollback_reopen_failed", "restore_digest_mismatch"):
-                # 库已经换成了快照的内容（引擎没能重开，或换上之后才发现摘要对不上）：别的标签页同样要知道
-                # 库变了。
+            # 池报告库已替换（C++ 的 replaced 标记，裁定 R32；池在这种失败上已刷新统计、重开过引擎）：库已经换成快照的
+            # 内容，别的标签页同样要知道库变了。判定来自标记，不来自错误码列表。
+            if getattr(exc.__cause__, "pool_replaced", False):
                 await _broadcast(request, "world_rolled_back", name, rolled_back)
             raise
         await _broadcast(request, "world_rolled_back", name, rolled_back)

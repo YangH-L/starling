@@ -352,7 +352,7 @@ class DashboardEngine:
                  else _runtime._build_local_store_sqlite_runtime)
         rt = build(Path(ctx.db_path))
         try:
-            self.schema_behind = rt.adapter.schema_version() < _core.latest_schema_version()
+            self.schema_behind = rt.adapter.schema_behind     # 判定在 C++（裁定 R31 M5）
             rt.start()
             self._rt = rt   # the live Runtime (holds the C++ RuntimeSupervisor); the
                             # host drain reaches the supervisor through begin_drain().

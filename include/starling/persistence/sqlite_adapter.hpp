@@ -33,6 +33,9 @@ public:
     // schema_migrations 的 MAX(version);表不存在时为 0。只读打开 schema 落后的库时
     // 小于 MigrationRunner::latest_embedded_version()。Throws std::logic_error after close().
     [[nodiscard]] int schema_version() const;
+    // schema_version() < MigrationRunner::latest_embedded_version()（裁定 R31 M5：判定在 C++，绑定层不比较版本号）。
+    // 只读打开的旧库为 true；open() 刚迁移到最新的库为 false。Throws std::logic_error after close()。
+    [[nodiscard]] bool schema_behind() const;
 
     starling::ProfileCapability declare_capability() const override;
     bool check_final_query(const std::string& sql) const override;
@@ -60,7 +63,7 @@ public:
     // same file holds a read transaction; SQLite then leaves the WAL for the
     // last connection to close (or the next open) to merge.
     void close();
-    const std::filesystem::path& db_path() const noexcept { return db_path_; }
+    [[nodiscard]] const std::filesystem::path& db_path() const noexcept { return db_path_; }
 
 private:
     SqliteAdapter(Connection conn, std::filesystem::path path, bool read_only)

@@ -73,6 +73,9 @@ void bind_02_persistence(pybind11::module_& m) {
              &starling::persistence::SqliteAdapter::schema_version,
              py::call_guard<py::gil_scoped_release>(),
              "MAX(version) of schema_migrations; 0 when the table does not exist.")
+        .def_property_readonly("schema_behind",
+             &starling::persistence::SqliteAdapter::schema_behind,
+             "schema_version() < latest_schema_version(), decided in C++ (R31 M5).")
         .def("declare_capability",
              &starling::persistence::SqliteAdapter::declare_capability)
         .def("has_index",

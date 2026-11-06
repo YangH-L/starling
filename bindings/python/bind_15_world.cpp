@@ -180,8 +180,23 @@ gov::AutoSnapshotConfig auto_config_in(const py::handle& on_session, const py::h
 void bind_15_world(pybind11::module_& m) {
     using namespace pybind11::literals;
 
-    // 与 bind_07/bind_14 同一写法；what() 形如 "world_exists: sim-1"。
-    py::register_exception<gov::WorldStoreError>(m, "WorldStoreError", PyExc_RuntimeError);
+    // Python 类型 WorldStoreError（基类 RuntimeError），str(exc) 即 what()，形如 "world_exists: sim-1"。自定义翻译器
+    // 只多做一件事：把 C++ 的 replaced()（rollback_world 替换库之后才失败，裁定 R31 M5、R32）放到异常对象的属性
+    // replaced 上。Python 侧自己构造的 WorldStoreError（引擎的 world_read_only）没有这个属性，读时按 False。
+    PYBIND11_CONSTINIT static py::gil_safe_call_once_and_store<py::object> world_store_error;
+    world_store_error.call_once_and_store_result([&m] {
+        return py::object(py::exception<gov::WorldStoreError>(m, "WorldStoreError", PyExc_RuntimeError));
+    });
+    py::register_exception_translator([](std::exception_ptr thrown) {
+        try {
+            if (thrown) { std::rethrow_exception(thrown); }
+        } catch (const gov::WorldStoreError& err) {
+            const py::object& type = world_store_error.get_stored();
+            const py::object instance = type(py::str(err.what()));
+            instance.attr("replaced") = py::bool_(err.replaced());
+            py::set_error(type, instance);
+        }
+    });
 
     // 取异常文本冒号前的部分，即 WorldStoreError 的 code。
     m.def("world_store_error_code", [](const py::object& exc) {
@@ -520,7 +535,8 @@ void bind_15_world(pybind11::module_& m) {
     // ---- 回滚与归档（W3） ----
     // 回滚不改注册表。世界 home 与归档目录由 C++ 从 RegistryDb 推出（不再传 registry_dir）。
     // C++ 的连接探测（world_in_use）只是纵深防御；进程内的安全由调用方保证。复制快照 +
-    // integrity_check 可能要几秒，释放 GIL。C++ 的测试钩子（free_space、before_replace）不暴露。
+    // integrity_check 可能要几秒，释放 GIL。C++ 的测试钩子 free_space、before_replace 不暴露；after_replace_for_test
+    // 经 world_rollback 的 _test_fail_after_replace 暴露（只能注入一次固定的失败）。
     // 回滚预检：world_rollback 第 1–4 步的只读检查（同顺序、同错误码），什么都不动。
     m.def("world_check_rollback",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
@@ -533,12 +549,20 @@ void bind_15_world(pybind11::module_& m) {
           }, py::arg("registry"), py::arg("world"), py::arg("snapshot_id"), py::kw_only(),
           py::arg("vector_backend") = "sqlite");
 
+    // 抛出的 WorldStoreError 带属性 replaced（bool）：True = 库已经换成快照的内容之后才失败（restore_digest_mismatch
+    // 恒为 True），调用方按「库已替换」处理；码不变。_test_fail_after_replace（仅测试用）：rename 之后、算摘要之前
+    // 抛 snapshot_failed，模拟「替换之后才失败」。
     m.def("world_rollback",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
           [](const gov::RegistryDb& reg, const std::string& world, const std::string& snapshot_id,
-             const std::string& vector_backend) {
+             const std::string& vector_backend, bool test_fail_after_replace) {
               gov::RollbackOptions opts;
               opts.vector_backend = vector_backend;
+              if (test_fail_after_replace) {
+                  opts.after_replace_for_test = [] {
+                      throw std::runtime_error("injected failure after the replace (test only)");
+                  };
+              }
               gov::RollbackResult result;
               {
                   const py::gil_scoped_release release;
@@ -548,7 +572,7 @@ void bind_15_world(pybind11::module_& m) {
                               "restored_bytes"_a = result.restored_bytes,
                               "digest"_a = text_or_none(result.digest));
           }, py::arg("registry"), py::arg("world"), py::arg("snapshot_id"), py::kw_only(),
-          py::arg("vector_backend") = "sqlite");
+          py::arg("vector_backend") = "sqlite", py::arg("_test_fail_after_replace") = false);
 
     m.def("world_list_archives", [](const gov::RegistryDb& reg, const std::string& world) {
         std::vector<gov::ArchiveEntry> listed;

@@ -1089,6 +1089,99 @@ def test_routes_rollback_to_a_missing_snapshot_file_is_409_snapshot_corrupt(tmp_
     pool.close_all()
 
 
+def test_binding_rollback_failure_carries_the_replaced_marker(pool_reg):
+    """裁定 R31 M5、R32：C++ 在替换库之后才失败时，异常对象上 replaced 为 True（码不变）；替换之前的失败为 False。
+    异常类型、基类、str(exc) 与 register_exception 时一样。"""
+    pool, reg = pool_reg
+    pool.create_world("sim-1", "")
+    snap = _write_snapshot_write(pool, "sim-1")
+    pool.close_world("sim-1")
+    with pytest.raises(_core.WorldStoreError) as ei:
+        _core.world_rollback(reg, "sim-1", snap["id"], _test_fail_after_replace=True)
+    exc = ei.value
+    assert type(exc).__name__ == "WorldStoreError" and isinstance(exc, RuntimeError)
+    assert type(exc) is _core.WorldStoreError
+    assert _code(exc) == "snapshot_failed" and str(exc).startswith("snapshot_failed: restored ")
+    assert exc.replaced is True
+    del exc, ei
+    assert _count(_db(reg, "sim-1")) == 1                           # 库已是快照的内容
+    with pytest.raises(_core.WorldStoreError) as ei:
+        _core.world_rollback(reg, "sim-1", "20261106T000000Z-0000")
+    assert _code(ei.value) == "snapshot_not_found" and ei.value.replaced is False
+
+
+def _fail_after_replace(monkeypatch, pool) -> None:
+    """让池调 C++ 回滚时走测试钩子：rename 之后、算摘要之前失败（snapshot_failed，replaced=True）。"""
+    real = pool._rollback_in_cpp
+
+    def _inject(reg, world, snapshot_id, backend):
+        return _core.world_rollback(reg, world, snapshot_id, vector_backend=backend,
+                                    _test_fail_after_replace=True)
+    monkeypatch.setattr(pool, "_rollback_in_cpp", _inject)
+    return real
+
+
+def test_pool_failure_after_replace_refreshes_reopens_and_route_broadcasts(tmp_path, monkeypatch):
+    """裁定 R32（替代 R22 M2）：替换之后才失败的 snapshot_failed 不在任何码列表里，池只看 C++ 的 replaced 标记：
+    刷新统计缓存、在新库上重开引擎；路由广播 world_rolled_back。"""
+    client, app = _client(tmp_path)
+    pool = app.state.pool
+    sent = _recording(app)
+    pool.create_world("sim-1", "")
+    snap = _write_snapshot_write(pool, "sim-1")
+    db = _db(pool.registry, "sim-1")
+    pool.close_world("sim-1")
+    assert pool.registry.get("sim-1")["statements"] == 2
+    _remember(pool, "sim-1", "Dave owns search")                 # 重新打开
+    with pool.lease("sim-1", build=False) as eng:
+        old_engine = weakref.ref(eng)
+    eng = None
+    _fail_after_replace(monkeypatch, pool)
+    r = client.post("/api/worlds/sim-1/rollback", json=_rollback_body("sim-1", snap["id"]))
+    assert (r.status_code, r.json()["detail"]) == (500, "snapshot_failed")
+    assert _count(db) == 1                                       # 库已换成快照
+    assert pool.registry.get("sim-1")["statements"] == 1         # 统计缓存刷新了
+    assert "sim-1" in pool.open_worlds()
+    with pool.lease("sim-1", build=False) as eng:
+        assert eng is not None and eng is not old_engine()       # 在新库上重开（旧引擎已丢掉）
+        assert eng.health() is not None
+    eng = None
+    assert sent == [{"type": "world_rolled_back", "world": "sim-1",
+                     "payload": {"world": "sim-1", "snapshot_id": snap["id"]}}]
+    pool.close_all()
+
+
+def test_pool_failure_before_replace_is_not_replaced_and_does_not_broadcast(tmp_path, monkeypatch):
+    """替换之前的 snapshot_failed：replaced=False，库原样，引擎重开，不广播。"""
+    client, app = _client(tmp_path)
+    pool = app.state.pool
+    sent = _recording(app)
+    pool.create_world("sim-1", "")
+    snap = _write_snapshot_write(pool, "sim-1")
+    db = _db(pool.registry, "sim-1")
+    seen: list = []
+    real = pool._rollback_in_cpp
+
+    def _fail_before(reg, world, snapshot_id, backend):
+        try:
+            # 第 8 步的探测之前让 -journal 非空：C++ 在替换之前就拒绝（snapshot_failed）。
+            with open(db + "-journal", "wb") as fh:
+                fh.write(b"x")
+            return real(reg, world, snapshot_id, backend)
+        except _core.WorldStoreError as exc:
+            seen.append(exc.replaced)
+            raise
+        finally:
+            os.remove(db + "-journal")
+    monkeypatch.setattr(pool, "_rollback_in_cpp", _fail_before)
+    r = client.post("/api/worlds/sim-1/rollback", json=_rollback_body("sim-1", snap["id"]))
+    assert (r.status_code, r.json()["detail"]) == (500, "snapshot_failed")
+    assert seen == [False]
+    assert _count(db) == 2 and "sim-1" in pool.open_worlds()
+    assert sent == []
+    pool.close_all()
+
+
 @pytest.mark.parametrize("source,code,status", [
     ("cpp", "snapshot_corrupt", 409), ("cpp", "world_tenant_mismatch", 409),
     ("cpp", "insufficient_disk", 507), ("cpp", "snapshot_failed", 500),
