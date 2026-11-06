@@ -481,7 +481,7 @@ WorldRecord RegistryDb::create(const std::string& name, const std::string& label
     const std::scoped_lock lock(impl_->mutex);
     return impl_->create_row(NewWorld{.name = name, .tenant = name, .label = label, .labels = labels,
                                       .settings_json = settings_json,
-                                      .now_iso = std::string(now_iso), .flags = flags},
+                                      .now_iso = std::string(now_iso), .flags = flags,},
                              false);
 }
 
@@ -500,7 +500,7 @@ WorldRecord RegistryDb::create_world(const std::string& name, const std::string&
     if (provider_endpoints) { require_inherited_endpoints(merged, *provider_endpoints); }
     return impl_->create_row(NewWorld{.name = name, .tenant = name, .label = label, .labels = labels,
                                       .settings_json = settings_to_json(merged),
-                                      .now_iso = std::string(now_iso), .flags = normal},
+                                      .now_iso = std::string(now_iso), .flags = normal,},
                              true);
 }
 

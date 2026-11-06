@@ -1892,7 +1892,7 @@ struct WriteMark {
 
 WriteMark write_mark(sqlite3* dbh) {
     return WriteMark{.data_version = single_int(dbh, "PRAGMA data_version"),
-                     .own_changes = sqlite3_total_changes64(dbh)};
+                     .own_changes = sqlite3_total_changes64(dbh),};
 }
 
 void require_current_schema(sqlite3* dbh, const std::string& source) {
