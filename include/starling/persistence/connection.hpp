@@ -34,7 +34,7 @@ public:
     static Connection open_read_only(const std::filesystem::path& db_path);
 
     // nullptr once close() has run.
-    sqlite3* raw() const noexcept { return handle_.get(); }
+    [[nodiscard]] sqlite3* raw() const noexcept { return handle_.get(); }
 
     // Releases the sqlite handle. Idempotent. After close(), raw() is nullptr,
     // exec() throws SqliteError, and the transaction helpers are no-ops. The

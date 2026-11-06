@@ -34,7 +34,7 @@ bool header_is_wal(const std::filesystem::path& db_path) {
     if (!input.read(header.data(), static_cast<std::streamsize>(header.size()))) {
         return false;
     }
-    return header[kReadVersionOffset] == 2;
+    return header.back() == 2;   // 数组只读到读版本那一字节为止
 }
 
 // 查不清(权限等错误)时按存在处理:走普通 mode=ro,宁可建旁车也不读漏 WAL 里的提交。
