@@ -97,6 +97,14 @@ Connection Connection::open(const std::filesystem::path& db_path) {
     return c;
 }
 
+void throw_sqlite_error(std::string msg, int code) {
+    constexpr unsigned kPrimaryMask = 0xFFU;   // 扩展码的低 8 位是主码
+    if ((static_cast<unsigned>(code) & kPrimaryMask) == static_cast<unsigned>(SQLITE_READONLY)) {
+        throw ReadOnlyWriteRejected(std::move(msg), code);
+    }
+    throw SqliteError(std::move(msg), code);
+}
+
 void Connection::exec(std::string_view sql) {
     if (!handle_) {
         throw SqliteError("exec failed: connection closed", SQLITE_MISUSE);
@@ -106,7 +114,7 @@ void Connection::exec(std::string_view sql) {
                      nullptr, nullptr, &err) != SQLITE_OK) {
         std::string msg = err ? err : "unknown sqlite_exec error";
         sqlite3_free(err);
-        throw SqliteError("exec failed: " + msg, sqlite3_errcode(handle_.get()));
+        throw_sqlite_error("exec failed: " + msg, sqlite3_extended_errcode(handle_.get()));
     }
 }
 

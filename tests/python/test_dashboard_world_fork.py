@@ -348,9 +348,28 @@ def test_write_to_read_only_world_is_409_world_read_only(client, kind):
     assert _sha256(db) == sha
 
 
+def test_read_only_engine_maps_a_real_sqlite_readonly_write_to_409(client, monkeypatch):
+    """裁定 R33（替代 R22 M3）：真实只读引擎上一次真的走到 SQLite 写的调用。core.tick 的 common_ground 降级扫描在
+    只读连接上执行 UPDATE，C++ 抛带类型的 _core.ReadOnlyWriteRejected；引擎按类型（不按错误文本）报 world_read_only。
+    这里让 /recall 的读路径调到它（引擎外的写入口本来就被 _require_writable 挡在前面）。"""
+    _source_with_content(client)
+    _fork(client, "src", "rollout-1", reclaimable=True)
+    assert client.post("/api/w/rollout-1/recall", json={"query": "auth"}).status_code == 200
+    engine = _engine_of(_pool(client), "rollout-1")
+    core = engine._core
+    engine = None
+    with pytest.raises(_core.ReadOnlyWriteRejected) as ei:          # 真的是 C++ 抛的、带类型
+        core.tick("2026-11-06T00:00:00Z")
+    assert isinstance(ei.value, RuntimeError)
+    del ei
+    monkeypatch.setattr(core, "recall", lambda *_a, **_k: core.tick("2026-11-06T00:00:00Z"))
+    resp = client.post("/api/w/rollout-1/recall", json={"query": "auth"})
+    assert (resp.status_code, resp.json()) == (409, {"detail": "world_read_only"})
+
+
 def test_read_only_engine_maps_write_rejections_to_world_read_only(client, monkeypatch):
-    """读路径上万一碰到写入拒绝（C++ 写门的 WriteGateRejected，或 mode=ro 连接拒绝写入的 SQLite 错误），只读引擎
-    一律报 world_read_only（409），不报 500。别的错误照常抛。"""
+    """读路径上万一碰到写入拒绝（C++ 写门的 WriteGateRejected，或只读连接拒绝写入的 ReadOnlyWriteRejected），只读引擎
+    一律报 world_read_only（409），不报 500。文本像只读拒绝的普通 RuntimeError 不算（按类型认，裁定 R33）。"""
     _source_with_content(client)
     _fork(client, "src", "rollout-1", reclaimable=True)
     assert client.post("/api/w/rollout-1/recall", json={"query": "auth"}).status_code == 200
@@ -363,13 +382,15 @@ def test_read_only_engine_maps_write_rejections_to_world_read_only(client, monke
         raise raised["exc"]
     monkeypatch.setattr(core, "recall", _recall)
     for exc in (_core.WriteGateRejected("write rejected: runtime not accepting writes"),
-                RuntimeError("Stmt: step failed: attempt to write a readonly database")):
+                _core.ReadOnlyWriteRejected("Stmt: step failed: attempt to write a readonly database")):
         raised["exc"] = exc
         resp = client.post("/api/w/rollout-1/recall", json={"query": "auth"})
         assert (resp.status_code, resp.json()) == (409, {"detail": "world_read_only"}), exc
-    raised["exc"] = ValueError("something else")
-    with pytest.raises(ValueError):
-        client.post("/api/w/rollout-1/recall", json={"query": "auth"})
+    for exc in (ValueError("something else"),
+                RuntimeError("Stmt: step failed: attempt to write a readonly database")):
+        raised["exc"] = exc
+        with pytest.raises(type(exc)):
+            client.post("/api/w/rollout-1/recall", json={"query": "auth"})
 
 
 

@@ -15,6 +15,17 @@ private:
     int code_;
 };
 
+// 只读连接上执行写语句（SQLITE_READONLY 及其扩展码）时抛（裁定 R33）。继承 SqliteError：已有的
+// catch (const SqliteError&) 照常接得住；Python 侧是 _core.ReadOnlyWriteRejected（RuntimeError 的子类），看板的
+// 只读引擎按类型把它报成 world_read_only。由 make_sqlite_error（Stmt、各处 prepare/step）与 Connection::exec 产生。
+class ReadOnlyWriteRejected : public SqliteError {
+public:
+    using SqliteError::SqliteError;
+};
+
+// code 是 SQLITE_READONLY 一族（主码 8，含 SQLITE_READONLY_* 扩展码）时抛 ReadOnlyWriteRejected，否则抛 SqliteError。
+[[noreturn]] void throw_sqlite_error(std::string msg, int code);
+
 class Connection {
 public:
     // Opens db_path with WAL + foreign_keys=ON + busy_timeout=5000 + synchronous=NORMAL.

@@ -130,6 +130,10 @@ void bind_02_persistence(pybind11::module_& m) {
           "file:<resolved path>?mode=ro, plus &immutable=1 for a WAL-header file "
           "with no -wal/-shm beside it.");
 
+    // 只读连接上的写语句（裁定 R33）：Python 的 RuntimeError 子类，看板只读引擎按类型报 world_read_only。
+    py::register_exception<starling::persistence::ReadOnlyWriteRejected>(m, "ReadOnlyWriteRejected",
+                                                                         PyExc_RuntimeError);
+
     m.def("latest_schema_version",
           &starling::persistence::MigrationRunner::latest_embedded_version,
           "Highest migration version embedded in this build.");

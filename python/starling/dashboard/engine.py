@@ -145,11 +145,6 @@ def _tick_did_work(stats: dict) -> bool:
     return any(v for k, v in stats.items() if k not in ("stage_timings_ms", "stages_skipped"))
 
 
-# SQLite 拒绝在 mode=ro 连接上写入时的报错（SQLITE_READONLY 的 sqlite3_errstr）。C++ 的 SqliteError 到 Python
-# 是 RuntimeError，只有文本可认。
-_SQLITE_READONLY_TEXT = "readonly database"
-
-
 def _world_read_only(world: str) -> Exception:
     """只读世界上的写入（spec §6.3）：WorldStoreError("world_read_only")，路由回 409。只点名世界。"""
     return _core.WorldStoreError(f"world_read_only: world '{world}' is opened read-only")
@@ -448,18 +443,14 @@ class DashboardEngine:
 
     @contextmanager
     def _read_only_rejections(self):
-        """读方法在只读引擎上万一碰到写入（C++ 写门的 WriteGateRejected，或 mode=ro 连接拒绝写入的 SQLite 错误），
-        统一报 world_read_only，不让它变成 500。可写引擎原样放行。"""
+        """读方法在只读引擎上万一碰到写入（C++ 写门的 WriteGateRejected，或只读连接拒绝写入时 C++ 抛的
+        ReadOnlyWriteRejected，裁定 R33），统一报 world_read_only，不让它变成 500。按类型认，不看错误文本。可写引擎原样放行。"""
         if not self.read_only:
             yield
             return
         try:
             yield
-        except _core.WriteGateRejected:
-            raise _world_read_only(self._ctx.name) from None
-        except RuntimeError as exc:
-            if _SQLITE_READONLY_TEXT not in str(exc):
-                raise
+        except (_core.WriteGateRejected, _core.ReadOnlyWriteRejected):
             raise _world_read_only(self._ctx.name) from None
 
     def _provider_snapshot(self, ep: dict | None) -> dict | None:

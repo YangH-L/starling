@@ -169,8 +169,26 @@ TEST(SqliteAdapterReadOnly, WritesAreRejected) {
     llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
     EXPECT_THROW((void)memoryops::remember(*reader, llm, "", params("Bob owns auth")),
                  governance::WriteGateRejected);
-    // 绕过写门直接发 SQL,连接本身也拒绝(mode=ro)。
-    EXPECT_THROW(reader->connection().exec("DELETE FROM schema_migrations"), SqliteError);
+    // 绕过写门直接发 SQL,连接本身也拒绝(mode=ro)。裁定 R33:SQLITE_READONLY 抛带类型的 ReadOnlyWriteRejected
+    // (SqliteError 的子类,已有的 catch (const SqliteError&) 照常接得住);Connection::exec 与 Stmt 两条路都是。
+    EXPECT_THROW(reader->connection().exec("DELETE FROM schema_migrations"), ReadOnlyWriteRejected);
+    {
+        Stmt del(reader->connection().raw(), "DELETE FROM schema_migrations");
+        EXPECT_THROW(del.step_done(), ReadOnlyWriteRejected);
+    }
+    try {
+        reader->connection().exec("DELETE FROM schema_migrations");
+    } catch (const SqliteError& err) {   // 仍是 SqliteError
+        EXPECT_EQ(static_cast<unsigned>(err.code()) & 0xFFU, static_cast<unsigned>(SQLITE_READONLY));
+    }
+    // 别的 SQLite 错误不是这个类型。
+    try {
+        reader->connection().exec("SELECT * FROM no_such_table");
+        FAIL() << "expected SqliteError";
+    } catch (const ReadOnlyWriteRejected&) {
+        FAIL() << "a missing table is not a read-only rejection";
+    } catch (const SqliteError&) {
+    }
     reader->close();
     reader.reset();
 
