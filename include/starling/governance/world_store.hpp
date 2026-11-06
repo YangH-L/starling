@@ -60,7 +60,8 @@ private:
 //           | restore_digest_mismatch（rollback_world：恢复后的摘要与快照条目记的不同；库已替换）
 //           | world_busy（fork_world_from_connection：复制途中来源有写入，或来源连接上开着事务、有没走完的
 //             语句；瞬态，调用方重试）
-//           | world_read_only（只读世界上写入；由引擎层抛，见第 3 期 Task 3.3）
+//           | world_read_only（只读世界上写入；由引擎层抛，见第 3 期 Task 3.3。check_rollback / rollback_world：
+//             只读世界（含种子）不能恢复，裁定 R31 M1）
 
 struct SnapshotEntry {
     std::string id;           // 20261025T011200Z-a1b2
@@ -415,7 +416,8 @@ struct RollbackResult {
 };
 
 // 回滚的预检：只做 rollback_world 第 1–4 步的只读检查，顺序、错误码与 rollback_world 相同：
-//   world_not_found → validate_world（registry_corrupt 等，裁定 R12）→ snapshot_not_found →
+//   world_not_found → validate_world（registry_corrupt 等，裁定 R12）→ 只读世界（read_only，含种子）world_read_only
+//   （裁定 R31 M1）→ snapshot_not_found →
 //   snapshot_unsupported_backend → 快照路径越出 snapshot_dir（snapshot_failed）→ 快照文件缺失或不是
 //   普通文件（snapshot_corrupt）→ 世界 home 的 a、b 检查（registry_corrupt / snapshot_failed）→
 //   insufficient_disk（2 ×）。
@@ -436,8 +438,8 @@ void check_rollback(const RegistryDb& reg, const std::string& world,
 // 不变式：库路径上任何时刻都是一份完整的库（替换前是旧库，替换后是新库），从不为空。
 // 归档用硬链接建出来，替换是 rename(partial, 库) 一步原子完成。
 // 顺序（第 1–4 步与 check_rollback 是同一份代码）：
-//   1. 取世界（world_not_found），validate_world（registry_corrupt 等，裁定 R12），再取快照
-//      （snapshot_not_found）。opts.vector_backend 不是
+//   1. 取世界（world_not_found），validate_world（registry_corrupt 等，裁定 R12），只读世界（read_only，含种子）抛
+//      world_read_only（裁定 R31 M1），再取快照（snapshot_not_found）。opts.vector_backend 不是
 //      "sqlite" 抛 snapshot_unsupported_backend。都在任何文件 I/O 之前。
 //   2. 快照路径解析符号链接后必须严格在该世界 snapshot_dir 之下（snapshot_failed）。
 //   3. 快照文件缺失或不是普通文件 → snapshot_corrupt。

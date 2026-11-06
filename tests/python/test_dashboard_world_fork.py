@@ -354,6 +354,22 @@ def test_read_only_engine_maps_write_rejections_to_world_read_only(client, monke
         client.post("/api/w/rollout-1/recall", json={"query": "auth"})
 
 
+
+def test_restore_of_a_seed_is_409_world_read_only(client):
+    """裁定 R31 M1：种子（只读）不能恢复。C++ 预检就拒绝（world_read_only → 409），库字节不变、不建归档。"""
+    pool = _pool(client)
+    _source_with_content(client)
+    _fork(client, "src", "seed-1", seed=True)
+    snap = client.post("/api/worlds/seed-1/snapshots", json={})
+    assert snap.status_code == 200, snap.text
+    db = pool.record("seed-1")["db_path"]
+    sha, files = _sha256(db), _dir_files(db)
+    resp = client.post("/api/worlds/seed-1/rollback",
+                       json={"snapshot_id": snap.json()["id"], "confirm": "seed-1"})
+    assert (resp.status_code, resp.json()["detail"]) == (409, "world_read_only")
+    assert _sha256(db) == sha and _dir_files(db) == files
+    assert pool.archives("seed-1") == []
+
 # ───────────────────────── 列表、详情与升级种子 ─────────────────────────
 
 def test_seed_shows_flags_in_list(client):

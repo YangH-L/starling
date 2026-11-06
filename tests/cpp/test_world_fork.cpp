@@ -519,4 +519,30 @@ TEST(WorldFork, ForeignTenantRowInSourceRefusesTheFork) {
     EXPECT_EQ(code_of([&] { (void)reg.get("seed-v2"); }), "world_not_found");
 }
 
+// 裁定 R31 M1：只读世界（含种子）不能恢复。预检与回滚都在任何文件 I/O 之前抛 world_read_only，库字节不变、
+// 不建归档。
+TEST(WorldRollback, ReadOnlyWorldIsRefusedBeforeAnyIo) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    (void)world_with_statements(reg, "deploy-1", 2);
+    ForkOptions opts = fork_opts();
+    opts.seed = true;
+    const ForkResult seeded = fork_world(reg, "deploy-1", "seed-1", opts);
+    const SnapshotEntry snap = take_snapshot(reg, "seed-1", SnapshotOptions{});
+    const std::string sha = file_sha256(seeded.world.db_path);
+    const auto entries = home_entries(seeded.world.db_path);
+
+    EXPECT_EQ(code_of([&] { check_rollback(reg, "seed-1", snap.id, RollbackOptions{}); }),
+              "world_read_only");
+    EXPECT_EQ(code_of([&] { (void)rollback_world(reg, "seed-1", snap.id, RollbackOptions{}); }),
+              "world_read_only");
+    // 快照 id 不存在时同样先报只读（只读这一条与输入无关，重试也过不了）。
+    EXPECT_EQ(code_of([&] {
+                  (void)rollback_world(reg, "seed-1", "20261106T000000Z-0000", RollbackOptions{});
+              }),
+              "world_read_only");
+    EXPECT_EQ(file_sha256(seeded.world.db_path), sha);
+    EXPECT_EQ(home_entries(seeded.world.db_path), entries);   // 没有 archive/、没有 partial
+}
+
 }  // namespace starling::governance

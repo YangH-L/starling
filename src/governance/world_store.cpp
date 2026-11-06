@@ -1444,6 +1444,11 @@ RollbackTarget check_rollback_target(const RegistryDb& reg, const std::string& w
     RollbackTarget target;
     target.entry = reg.get(world);   // world_not_found
     validate_world(reg, world);      // 裁定 R12：替换库、建归档之前先查注册表行与布局
+    // 裁定 R31 M1：只读世界（含种子，seed 蕴含 read_only）的库不能被替换。与快照 id 无关，所以在找快照之前。
+    if (target.entry.read_only || target.entry.seed) {
+        throw WorldStoreError("world_read_only",
+                              "world '" + world + "' is read-only and cannot be restored");
+    }
     target.snap = registered_snapshot(reg, world, snapshot_id);
     if (opts.vector_backend != "sqlite") {
         throw WorldStoreError("snapshot_unsupported_backend",
