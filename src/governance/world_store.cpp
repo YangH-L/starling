@@ -526,9 +526,12 @@ std::string uri_escape_path(const std::string& path) {
     return out;
 }
 
+// 只读打开（裁定 R28）：URI 取自 Connection::read_only_uri，与 Connection::open_read_only 同一条规则（WAL 头、
+// 旁边没有 -wal / -shm 的库用 immutable=1，不在库旁边建文件），这里不另拼 URI。打开的都是调用方持着的世界库
+// （Python 侧持世界锁或租约），或本进程刚写完、已关闭的 partial / 复制品。
 persistence::SqliteHandle open_read_only(const std::string& path) {
     sqlite3* raw = nullptr;
-    const std::string uri = "file:" + uri_escape_path(path) + "?mode=ro";
+    const std::string uri = persistence::Connection::read_only_uri(path).uri;
     const int code = sqlite3_open_v2(uri.c_str(), &raw, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI,
                                      nullptr);
     persistence::SqliteHandle handle(raw);

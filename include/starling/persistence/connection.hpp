@@ -38,6 +38,16 @@ public:
     // mode=ro(宁可建旁车,也不读漏 WAL 里的提交)。
     static Connection open_read_only(const std::filesystem::path& db_path);
 
+    // open_read_only 交给 sqlite3_open_v2 的 URI（裁定 R28：只读打开世界库的唯一规则）。immutable 判定只在
+    // 这里：库头是 WAL、旁边没有 -wal / -shm 时 "?mode=ro&immutable=1"，否则 "?mode=ro"；路径按上面的
+    // 规则解析并做百分号编码。world_store 的只读打开与 Python 看板的检视连接（绑定 _core.read_only_uri）
+    // 都从这里取 URI，自己不拼。调用方用 SQLITE_OPEN_READONLY | SQLITE_OPEN_URI 打开。
+    struct ReadOnlyUri {
+        std::string uri;
+        bool immutable = false;
+    };
+    [[nodiscard]] static ReadOnlyUri read_only_uri(const std::filesystem::path& db_path);
+
     // true = 这条连接是 open_read_only 以 immutable=1 打开的(见上)。close() 之后仍报告
     // 当初走的路径。open() 打开的连接恒为 false。
     [[nodiscard]] bool immutable() const noexcept { return immutable_; }

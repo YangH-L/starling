@@ -17,6 +17,7 @@
 #include <sqlite3.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -430,6 +431,54 @@ TEST(WorldFork, ForkFromConnectionInAnOpenTransactionIsWorldBusy) {
         fork_world_from_connection(reg, writer->connection(), "deploy-1", "rollout-1", fork_opts());
     EXPECT_EQ(forked.world.fork_of_world, "deploy-1");
     writer->close();
+}
+
+
+namespace {
+
+// 世界目录这一层的条目（不进 snapshots/ 子目录）：断言「只读打开没有在库旁边留下文件」。
+std::set<std::string> home_entries(const fs::path& db_file) {
+    std::set<std::string> out;
+    for (const auto& item : fs::directory_iterator(db_file.parent_path())) {
+        out.insert(item.path().filename().string());
+    }
+    return out;
+}
+
+// 库头第 19 字节（读版本）：2 = WAL 模式。
+int read_version_byte(const fs::path& db_file) {
+    std::ifstream input(db_file, std::ios::binary);
+    std::array<char, 20> header{};
+    input.read(header.data(), static_cast<std::streamsize>(header.size()));
+    return static_cast<int>(header.back());
+}
+
+}  // namespace
+
+// 裁定 R28（审查 I1）：create_world 建的库是 WAL 头，写连接正常关闭后旁边没有 -wal / -shm。world_store 里
+// 每条只读打开都走 Connection::open_read_only 的同一条规则（这种库用 immutable=1），不在库旁边新建文件。
+TEST(WorldReadOnlyOpen, WalHeaderLibraryWithoutSidecarsGrowsNoFiles) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    const WorldRecord src = world_with_statements(reg, "deploy-1", 2);
+    ASSERT_EQ(read_version_byte(src.db_path), 2);
+    ASSERT_FALSE(fs::exists(src.db_path + "-wal"));
+    ASSERT_FALSE(fs::exists(src.db_path + "-shm"));
+    const auto before = home_entries(src.db_path);
+    const std::string sha = file_sha256(src.db_path);
+
+    EXPECT_EQ(world_stats(src.db_path, src.tenant).statements, 2);
+    EXPECT_EQ(home_entries(src.db_path), before) << "world_stats";
+    verify_world_tenant(src.db_path, src.tenant);
+    EXPECT_EQ(home_entries(src.db_path), before) << "verify_world_tenant";
+    (void)snapshot_world_time(src.db_path, src.tenant);
+    (void)list_sessions(reg, "deploy-1", 10);
+    EXPECT_EQ(home_entries(src.db_path), before) << "snapshot_world_time / list_sessions";
+    (void)take_snapshot(reg, "deploy-1", SnapshotOptions{});
+    EXPECT_EQ(home_entries(src.db_path), before) << "take_snapshot";
+    (void)fork_world(reg, "deploy-1", "rollout-1", fork_opts());
+    EXPECT_EQ(home_entries(src.db_path), before) << "fork_world";
+    EXPECT_EQ(file_sha256(src.db_path), sha);
 }
 
 }  // namespace starling::governance

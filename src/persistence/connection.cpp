@@ -46,7 +46,7 @@ bool sidecar_present(const std::filesystem::path& db_path, const char* suffix) {
 
 }  // namespace
 
-Connection Connection::open_read_only(const std::filesystem::path& db_path) {
+Connection::ReadOnlyUri Connection::read_only_uri(const std::filesystem::path& db_path) {
     // 旁车跟着真实文件走:符号链接旁边没有 -wal 不等于真实文件旁边没有。
     std::error_code resolve_err;
     const std::filesystem::path resolved = std::filesystem::canonical(db_path, resolve_err);
@@ -54,18 +54,23 @@ Connection Connection::open_read_only(const std::filesystem::path& db_path) {
                             !sidecar_present(resolved, "-wal") &&
                             !sidecar_present(resolved, "-shm");
     const std::filesystem::path& target = resolve_err ? db_path : resolved;
-    const std::string uri = "file:" + uri_escape_path(target.string()) +
-                            (frozen_wal ? "?mode=ro&immutable=1" : "?mode=ro");
+    return ReadOnlyUri{.uri = "file:" + uri_escape_path(target.string()) +
+                              (frozen_wal ? "?mode=ro&immutable=1" : "?mode=ro"),
+                       .immutable = frozen_wal,};
+}
+
+Connection Connection::open_read_only(const std::filesystem::path& db_path) {
+    const ReadOnlyUri target = read_only_uri(db_path);
     sqlite3* raw = nullptr;
     const int code = sqlite3_open_v2(
-        uri.c_str(), &raw, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_FULLMUTEX,
+        target.uri.c_str(), &raw, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_FULLMUTEX,
         nullptr);
     SqliteHandle handle(raw);
     if (code != SQLITE_OK) {
         throw SqliteError(std::string("sqlite3_open_v2 (read-only) failed: ") +
             (raw != nullptr ? sqlite3_errmsg(raw) : "alloc failure"), code);
     }
-    Connection conn(std::move(handle), frozen_wal);
+    Connection conn(std::move(handle), target.immutable);
     conn.exec("PRAGMA busy_timeout = 5000");
     return conn;
 }

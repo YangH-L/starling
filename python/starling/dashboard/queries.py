@@ -1,6 +1,6 @@
 """Read-only SQLite inspection queries for the dashboard.
 
-Opens a fresh read-only connection per call (`mode=ro` + PRAGMA query_only).
+Opens a fresh read-only connection per call (the C++ read-only URI + PRAGMA query_only).
 List endpoints return rows as dicts keyed by cursor column names, so they are
 robust to schema column additions. The engine remains the single writer.
 """
@@ -12,10 +12,14 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from starling import _core
+
 
 @contextmanager
 def open_ro(db_path: str):
-    uri = f"file:{Path(db_path).as_posix()}?mode=ro"
+    # 裁定 R28：URI 取自 C++（_core.read_only_uri，与 Connection::open_read_only 同一条规则）。WAL 头、旁边
+    # 没有 -wal/-shm 的库（种子、升级种子的产物）走 immutable=1，不在库旁边新建 -wal/-shm。
+    uri = _core.read_only_uri(str(db_path))
     conn = sqlite3.connect(uri, uri=True)
     try:
         conn.execute("PRAGMA query_only = ON")

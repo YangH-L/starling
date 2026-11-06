@@ -116,6 +116,17 @@ void bind_02_persistence(pybind11::module_& m) {
              &starling::persistence::SqliteAdapter::connection,
              py::return_value_policy::reference_internal);
 
+    // 裁定 R28：只读打开世界库的唯一规则（Connection::read_only_uri）。看板的检视连接（queries.open_ro）用
+    // sqlite3.connect(uri, uri=True) 打开这个 URI，与 C++ 的只读打开同一条 immutable 判定。
+    m.def("read_only_uri",
+          [](const std::string& path) {
+              return starling::persistence::Connection::read_only_uri(path).uri;
+          },
+          py::arg("path"),
+          "The URI C++ passes to sqlite3_open_v2 for a read-only open of path: "
+          "file:<resolved path>?mode=ro, plus &immutable=1 for a WAL-header file "
+          "with no -wal/-shm beside it.");
+
     m.def("latest_schema_version",
           &starling::persistence::MigrationRunner::latest_embedded_version,
           "Highest migration version embedded in this build.");

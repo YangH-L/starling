@@ -225,6 +225,60 @@ def test_reclaimable_world_opens_read_only_and_bytes_unchanged(client):
     engine = None
 
 
+def _wal_header(db_path: str) -> bool:
+    """库头第 19 字节（读版本）是 2：WAL 模式的库。"""
+    with open(db_path, "rb") as fh:
+        return fh.read(20)[19] == 2
+
+
+def _inspect_leaves_no_trace(client, name: str) -> tuple[list, list]:
+    """详情、语句检视、召回各走一遍（召回会只读打开引擎），每一步之后目录文件集合不变；关闭之后 sha256 不变。
+    返回 (语句行, 召回结果)。"""
+    pool = _pool(client)
+    db = pool.record(name)["db_path"]
+    assert _wal_header(db), "这条测试要的是 WAL 头、旁边没有 -wal/-shm 的库"
+    sha, files = _sha256(db), _dir_files(db)
+    assert not any(n.endswith(("-wal", "-shm", "-journal")) for n in files), files
+    detail = client.get(f"/api/worlds/{name}")
+    assert detail.status_code == 200, detail.text
+    assert "stats_error" not in detail.json()
+    assert _dir_files(db) == files, ("detail", _dir_files(db) - files)
+    resp = client.get(f"/api/w/{name}/statements")
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()["rows"]
+    assert _dir_files(db) == files, ("statements", _dir_files(db) - files)
+    resp = client.post(f"/api/w/{name}/recall", json={"query": "who owns auth"})
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert _dir_files(db) == files, ("recall", _dir_files(db) - files)
+    assert name in pool.open_worlds()
+    pool.close_world(name)
+    assert _dir_files(db) == files, ("close", _dir_files(db) - files)
+    assert _sha256(db) == sha
+    return rows, results
+
+
+def test_upgrade_seed_output_wal_header_inspect_leaves_no_sidecars(client):
+    """裁定 R28（审查 I1）：upgrade_seed 的产物在副本上跑过迁移、经写连接关闭，库头是 WAL、旁边没有 -wal/-shm。
+    看板的每条只读打开（C++ world_stats / 只读引擎，Python queries.open_ro）都走 C++ 的同一条规则，不在旁边建文件。"""
+    _source_with_content(client)
+    _fork(client, "src", "seed-1", seed=True)
+    resp = client.post("/api/worlds/seed-1/upgrade_seed", json={"new_name": "seed-2"})
+    assert resp.status_code == 200, resp.text
+    rows, results = _inspect_leaves_no_trace(client, "seed-2")
+    assert [row["object_value"] for row in rows] == ["auth"]
+    assert results, "召回要真的读到种子里的语句"
+
+
+def test_empty_seed_from_registry_create_inspect_leaves_no_sidecars(client):
+    """裁定 R28、R34 M8：_core.WorldRegistry.create(seed=True) 建的空种子（create_world 初始化过库：WAL 头、旁边
+    没有 -wal/-shm）。同样的检视不在旁边建文件、不改字节。"""
+    pool = _pool(client)
+    pool.registry.create("seed-e", "", {}, None, "2026-11-06T00:00:00Z", seed=True)
+    rows, results = _inspect_leaves_no_trace(client, "seed-e")
+    assert rows == [] and results == []
+
+
 @pytest.mark.parametrize("kind", ["reclaimable", "seed"])
 def test_write_to_read_only_world_is_409_world_read_only(client, kind):
     _source_with_content(client)
