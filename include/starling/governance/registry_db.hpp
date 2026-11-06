@@ -45,7 +45,7 @@ struct WorldQuery {
 };
 
 // 一个世界怎么打开（spec §6.4，判定在 C++，Python 只问）。
-enum class OpenMode { ReadWrite, ReadOnly };
+enum class OpenMode : std::uint8_t { ReadWrite, ReadOnly };
 
 // 看板打开一个世界（for_client_write=false）：read_only（含种子）或 reclaimable（rollout 世界、验证分叉）
 // → ReadOnly，不跑迁移、不起后台线程、拒绝写入；其余（部署世界、用户建的世界、默认世界）→ ReadWrite。
