@@ -532,6 +532,10 @@ WorldRecord RegistryDb::create_populated(
         if (impl_->find(spec.name)) {
             throw WorldStoreError("world_exists", "world '" + spec.name + "' exists");
         }
+        // 裁定 R31 M3：与 create_world 同一条规则，在登记的这次持锁内、写之前核对继承来的 endpoint。
+        if (spec.provider_endpoints) {
+            require_inherited_endpoints(settings_from_json(spec.settings_json), *spec.provider_endpoints);
+        }
         impl_->insert_world(spec, home);
         return impl_->require(spec.name);
     } catch (...) {

@@ -693,6 +693,34 @@ def test_put_settings_cannot_redirect_an_inherited_endpoint(tmp_path, monkeypatc
         assert built and built[-1]["base_url"] == "http://h.example"
 
 
+def test_fork_with_settings_cannot_point_an_inherited_endpoint_elsewhere(tmp_path, monkeypatch):
+    """裁定 R31 M3：分叉带设置覆盖时，与建世界一样把 provider 地址表交给 C++，在登记的那次持锁内核对继承来的
+    endpoint。改了地址的覆盖回 409 endpoint_changed，不留目录、不登记；不碰地址的覆盖照常分叉。"""
+    import os
+    built: list = []
+    with _embedding_client(tmp_path, monkeypatch, built) as client:
+        pool = _pool(client)
+        assert client.post("/api/worlds", json={"name": "w1"}).status_code == 200
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+        worlds_root = os.path.join(pool.registry.data_dir, "worlds")
+        dirs = set(os.listdir(worlds_root))
+        for body in ({"new_name": "f1", "settings": {"embedding": {"base_url": "http://evil.example"}}},
+                     {"new_name": "f1", "settings": {"extraction": {"base_url": "http://evil.example"}}}):
+            resp = client.post("/api/worlds/w1/fork", json=body)
+            assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), body
+        assert client.get("/api/worlds/f1").status_code == 404
+        assert set(os.listdir(worlds_root)) == dirs
+        pool.close_world("w1")                                       # 关着的来源走 world_fork，同样核对
+        resp = client.post("/api/worlds/w1/fork", json={
+            "new_name": "f1", "settings": {"embedding": {"base_url": "http://evil.example"}}})
+        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"})
+        assert set(os.listdir(worlds_root)) == dirs
+        resp = client.post("/api/worlds/w1/fork", json={"new_name": "f1",
+                                                        "settings": {"source_lane": {"k_source": 9}}})
+        assert resp.status_code == 200, resp.text
+        assert pool.registry.get("f1")["settings"]["embedding"]["base_url"] == "http://h.example"
+
+
 def test_create_world_cannot_point_an_inherited_endpoint_elsewhere(tmp_path, monkeypatch):
     built: list = []
     with _embedding_client(tmp_path, monkeypatch, built) as client:

@@ -1035,9 +1035,12 @@ class WorldPool:
         文档里的锁顺序；这里不持租约（持租约的代码不得阻塞地等世界锁）。之前的关闭留下的 Runtime 还开着来源
         库时 world_busy（关着的来源只读打开可能走 immutable，看不见它的写入）。"""
         reg = self._require_registry()
+        # 裁定 R31 M3：与 create_world 同一种传法。客户端给了设置时 provider 地址表交给 C++，在登记的那次持注册表锁内
+        # 核对合并后设置里继承来的 endpoint；地址变了就 endpoint_changed，不留文件、不登记。没给设置时不核对。
         opts = {"labels": dict(labels or {}), "retention_group": retention_group or "",
                 "reclaimable": bool(reclaimable), "seed": bool(seed), "settings": settings,
-                "now": self._clock()}
+                "now": self._clock(),
+                "provider_endpoints": self._provider_endpoints() if settings else None}
         if snapshot_id:
             return _core.world_fork(reg, source, new_name, {**opts, "snapshot_id": snapshot_id})
         rec = self._record(source)                    # world_not_found：未知世界名不建世界锁

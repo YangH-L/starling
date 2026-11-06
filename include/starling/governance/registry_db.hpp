@@ -28,9 +28,7 @@
 
 namespace starling::governance {
 
-// {provider 名: 该 provider 此刻的种类与 base_url}：客户端写设置时核对继承来的 endpoint 用（裁定 R40、R51）。
-// 表里没有的名字 = provider 已被删掉。
-using ProviderEndpoints = std::map<std::string, ProviderEndpoint>;
+// ProviderEndpoints（{provider 名: 该 provider 此刻的种类与 base_url}，裁定 R40、R51）定义在 world_store.hpp。
 
 // WorldRecord、WorldFlags 定义在 world_store.hpp（分叉的结果 ForkResult 按值带着 WorldRecord）。
 
@@ -113,7 +111,8 @@ public:
     //      dir_id，建 worlds/<dir_id>/ 与 snapshots/。
     //   2. 不持锁：populate(worlds/<dir_id>/world.db)，它负责把库写到这个路径上。
     //   3. 持锁：登记（tenant、label、labels、settings_json、flags 照 spec 原样写入；seed 蕴含 read_only，
-    //      read_only 时设置强制关后台）。第 1、2 步之间名字被别的调用抢先登记 → world_exists。
+    //      read_only 时设置强制关后台）。第 1、2 步之间名字被别的调用抢先登记 → world_exists。spec.provider_endpoints
+    //      给出时先按 create_world 的规则核对 settings_json 里继承来的 endpoint（endpoint_changed，裁定 R31 M3）。
     // 任何一步抛错都删掉整个世界目录、不写注册项，原样抛出。
     WorldRecord create_populated(const NewWorld& spec,
                                  const std::function<void(const std::filesystem::path& db_file)>&

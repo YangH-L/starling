@@ -545,4 +545,47 @@ TEST(WorldRollback, ReadOnlyWorldIsRefusedBeforeAnyIo) {
     EXPECT_EQ(home_entries(seeded.world.db_path), entries);   // 没有 archive/、没有 partial
 }
 
+// 裁定 R31 M3：分叉带设置覆盖时，与 create_world 一样在登记的同一次持锁内用 provider_endpoints 核对继承来的
+// endpoint（R40、R51）。地址变了 → endpoint_changed，不留文件、不登记。不给表（nullopt）时不核对。
+TEST(WorldFork, ProviderEndpointsAreCheckedAtRegistration) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    (void)reg.update_world_settings(
+        "default", R"({"embedding":{"provider":"openai","provider_name":"p","base_url":"http://h",)"
+                   R"("model":"e1","dim":8,"max_tokens":1,"timeout_ms":1000}})");
+    (void)world_with_statements(reg, "deploy-1", 2);
+    const ProviderEndpoints same{{"p", ProviderEndpoint{.provider = "openai", .base_url = "http://h"}}};
+    const ProviderEndpoints moved{{"p", ProviderEndpoint{.provider = "openai", .base_url = "http://moved"}}};
+    const auto dirs = world_dirs(reg);
+
+    ForkOptions opts = fork_opts();
+    opts.settings_overrides_json = R"({"source_lane":{"k_source":9}})";
+    opts.provider_endpoints = moved;
+    EXPECT_EQ(code_of([&] { (void)fork_world(reg, "deploy-1", "rollout-1", opts); }),
+              "endpoint_changed");
+    EXPECT_EQ(world_dirs(reg), dirs);
+    EXPECT_EQ(code_of([&] { (void)reg.get("rollout-1"); }), "world_not_found");
+    {
+        auto writer = persistence::SqliteAdapter::open(reg.get("deploy-1").db_path);
+        EXPECT_EQ(code_of([&] {
+                      (void)fork_world_from_connection(reg, writer->connection(), "deploy-1",
+                                                       "rollout-1", opts);
+                  }),
+                  "endpoint_changed");
+        writer->close();
+    }
+    EXPECT_EQ(world_dirs(reg), dirs);
+    // provider 已被删掉（表里没有这个名字）同样拒绝。
+    opts.provider_endpoints = ProviderEndpoints{};
+    EXPECT_EQ(code_of([&] { (void)fork_world(reg, "deploy-1", "rollout-1", opts); }),
+              "endpoint_changed");
+    EXPECT_EQ(world_dirs(reg), dirs);
+
+    opts.provider_endpoints = same;
+    const ForkResult forked = fork_world(reg, "deploy-1", "rollout-1", opts);
+    EXPECT_EQ(settings_from_json(forked.world.settings_json).source_lane.k_source, 9);
+    opts.provider_endpoints = std::nullopt;   // 不给表：不核对
+    (void)fork_world(reg, "deploy-1", "rollout-2", opts);
+}
+
 }  // namespace starling::governance

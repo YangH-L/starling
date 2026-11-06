@@ -86,14 +86,7 @@ WorldSettings merge_settings(const WorldSettings& base, const std::string& overr
 // 校验规则与 settings_from_json 相同，非法时在返回前抛出，base 不被修改。
 WorldSettings replace_sections(const WorldSettings& base, const std::string& sections_json);
 
-// 一个 provider 此刻的端点身份（裁定 R51）：种类与 base_url。base_url 为空表示「这个种类的默认地址」，
-// openai 与 anthropic 的默认地址不同，所以只比 base_url 认不出地址变了：种类一变，密钥就会发到另一家。
-// 不含密钥。
-struct ProviderEndpoint {
-    std::string provider;
-    std::string base_url;
-    bool operator==(const ProviderEndpoint&) const = default;
-};
+// ProviderEndpoint（一个 provider 此刻的端点身份，裁定 R51）定义在 world_store.hpp：分叉的 ForkOptions 带着它。
 
 // world 里的 provider_name 非空时核对该 provider 此刻的端点（current）：provider 已不存在（nullopt，相当于
 // {"", ""}，一律拒绝）、或种类与 base_url 任一与 world 记的不同 → 抛 endpoint_changed。provider_name 为空

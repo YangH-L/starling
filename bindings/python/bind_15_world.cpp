@@ -114,7 +114,8 @@ std::string overrides_in(const py::object& overrides) {
 }
 
 // 分叉的 opts dict → ForkOptions（只做类型归一）。键：snapshot_id、labels、retention_group、reclaimable、
-// seed、settings（None 或部分设置 dict，json.dumps 成 overrides）、now（调用方的时刻）。未知键抛
+// seed、settings（None 或部分设置 dict，json.dumps 成 overrides）、now（调用方的时刻）、provider_endpoints
+// （None 或 {provider 名: {"provider", "base_url"}}，同 WorldRegistry.create；核对在 C++）。未知键抛
 // invalid_settings；缺的键取 ForkOptions 的默认值。持 GIL 调用。
 gov::ForkOptions fork_options_in(const py::dict& opts) {
     gov::ForkOptions out;
@@ -135,6 +136,9 @@ gov::ForkOptions fork_options_in(const py::dict& opts) {
                 value.is_none() ? std::string() : from_py(py::reinterpret_borrow<py::object>(value));
         } else if (key == "now") {
             out.now_iso = value.cast<std::string>();
+        } else if (key == "provider_endpoints") {
+            out.provider_endpoints =
+                provider_endpoints_in(py::reinterpret_borrow<py::object>(value));
         } else {
             throw gov::WorldStoreError("invalid_settings", "unknown fork option '" + key + "'");
         }

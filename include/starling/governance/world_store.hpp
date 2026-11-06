@@ -100,6 +100,19 @@ struct AutoSnapshotConfig {
 
 [[nodiscard]] bool is_valid_world_name(std::string_view name);
 
+// 一个 provider 此刻的端点身份（裁定 R51）：种类与 base_url。base_url 为空表示「这个种类的默认地址」，
+// openai 与 anthropic 的默认地址不同，所以只比 base_url 认不出地址变了：种类一变，密钥就会发到另一家。
+// 不含密钥。比较规则在 world_settings.hpp require_endpoint_unchanged。
+struct ProviderEndpoint {
+    std::string provider;
+    std::string base_url;
+    bool operator==(const ProviderEndpoint&) const = default;
+};
+
+// {provider 名: 该 provider 此刻的种类与 base_url}：客户端写设置时核对继承来的 endpoint 用（裁定 R40、R51）。
+// 表里没有的名字 = provider 已被删掉。
+using ProviderEndpoints = std::map<std::string, ProviderEndpoint>;
+
 // 注册表里的一个世界（RegistryDb，registry_db.hpp）。定义在这里是因为分叉的结果 ForkResult 按值带着它，
 // 而 registry_db.hpp 包含本文件。
 struct WorldRecord {
@@ -133,6 +146,9 @@ struct NewWorld {
     std::string settings_json;      // 完整的设置 JSON（settings_to_json 的输出）
     std::string now_iso;
     WorldFlags flags;
+    // 给出时 create_populated 在登记的那次持锁内、写之前按 require_endpoint_unchanged 核对 settings_json 里继承来的
+    // endpoint（与 create_world 同一条规则，裁定 R40、R51、R31 M3），endpoint_changed 时不登记、删掉世界目录。
+    std::optional<ProviderEndpoints> provider_endpoints;
 };
 
 class RegistryDb;   // registry_db.hpp：世界注册表 registry.db（SQLite）
@@ -514,6 +530,9 @@ struct ForkOptions {
     bool reclaimable = false, seed = false;        // seed 蕴含 read_only
     std::string settings_overrides_json;           // 空 = 复制来源的设置
     std::string now_iso;                           // 调用方给的时刻，记作新世界的 created_at
+    // 客户端写设置时的 provider 地址表（裁定 R31 M3，同 RegistryDb::create_world）：给出时在登记的那次持锁内核对合并后
+    // 设置里继承来的 endpoint，endpoint_changed 时不留文件、不登记。nullopt：不核对。
+    std::optional<ProviderEndpoints> provider_endpoints;
     // 测试注入用：VACUUM INTO 写完 partial 之后、再读来源的 data_version 之前调用，参数是 partial 的
     // 路径（模拟复制被篡改、复制途中来源被写）。为空时不调用（生产）。
     std::function<void(const std::filesystem::path& partial)> after_copy_for_test;
@@ -548,7 +567,8 @@ struct ForkResult {
 //      e. rename(partial, world.db)。
 //   4. 登记：tenant 取来源（语句行的 tenant_id 不可变）、label 为空、labels / retention_group /
 //      reclaimable / seed 取 opts（seed 蕴含 read_only）、fork_of_world=source、fork_of_snapshot 为空、
-//      设置是第 1 步合并的结果（只读时后台强制关）。第 3 步之后名字被抢先登记 → world_exists。
+//      设置是第 1 步合并的结果（只读时后台强制关）。第 3 步之后名字被抢先登记 → world_exists。opts.provider_endpoints
+//      给出时在这次持锁内、写之前核对设置里继承来的 endpoint（endpoint_changed，裁定 R31 M3）。
 // 任何一步失败：删掉整个新世界目录，不登记。不在注册表锁内复制。
 // 前提（调用方保证，Task 3.3 的 Python 侧持该世界的世界锁）：分叉期间没有别的写入落到来源上；有的话
 // 第 3c 步报 world_busy，不会产出不一致的副本。
