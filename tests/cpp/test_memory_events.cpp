@@ -1,9 +1,11 @@
-// test_memory_events.cpp — events 表(迁移 0038)。读侧:next_seq 与 pending_events,
-// 直接插行、不经写侧。写侧:remember_event 的四条主路径(新 key、同文本已提交、
-// 异文本冲突、补齐不抽取),LLM 用 FakeLLMAdapter,零网络。
+// test_memory_events.cpp — events 表(迁移 0038,0039 起按 holder 区分)。读侧:next_seq 与
+// pending_events,直接插行、不经写侧。写侧:remember_event 的四条主路径(新 key、同文本
+// 已提交、异文本冲突、补齐不抽取),LLM 用 FakeLLMAdapter,零网络。末尾是 0039 的回填、
+// 旧行认领与同 key 两个 holder 的用例。
 
 #include "starling/memory/memory_events.hpp"
 
+#include "starling/crypto/sha256.hpp"
 #include "starling/extractor/fake_llm_adapter.hpp"
 #include "starling/memory/memory_ops.hpp"
 #include "starling/persistence/migration_runner.hpp"
@@ -16,10 +18,12 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace starling::memoryops {
 
@@ -31,14 +35,18 @@ std::unique_ptr<persistence::SqliteAdapter> make_adapter() {
     return a;
 }
 
+// event_params() 的 holder。直接插的行也记在它名下,所以 abandon_event 等按 holder 的调用
+// 走的是「自己的行」这条路,不是旧行认领。
+constexpr const char* kHolder = "cog-self";
+
 void insert_event(persistence::Connection& conn, std::string_view tenant, std::string_view key,
                   std::int64_t seq, std::string_view state, std::string_view interlocutor = "bob",
-                  std::string_view failure_category = "") {
+                  std::string_view failure_category = "", std::string_view holder = kHolder) {
     persistence::Stmt s(conn.raw(),
-        "INSERT INTO events(tenant_id,key,text,interlocutor,text_sha256,seq,state,"
-        "failure_category) VALUES(?1,?2,?3,?4,'h',?5,?6,?7)");
+        "INSERT INTO events(tenant_id,holder_id,key,text,interlocutor,text_sha256,seq,state,"
+        "failure_category) VALUES(?1,?2,?3,?4,?5,'h',?6,?7,?8)");
     const std::string text = "text-" + std::string(key);
-    s.bind(tenant, key, text, interlocutor, seq, state, failure_category);
+    s.bind(tenant, holder, key, text, interlocutor, seq, state, failure_category);
     s.step_done();
 }
 
@@ -52,7 +60,7 @@ constexpr const char* kEpoch = "2026-01-01T00:00:00Z";
 RememberParams event_params() {
     RememberParams p;
     p.tenant_id     = "default";
-    p.holder_id     = "cog-self";
+    p.holder_id     = kHolder;
     p.interlocutor  = "bob";
     p.adapter_name  = "facade";
     p.source_prefix = "mem-";
@@ -140,12 +148,14 @@ TEST(MemoryEvents, NextSeqOnEmptyLibraryIsZero) {
 }
 
 TEST(MemoryEvents, PendingEventsOrderedBySeqOnlyPending) {
+    // 全世界的 pending 行(所有 holder),按世界一级的 seq 升序。holder 名的字母序与 seq
+    // 相反,所以按主键 (tenant_id, holder_id, key) 扫出来的顺序会让本用例失败。
     auto adapter = make_adapter();
     auto& conn = adapter->connection();
-    insert_event(conn, "default", "late", 5, "pending", "carol", "timeout");
+    insert_event(conn, "default", "late", 5, "pending", "carol", "timeout", "aaa");
     insert_event(conn, "default", "done", 2, "committed");
     insert_event(conn, "default", "gone", 3, "abandoned");
-    insert_event(conn, "default", "early", 1, "pending");
+    insert_event(conn, "default", "early", 1, "pending", "bob", "", "zzz");
     insert_event(conn, "other", "foreign", 0, "pending");
 
     const auto rows = pending_events(conn, "default");
@@ -155,10 +165,12 @@ TEST(MemoryEvents, PendingEventsOrderedBySeqOnlyPending) {
     EXPECT_EQ(rows[0].interlocutor, "bob");
     EXPECT_EQ(rows[0].seq, 1);
     EXPECT_EQ(rows[0].failure_category, "");
+    EXPECT_EQ(rows[0].holder, "zzz");
     EXPECT_EQ(rows[1].key, "late");
     EXPECT_EQ(rows[1].interlocutor, "carol");
     EXPECT_EQ(rows[1].seq, 5);
     EXPECT_EQ(rows[1].failure_category, "timeout");
+    EXPECT_EQ(rows[1].holder, "aaa");
 }
 
 TEST(MemoryEvents, PendingEventsEmptyForUnknownTenant) {
@@ -306,7 +318,7 @@ TEST(MemoryEvents, RememberEventConflictMessagesTellTheThreeCausesApart) {
                                "k-text", "bob:hi", kEpoch).extraction_failed);
     ASSERT_TRUE(remember_event(*adapter, failing, event_params(), RememberPrompts{},
                                "k-abandon", "bob:hi", kEpoch).extraction_failed);
-    abandon_event(*adapter, "default", "k-abandon");
+    abandon_event(*adapter, "default", kHolder, "k-abandon");
     auto carol = event_params();
     carol.interlocutor = "carol";
 
@@ -378,7 +390,7 @@ TEST(MemoryEvents, AbandonEventTurnsPendingIntoAbandonedAndKeepsSeq) {
     insert_event(conn, "default", "r1/turn#3", 0, "pending", "bob", "not_stored:rejected");
     insert_event(conn, "default", "r1/turn#4", 1, "pending");
 
-    abandon_event(*adapter, "default", "r1/turn#3");
+    abandon_event(*adapter, "default", kHolder, "r1/turn#3");
 
     EXPECT_EQ(event_state(conn, "r1/turn#3"), "abandoned");
     EXPECT_EQ(event_state(conn, "r1/turn#4"), "pending");     // 只动目标 key
@@ -393,8 +405,8 @@ TEST(MemoryEvents, AbandonEventTwiceIsNoop) {
     auto& conn = adapter->connection();
     insert_event(conn, "default", "r1/turn#3", 0, "pending");
 
-    abandon_event(*adapter, "default", "r1/turn#3");
-    EXPECT_NO_THROW(abandon_event(*adapter, "default", "r1/turn#3"));
+    abandon_event(*adapter, "default", kHolder, "r1/turn#3");
+    EXPECT_NO_THROW(abandon_event(*adapter, "default", kHolder, "r1/turn#3"));
     EXPECT_EQ(event_state(conn, "r1/turn#3"), "abandoned");
 }
 
@@ -405,7 +417,7 @@ TEST(MemoryEvents, AbandonEventRefusesCommittedWithEventConflict) {
     ASSERT_EQ(remember_event(*adapter, llm, event_params(), RememberPrompts{},
                              "r1/turn#3", "bob:hi", kEpoch).outcome, "accepted");
 
-    EXPECT_THROW(abandon_event(*adapter, "default", "r1/turn#3"), EventConflict);
+    EXPECT_THROW(abandon_event(*adapter, "default", kHolder, "r1/turn#3"), EventConflict);
     EXPECT_EQ(event_state(adapter->connection(), "r1/turn#3"), "committed");
 }
 
@@ -414,7 +426,7 @@ TEST(MemoryEvents, AbandonEventUnknownKeyThrowsOutOfRange) {
     auto& conn = adapter->connection();
     insert_event(conn, "other", "r1/turn#3", 0, "pending");   // 别的租户的同名 key 不算
 
-    EXPECT_THROW(abandon_event(*adapter, "default", "r1/turn#3"), std::out_of_range);
+    EXPECT_THROW(abandon_event(*adapter, "default", kHolder, "r1/turn#3"), std::out_of_range);
     EXPECT_EQ(event_state(conn, "r1/turn#3"), "");            // 没有凭空造行
 }
 
@@ -426,7 +438,7 @@ TEST(MemoryEvents, AbandonEventOnlyTouchesItsOwnTenant) {
     insert_event(conn, "default", "r1/turn#3", 0, "pending");
     insert_event(conn, "other", "r1/turn#3", 0, "pending");
 
-    abandon_event(*adapter, "default", "r1/turn#3");
+    abandon_event(*adapter, "default", kHolder, "r1/turn#3");
 
     EXPECT_EQ(state_of(conn, "default", "r1/turn#3"), "abandoned");
     EXPECT_EQ(state_of(conn, "other", "r1/turn#3"), "pending");   // 别的租户没被牵连
@@ -441,7 +453,7 @@ TEST(MemoryEvents, AbandonDuringExtractIsNotResurrectedByPhaseThree) {
     auto adapter = make_adapter();
     MutateRowDuringExtractAdapter llm(
         extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true},
-        [&adapter] { abandon_event(*adapter, "default", "r1/turn#3"); });
+        [&adapter] { abandon_event(*adapter, "default", kHolder, "r1/turn#3"); });
 
     EXPECT_THROW(remember_event(*adapter, llm, event_params(), RememberPrompts{},
                                 "r1/turn#3", "bob:hi", kEpoch),
@@ -464,7 +476,7 @@ TEST(MemoryEvents, AbandonDuringExtractAlsoGuardsTheFailureBranch) {
     auto adapter = make_adapter();
     MutateRowDuringExtractAdapter llm(
         extractor::LLMResponse{.raw_xml = "", .ok = false, .error = "forced failure"},
-        [&adapter] { abandon_event(*adapter, "default", "r1/turn#3"); });
+        [&adapter] { abandon_event(*adapter, "default", kHolder, "r1/turn#3"); });
 
     EXPECT_THROW(remember_event(*adapter, llm, event_params(), RememberPrompts{},
                                 "r1/turn#3", "bob:hi", kEpoch),
@@ -501,12 +513,298 @@ TEST(MemoryEvents, AbandonedKeyRejectsLaterRememberEvent) {
     // 抽取失败 → 行留 pending(带 failure_category),随后放弃。
     ASSERT_TRUE(remember_event(*adapter, failing, event_params(), RememberPrompts{},
                                "r1/turn#3", "bob:hi", kEpoch).extraction_failed);
-    abandon_event(*adapter, "default", "r1/turn#3");
+    abandon_event(*adapter, "default", kHolder, "r1/turn#3");
 
     EXPECT_THROW(remember_event(*adapter, llm, event_params(), RememberPrompts{},
                                 "r1/turn#3", "bob:hi", kEpoch),
                  EventConflict);
     EXPECT_EQ(row_count(adapter->connection(), "SELECT COUNT(*) FROM statements"), 0);
+}
+
+// ── 迁移 0039:events 按 holder 区分 ──
+
+namespace {
+
+// 0038 的 events 表,逐字照抄迁移文件(已发布的迁移有 checksum 钉着,不会再变)。
+// 用来在最新库上造一份「只跑到 0038」的库:删掉 0039 起的表形与迁移记录。
+constexpr const char* kEvents0038Ddl = R"SQL(
+CREATE TABLE IF NOT EXISTS events (
+    tenant_id          TEXT NOT NULL,
+    key                TEXT NOT NULL,
+    text               TEXT NOT NULL,
+    interlocutor       TEXT NOT NULL,
+    text_sha256        TEXT NOT NULL,
+    engram_ref         TEXT,
+    statement_ids_json TEXT NOT NULL DEFAULT '[]',
+    seq                INTEGER NOT NULL,
+    state              TEXT NOT NULL CHECK (state IN ('pending','committed','abandoned')),
+    failure_category   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (tenant_id, key),
+    UNIQUE (tenant_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_events_state ON events(tenant_id, state);
+)SQL";
+
+void exec_script(persistence::Connection& conn, const char* sql) {
+    char* err = nullptr;
+    const int result_code = sqlite3_exec(conn.raw(), sql, nullptr, nullptr, &err);
+    const std::string msg = err != nullptr ? err : "";
+    sqlite3_free(err);
+    ASSERT_EQ(result_code, SQLITE_OK) << msg;
+}
+
+std::unique_ptr<persistence::SqliteAdapter> make_adapter_at_0038() {
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    exec_script(conn, "DROP TABLE events");
+    exec_script(conn, kEvents0038Ddl);
+    exec_script(conn, "DELETE FROM schema_migrations WHERE version >= 39");
+    return adapter;
+}
+
+// 0038 形状的 events 行(没有 holder_id 列)。
+void insert_0038_event(persistence::Connection& conn, std::string_view key, std::int64_t seq,
+                       std::string_view state, std::string_view statement_ids_json) {
+    persistence::Stmt ins(conn.raw(),
+        "INSERT INTO events(tenant_id,key,text,interlocutor,text_sha256,statement_ids_json,"
+        "seq,state) VALUES('default',?1,'bob:hi','bob','h',?2,?3,?4)");
+    ins.bind(key, statement_ids_json, seq, state);
+    ins.step_done();
+}
+
+// 一条最小的语句行,只为让回填能按 id 查到 holder_id。
+void insert_statement(persistence::Connection& conn, std::string_view tenant,
+                      std::string_view stmt_id, std::string_view holder) {
+    persistence::Stmt ins(conn.raw(),
+        "INSERT INTO statements(id,tenant_id,holder_id,holder_perspective,subject_kind,"
+        "subject_id,predicate,object_kind,object_value,canonical_object_hash,modality,"
+        "polarity,confidence,observed_at,salience,affect_json,activation,last_accessed,"
+        "provenance,created_at,updated_at) "
+        "VALUES(?1,?2,?3,'first_person','entity','cog-bob','responsible_for','str','auth',"
+        "'h-obj','believes','pos',0.7,'2026-01-01T00:00:00Z',0.5,'{}',0.0,"
+        "'2026-01-01T00:00:00Z','user_input','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')");
+    ins.bind(stmt_id, tenant, holder);
+    ins.step_done();
+}
+
+std::string text_query(persistence::Connection& conn, const std::string& sql) {
+    persistence::Stmt q(conn.raw(), sql.c_str());
+    if (!q.step_row()) return {};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(q.raw(), 0));
+    return text != nullptr ? std::string(text) : std::string();
+}
+
+std::string holder_of(persistence::Connection& conn, std::string_view key) {
+    return text_query(conn, "SELECT holder_id FROM events WHERE tenant_id='default' AND key='" +
+                                std::string(key) + "'");
+}
+
+// 0039 之后、还没被任何 holder 碰过的旧行(holder_id=''),文本哈希是真的,同文本能对上。
+void insert_unclaimed_event(persistence::Connection& conn, std::string_view key,
+                            std::string_view text, std::int64_t seq, std::string_view state) {
+    persistence::Stmt ins(conn.raw(),
+        "INSERT INTO events(tenant_id,holder_id,key,text,interlocutor,text_sha256,seq,state) "
+        "VALUES('default','',?1,?2,'bob',?3,?4,?5)");
+    ins.bind(key, text, crypto::sha256_hex(text), seq, state);
+    ins.step_done();
+}
+
+RememberParams holder_params(std::string_view holder) {
+    auto params = event_params();
+    params.holder_id = std::string(holder);
+    return params;
+}
+
+// 语句表里这批 id 的 holder_id(去重)。
+std::set<std::string> holders_of_statements(persistence::Connection& conn,
+                                            const std::vector<std::string>& ids) {
+    std::set<std::string> holders;
+    for (const auto& stmt_id : ids) {
+        holders.insert(text_query(
+            conn, "SELECT holder_id FROM statements WHERE tenant_id='default' AND id='" +
+                      stmt_id + "'"));
+    }
+    return holders;
+}
+
+}  // namespace
+
+TEST(MemoryEvents0039, LegacyRowsBackfillHolderFromStatements) {
+    auto adapter = make_adapter_at_0038();
+    auto& conn = adapter->connection();
+    // 列表里第一条在本租户查不到(别的租户有同 id 的语句,不算),第二条是 alice 的。
+    insert_statement(conn, "other", "s-missing", "mallory");
+    insert_statement(conn, "default", "s-alice", "alice");
+    insert_0038_event(conn, "k-committed", 0, "committed", R"(["s-missing","s-alice"])");
+    insert_0038_event(conn, "k-pending", 1, "pending", "[]");
+    insert_0038_event(conn, "k-abandoned", 2, "abandoned", "[]");
+
+    persistence::MigrationRunner(conn.raw()).migrate_to_latest();
+
+    EXPECT_EQ(holder_of(conn, "k-committed"), "alice");
+    EXPECT_EQ(holder_of(conn, "k-pending"), "");
+    EXPECT_EQ(holder_of(conn, "k-abandoned"), "");
+    // 其余列原样复制。
+    EXPECT_EQ(text_query(conn, "SELECT statement_ids_json FROM events WHERE key='k-committed'"),
+              R"(["s-missing","s-alice"])");
+    EXPECT_EQ(event_state(conn, "k-abandoned"), "abandoned");
+    EXPECT_EQ(next_seq(conn, "default"), 3);
+
+    std::vector<std::string> pk_columns;
+    {
+        persistence::Stmt q(conn.raw(),
+                            "SELECT name FROM pragma_table_info('events') WHERE pk > 0 "
+                            "ORDER BY pk");
+        while (q.step_row()) {
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+            pk_columns.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(q.raw(), 0)));
+        }
+    }
+    EXPECT_EQ(pk_columns, (std::vector<std::string>{"tenant_id", "holder_id", "key"}));
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND "
+                              "name='idx_events_state'"),
+              1);
+
+    // seq 仍是世界一级的唯一键:另一个 holder、另一个 key,同一个 seq 照样撞约束。
+    EXPECT_THROW(insert_event(conn, "default", "k-new", 1, "pending", "bob", "", "bob"),
+                 persistence::SqliteError);
+}
+
+TEST(MemoryEvents0039, MalformedStatementIdsBackfillEmptyHolderInsteadOfFailing) {
+    // 列被外部写坏时迁移不许失败(失败了库就打不开),与 parse_statement_ids 当空一致。
+    auto adapter = make_adapter_at_0038();
+    auto& conn = adapter->connection();
+    insert_statement(conn, "default", "s-alice", "alice");
+    insert_0038_event(conn, "k-bad", 0, "committed", "not json");
+    insert_0038_event(conn, "k-object", 1, "committed", R"({"first":"s-alice"})");
+
+    persistence::MigrationRunner(conn.raw()).migrate_to_latest();
+
+    EXPECT_EQ(holder_of(conn, "k-bad"), "");
+    EXPECT_EQ(event_state(conn, "k-bad"), "committed");
+    EXPECT_EQ(holder_of(conn, "k-object"), "");      // 不是数组:当空,不按对象的值去找
+}
+
+TEST(MemoryEvents0039, FirstHolderClaimsLegacyRow) {
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    insert_unclaimed_event(conn, "r1/turn#3", "bob:hi", 4, "pending");
+    extractor::FakeLLMAdapter llm;
+    llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+
+    // bob 先碰到它:行归 bob,按 pending 重试走(原 seq,不另分配),收成 committed。
+    const auto bob = remember_event(*adapter, llm, holder_params("bob"), RememberPrompts{},
+                                    "r1/turn#3", "bob:hi", kEpoch);
+    EXPECT_FALSE(bob.extraction_failed);
+    ASSERT_FALSE(bob.statement_ids.empty());
+    EXPECT_EQ(holder_of(conn, "r1/turn#3"), "bob");
+    EXPECT_EQ(event_state(conn, "r1/turn#3"), "committed");
+    EXPECT_EQ(next_seq(conn, "default"), 5);
+    EXPECT_EQ(text_query(conn, "SELECT created_at FROM engrams"), "2026-01-01T00:00:04Z");
+    EXPECT_EQ(holders_of_statements(conn, bob.statement_ids), std::set<std::string>{"bob"});
+
+    // 之后 carol 写同一个 key 是一条全新的事件(新 seq、自己的行),不是重入:重入会原样
+    // 拿到 bob 的语句 id。
+    const auto carol = remember_event(*adapter, llm, holder_params("carol"), RememberPrompts{},
+                                      "r1/turn#3", "bob:hi", kEpoch);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events WHERE key='r1/turn#3'"), 2);
+    EXPECT_EQ(row_count(conn, "SELECT seq FROM events WHERE holder_id='carol'"), 5);
+    EXPECT_EQ(next_seq(conn, "default"), 6);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events WHERE holder_id='bob' AND "
+                              "state='committed' AND seq=4"),
+              1);                                       // bob 的行没被动
+    for (const auto& stmt_id : carol.statement_ids) {
+        EXPECT_EQ(std::ranges::count(bob.statement_ids, stmt_id), 0) << stmt_id;
+    }
+}
+
+TEST(MemoryEvents0039, AbandonEventClaimsLegacyRow) {
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    insert_unclaimed_event(conn, "r1/turn#3", "bob:hi", 0, "pending");
+
+    abandon_event(*adapter, "default", "bob", "r1/turn#3");
+
+    EXPECT_EQ(holder_of(conn, "r1/turn#3"), "bob");
+    EXPECT_EQ(event_state(conn, "r1/turn#3"), "abandoned");
+    // 行已归 bob:carol 名下没有这个 key,也没有可认领的旧行了。
+    EXPECT_THROW(abandon_event(*adapter, "default", "carol", "r1/turn#3"), std::out_of_range);
+
+    // 被拒绝的放弃不留认领:committed 旧行抛 EventConflict,事务回滚,行仍无主。
+    insert_unclaimed_event(conn, "r1/turn#4", "bob:hi", 1, "committed");
+    EXPECT_THROW(abandon_event(*adapter, "default", "bob", "r1/turn#4"), EventConflict);
+    EXPECT_EQ(holder_of(conn, "r1/turn#4"), "");
+}
+
+TEST(MemoryEvents0039, AbandonedLegacyRowRejectsRememberEventAfterClaim) {
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    insert_unclaimed_event(conn, "r1/turn#3", "bob:hi", 0, "abandoned");
+    extractor::FakeLLMAdapter llm;
+    llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+
+    // remember_event 认领后按状态机走到 abandoned → EventConflict。冲突回滚整个短事务,
+    // 认领一并撤销:行原样留着,不另插行、不分配 seq。
+    const auto msg = conflict_message([&] {
+        remember_event(*adapter, llm, holder_params("bob"), RememberPrompts{}, "r1/turn#3",
+                       "bob:hi", kEpoch);
+    });
+    EXPECT_NE(msg.find("already abandoned"), std::string::npos) << msg;
+    EXPECT_EQ(holder_of(conn, "r1/turn#3"), "");
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events"), 1);
+    EXPECT_EQ(next_seq(conn, "default"), 1);
+
+    // abandon_event 对已放弃的行是幂等的,但会认领它;认领之后照样冲突。
+    abandon_event(*adapter, "default", "bob", "r1/turn#3");
+    EXPECT_EQ(holder_of(conn, "r1/turn#3"), "bob");
+    EXPECT_THROW(remember_event(*adapter, llm, holder_params("bob"), RememberPrompts{},
+                                "r1/turn#3", "bob:hi", kEpoch),
+                 EventConflict);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM statements"), 0);
+}
+
+TEST(MemoryEventsHolder, SameKeySameTextGivesEachHolderOwnStatements) {
+    {
+        auto adapter = make_adapter();
+        auto& conn = adapter->connection();
+        extractor::FakeLLMAdapter llm;
+        llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+
+        const auto first = remember_event(*adapter, llm, holder_params("A"), RememberPrompts{},
+                                          "ep1#3", "B：你好", kEpoch);
+        const auto second = remember_event(*adapter, llm, holder_params("B"), RememberPrompts{},
+                                           "ep1#3", "B：你好", kEpoch);
+        EXPECT_EQ(first.outcome, "accepted");
+        EXPECT_EQ(second.outcome, "accepted");
+        ASSERT_FALSE(first.statement_ids.empty());
+        ASSERT_FALSE(second.statement_ids.empty());
+        for (const auto& stmt_id : second.statement_ids) {
+            EXPECT_EQ(std::ranges::count(first.statement_ids, stmt_id), 0) << stmt_id;
+        }
+        EXPECT_EQ(holders_of_statements(conn, first.statement_ids), std::set<std::string>{"A"});
+        EXPECT_EQ(holders_of_statements(conn, second.statement_ids), std::set<std::string>{"B"});
+        EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events WHERE state='committed'"), 2);
+        EXPECT_EQ(next_seq(conn, "default"), 2);
+    }
+    {
+        // 中途失败:两行都留 pending,pending_events 按 seq 列出,各带自己的 holder。
+        auto adapter = make_adapter();
+        AlwaysFailingLLMAdapter failing;
+        ASSERT_TRUE(remember_event(*adapter, failing, holder_params("A"), RememberPrompts{},
+                                   "ep1#3", "B：你好", kEpoch).extraction_failed);
+        ASSERT_TRUE(remember_event(*adapter, failing, holder_params("B"), RememberPrompts{},
+                                   "ep1#3", "B：你好", kEpoch).extraction_failed);
+
+        const auto rows = pending_events(adapter->connection(), "default");
+        ASSERT_EQ(rows.size(), 2U);
+        EXPECT_EQ(rows[0].key, "ep1#3");
+        EXPECT_EQ(rows[0].holder, "A");
+        EXPECT_EQ(rows[0].seq, 0);
+        EXPECT_EQ(rows[1].key, "ep1#3");
+        EXPECT_EQ(rows[1].holder, "B");
+        EXPECT_EQ(rows[1].seq, 1);
+    }
 }
 
 }  // namespace starling::memoryops

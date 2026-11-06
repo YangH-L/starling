@@ -36,9 +36,10 @@ def test_events_table_shape(tmp_path):
         cols = {r[1] for r in c.execute("PRAGMA table_info(events)")}
         pk = [r[1] for r in sorted(c.execute("PRAGMA table_info(events)"), key=lambda r: r[5]) if r[5]]
         assert c.execute("SELECT name FROM schema_migrations WHERE version=38").fetchone() is not None
-    assert cols == {"tenant_id", "key", "text", "interlocutor", "text_sha256", "engram_ref",
-                    "statement_ids_json", "seq", "state", "failure_category"}
-    assert pk == ["tenant_id", "key"]
+    # 0039 起按 holder 区分:多一列 holder_id,主键 (tenant_id, holder_id, key)。
+    assert cols == {"tenant_id", "holder_id", "key", "text", "interlocutor", "text_sha256",
+                    "engram_ref", "statement_ids_json", "seq", "state", "failure_category"}
+    assert pk == ["tenant_id", "holder_id", "key"]
 
 
 def test_events_state_check_rejects_unknown(tmp_path):

@@ -700,7 +700,8 @@ void bind_13_memory_ops(pybind11::module_& m) {
               for (const auto& row : starling::memoryops::pending_events(conn, tenant)) {
                   out.append(py::dict("key"_a = row.key, "text"_a = row.text,
                                       "interlocutor"_a = row.interlocutor, "seq"_a = row.seq,
-                                      "failure_category"_a = row.failure_category));
+                                      "failure_category"_a = row.failure_category,
+                                      "holder"_a = row.holder));
               }
               return out;
           },
@@ -768,14 +769,14 @@ void bind_13_memory_ops(pybind11::module_& m) {
     // KeyError,所以这里显式改译:调用方拼错 key 该得到 KeyError。
     m.def("memory_abandon_event",
           [](starling::persistence::SqliteAdapter& adapter, const std::string& tenant,
-             const std::string& key) {
+             const std::string& holder, const std::string& key) {
               try {
-                  starling::memoryops::abandon_event(adapter, tenant, key);
+                  starling::memoryops::abandon_event(adapter, tenant, holder, key);
               } catch (const std::out_of_range& e) {
                   throw py::key_error(e.what());
               }
           },
-          py::arg("adapter"), py::arg("tenant"), py::arg("key"));
+          py::arg("adapter"), py::arg("tenant"), py::arg("holder"), py::arg("key"));
 
     // library 的逻辑摘要与语句的内容 id(memoryops::digest / content_ids)。规范化与
     // 哈希都在 C++,这里只转发。纯本地 SQLite 读,无网络,不放 GIL。

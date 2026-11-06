@@ -39,12 +39,12 @@ struct EventRow {
 };
 
 EventRow read_event(persistence::Connection& conn, std::string_view tenant,
-                    std::string_view key) {
+                    std::string_view holder, std::string_view key) {
     persistence::Stmt stmt(conn.raw(),
                            "SELECT state, text, text_sha256, COALESCE(engram_ref,''), "
                            "statement_ids_json, seq, interlocutor "
-                           "FROM events WHERE tenant_id=?1 AND key=?2");
-    stmt.bind(tenant, key);
+                           "FROM events WHERE tenant_id=?1 AND holder_id=?2 AND key=?3");
+    stmt.bind(tenant, holder, key);
     EventRow row;
     if (!stmt.step_row()) {
         return row;
@@ -57,6 +57,30 @@ EventRow read_event(persistence::Connection& conn, std::string_view tenant,
     row.statement_ids_json = column_string(stmt.raw(), 4);
     row.seq                = sqlite3_column_int64(stmt.raw(), 5);
     row.interlocutor       = column_string(stmt.raw(), 6);
+    return row;
+}
+
+// 按 (tenant, holder, key) 读行;读不到再找 (tenant, '', key) 的无主旧行(迁移 0039 回填
+// 不出 holder 的那些),找到就把它的 holder_id 改成本次的 holder,再当作自己的行返回
+// (设计源 §4.3 的认领规则:旧库都是一库一 holder,第一个碰到它的 holder 就是它的主人)。
+// 必须在调用方的写事务里调:认领与随后的状态机判断同进同退——状态机抛 EventConflict
+// 时事务回滚,认领也一并撤销,被拒绝的调用不在库里留下任何改动。
+// holder 本身是 '' 时第一步就读到了那行,不会走到认领。
+EventRow read_or_claim_event(persistence::Connection& conn, std::string_view tenant,
+                             std::string_view holder, std::string_view key) {
+    EventRow row = read_event(conn, tenant, holder, key);
+    if (row.found || holder.empty()) {
+        return row;
+    }
+    row = read_event(conn, tenant, /*holder=*/"", key);
+    if (!row.found) {
+        return row;
+    }
+    persistence::Stmt claim(conn.raw(),
+                            "UPDATE events SET holder_id=?1 "
+                            "WHERE tenant_id=?2 AND holder_id='' AND key=?3");
+    claim.bind(holder, tenant, key);
+    claim.step_done();
     return row;
 }
 
@@ -175,8 +199,9 @@ std::int64_t next_seq(persistence::Connection& conn, std::string_view tenant) {
 std::vector<PendingEventRow> pending_events(persistence::Connection& conn,
                                             std::string_view tenant) {
     persistence::Stmt stmt(conn.raw(),
-                           "SELECT key, text, interlocutor, seq, failure_category FROM events "
-                           "WHERE tenant_id=?1 AND state='pending' ORDER BY seq ASC");
+                           "SELECT key, text, interlocutor, seq, failure_category, holder_id "
+                           "FROM events WHERE tenant_id=?1 AND state='pending' "
+                           "ORDER BY seq ASC");
     stmt.bind(tenant);
     std::vector<PendingEventRow> rows;
     while (stmt.step_row()) {
@@ -186,6 +211,7 @@ std::vector<PendingEventRow> pending_events(persistence::Connection& conn,
         row.interlocutor = column_string(stmt.raw(), 2);
         row.seq = sqlite3_column_int64(stmt.raw(), 3);
         row.failure_category = column_string(stmt.raw(), 4);
+        row.holder = column_string(stmt.raw(), 5);
         rows.push_back(std::move(row));
     }
     return rows;
@@ -203,12 +229,13 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
     auto& conn = adapter.connection();
     const std::string text_sha = crypto::sha256_hex(text);
 
-    // ── 第 1 段:短事务,读收据行,无行则占位。事务在本段末尾结束。 ──
+    // ── 第 1 段:短事务,读收据行(按 holder,必要时认领无主旧行),无行则占位。
+    //    事务在本段末尾结束。 ──
     EventRow row;
     bool retrying_pending = false;   // 只有重试已存在的 pending 行才进补齐分支
     {
         persistence::TransactionGuard txn(conn);
-        row = read_event(conn, base.tenant_id, key);
+        row = read_or_claim_event(conn, base.tenant_id, base.holder_id, key);
         if (row.found) {
             if (row.state == "abandoned") {
                 throw EventConflict(
@@ -253,9 +280,10 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
             row.seq          = next_seq(conn, base.tenant_id);
             persistence::Stmt ins(
                 conn.raw(),
-                "INSERT INTO events(tenant_id,key,text,interlocutor,text_sha256,seq,state) "
-                "VALUES(?1,?2,?3,?4,?5,?6,'pending')");
-            ins.bind(base.tenant_id, key, row.text, row.interlocutor, text_sha, row.seq);
+                "INSERT INTO events(tenant_id,holder_id,key,text,interlocutor,text_sha256,"
+                "seq,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending')");
+            ins.bind(base.tenant_id, base.holder_id, key, row.text, row.interlocutor, text_sha,
+                     row.seq);
             ins.step_done();
         }
         txn.commit();
@@ -266,9 +294,13 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
     // interlocutor 同样取行里的值,而不是 base 的:此刻两者必然相等(不等的重试已在第 1
     // 段抛了),显式取行里的,是让「重试沿用首次写入的说话对象」这件事不依赖那个前提,
     // 以后谁改了上面的比对,这里也不会悄悄退回到用本次调用的值。
+    // 来源身份按 holder 分开(设计源 §4.3,裁定 R6):engram 按 source_prefix + sha256(payload)
+    // 去重,不带 holder 时两个 holder 写同一段话会共用一个 engram,后写者被当成重入、
+    // 抽取的 span key 也撞上先写者的,一条语句都写不出来。带上 holder,各得各的 engram。
     const std::string payload_text = "[" + std::string(key) + "] " + row.text;
     RememberParams params = base;
     params.interlocutor = row.interlocutor;
+    params.source_prefix = base.source_prefix + "h:" + base.holder_id + ":";
     params.payload.assign(payload_text.begin(), payload_text.end());
     params.created_at_iso8601 = add_seconds_to_iso(epoch_iso, row.seq);
 
@@ -330,18 +362,20 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
             persistence::Stmt upd(conn.raw(),
                                   "UPDATE events SET failure_category=?1, "
                                   "engram_ref=COALESCE(NULLIF(?2,''), engram_ref) "
-                                  "WHERE tenant_id=?3 AND key=?4 AND state='pending'");
-            upd.bind(category, result.engram_ref, base.tenant_id, key);
+                                  "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
+                                  "AND state='pending'");
+            upd.bind(category, result.engram_ref, base.tenant_id, base.holder_id, key);
             upd.step_done();
             require_pending_row_updated(conn, key);
         } else {
             persistence::Stmt upd(conn.raw(),
                                   "UPDATE events SET state='committed', engram_ref=?1, "
                                   "statement_ids_json=?2, failure_category='' "
-                                  "WHERE tenant_id=?3 AND key=?4 AND state='pending'");
+                                  "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
+                                  "AND state='pending'");
             upd.bind(result.engram_ref,
                      nlohmann::json(result.statement_ids).dump(),
-                     base.tenant_id, key);
+                     base.tenant_id, base.holder_id, key);
             upd.step_done();
             require_pending_row_updated(conn, key);
         }
@@ -352,15 +386,16 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
 
 void abandon_event(persistence::SqliteAdapter& adapter,
                    std::string_view tenant,
+                   std::string_view holder,
                    std::string_view key) {
     governance::require_write_admission(adapter);   // 门前抛 = 零 DB 写
     auto& conn = adapter.connection();
 
     // 读状态与改状态在同一个事务里:TransactionGuard 的最外层是 BEGIN IMMEDIATE,
     // 读到 pending 之后别的写者插不进来改成 committed。两条抛出路径都没 commit,
-    // 守卫析构时回滚,什么都不留。
+    // 守卫析构时回滚,什么都不留(无主旧行的认领也一并撤销)。
     persistence::TransactionGuard txn(conn);
-    const EventRow row = read_event(conn, tenant, key);
+    const EventRow row = read_or_claim_event(conn, tenant, holder, key);
     if (!row.found) {
         throw std::out_of_range("abandon_event: no such key (key=" + std::string(key) + ")");
     }
@@ -372,8 +407,9 @@ void abandon_event(persistence::SqliteAdapter& adapter,
     if (row.state == "pending") {
         persistence::Stmt upd(conn.raw(),
                               "UPDATE events SET state='abandoned' "
-                              "WHERE tenant_id=?1 AND key=?2 AND state='pending'");
-        upd.bind(tenant, key);
+                              "WHERE tenant_id=?1 AND holder_id=?2 AND key=?3 "
+                              "AND state='pending'");
+        upd.bind(tenant, holder, key);
         upd.step_done();
     }
     // state == "abandoned":已是终态,什么都不改(幂等)。

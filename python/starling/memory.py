@@ -166,12 +166,14 @@ class TickStats:
 class PendingEvent:
     """One `events` row still in state 'pending': a keyed write that was recorded
     but not yet committed. `seq` is the per-tenant sequence number (starts at 0);
-    `failure_category` is '' until a failed attempt records one."""
+    `failure_category` is '' until a failed attempt records one. `holder` is the
+    holder the event belongs to ('' for a pre-0039 row no holder has claimed yet)."""
     key: str
     text: str
     interlocutor: str
     seq: int
     failure_category: str
+    holder: str = ""
 
 
 @dataclass
