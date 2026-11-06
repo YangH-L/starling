@@ -174,6 +174,29 @@ def test_fork_through_http_digest_matches(client, monkeypatch):
     assert "fresh" not in _rows(client)
 
 
+
+def test_fork_of_default_world_with_foreign_tenant_rows_is_409(client):
+    """裁定 R29（审查 I2）：默认世界（原地的 dashboard.db）可以按租户过滤地存多个租户，分叉复制整个文件，新世界
+    每次打开都会 world_tenant_mismatch。C++ 分叉在 partial 上核对租户，不过就 409 world_tenant_mismatch，什么都不
+    登记、不留目录。"""
+    pool = _pool(client)
+    resp = client.post("/api/remember", json={"text": "Bob owns auth"})
+    assert resp.status_code == 200, resp.text
+    db = pool.record("default")["db_path"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO engrams(id,tenant_id,content_hash,source_kind,ingest_policy,"
+            "ingest_mode,privacy_class,retention_mode,created_at,source_item_id) "
+            "VALUES('x-1','intruder','hx','conversation','default','inline','normal',"
+            "'audit_retain','2026-10-25T00:00:00Z','x-1')")
+    conn.close()
+    worlds_root = os.path.join(os.path.dirname(db), "worlds")
+    dirs = set(os.listdir(worlds_root)) if os.path.isdir(worlds_root) else set()
+    resp = client.post("/api/worlds/default/fork", json={"new_name": "rollout-1"})
+    assert (resp.status_code, resp.json()["detail"]) == (409, "world_tenant_mismatch")
+    assert "rollout-1" not in _rows(client)
+    assert (set(os.listdir(worlds_root)) if os.path.isdir(worlds_root) else set()) == dirs
+
 def test_fork_of_schema_behind_source_is_409(client):
     pool = _pool(client)
     src = _source_with_content(client)

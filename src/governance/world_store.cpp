@@ -1923,6 +1923,14 @@ void require_intact(const fs::path& copy) {
     }
 }
 
+// 分叉与升级种子复制出来的 partial，改名、登记之前的两项检查：integrity_check（snapshot_failed），然后
+// 租户不变式（裁定 R29，与回滚第 6–7 步同一个函数 verify_world_tenant）：VACUUM INTO 复制整个文件，来源库里
+// 别的租户的行也跟着过来，这样的世界每次打开都 world_tenant_mismatch，所以在这里就拒绝。
+void require_intact_single_tenant(const fs::path& partial, const std::string& tenant) {
+    require_intact(partial);
+    verify_world_tenant(partial.string(), tenant);
+}
+
 // 非 WorldStoreError（SqliteError、filesystem_error 等）转成 snapshot_failed，消息带上 what。
 template <typename Body>
 auto as_world_store_error(const std::string& what, const Body& body) {
@@ -2013,7 +2021,7 @@ std::string copy_verified(persistence::Connection& source_conn, const std::strin
         throw WorldStoreError("world_busy", "source '" + source +
                                                 "' was written while it was being copied; retry");
     }
-    require_intact(partial);
+    require_intact_single_tenant(partial, tenant);
     const std::string copied = digest_of_file(partial, tenant);
     if (copied != expected) {
         throw WorldStoreError("fork_digest_mismatch",
@@ -2094,7 +2102,7 @@ ForkResult upgrade_seed(RegistryDb& reg, const std::string& source, const std::s
         return reg.create_populated(spec, [&](const fs::path& db_file) {
             const fs::path partial = db_file.string() + ".partial";
             vacuum_into(conn.raw(), partial);
-            require_intact(partial);
+            require_intact_single_tenant(partial, plan.source.tenant);
             {
                 auto adapter = persistence::SqliteAdapter::open(partial);   // 跑迁移到最新
                 adapter->close();                                            // WAL 合并进主文件

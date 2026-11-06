@@ -42,7 +42,8 @@ private:
 //           | insufficient_disk | snapshot_failed
 //           | labels_immutable（RegistryDb::set_labels：世界已有标签，标签创建后不可改）
 //           | invalid_snapshot_kind（take_snapshot：kind 不是 manual / auto，或 kind 与 reason 不配对）
-//           | world_tenant_mismatch（verify_world_tenant：库里有别的租户的行）
+//           | world_tenant_mismatch（verify_world_tenant：库里有别的租户的行；fork_world / fork_world_from_connection /
+//             upgrade_seed：复制出来的库里有别的租户的行，裁定 R29）
 //           | snapshot_unsupported_backend（take_snapshot / rollback_world：vector_backend 不是 sqlite）
 //           | snapshot_corrupt（rollback_world：快照文件缺失、打不开或 integrity_check 不过）
 //           | world_in_use（rollback_world：第 8 步的探测发现别的连接开着要被替换的库。WAL 库上
@@ -538,8 +539,9 @@ struct ForkResult {
 //      c. 再读一次 data_version 与 total_changes：任一变了（别的连接或同一条连接在复制途中提交了
 //         写入）→ world_busy（瞬态，调用方重试）。所以 fork_digest_mismatch 只表示「来源没变，复制
 //         却不同」；
-//      d. 只读打开 partial：PRAGMA integrity_check 必须为 "ok"（否则 snapshot_failed），算 digest，
-//         与 a 的不同 → fork_digest_mismatch；
+//      d. 只读打开 partial：PRAGMA integrity_check 必须为 "ok"（否则 snapshot_failed）；verify_world_tenant(partial,
+//         来源租户)（裁定 R29：VACUUM INTO 复制整个文件，来源库里别的租户的行也会过来）→ world_tenant_mismatch；
+//         算 digest，与 a 的不同 → fork_digest_mismatch；
 //      e. rename(partial, world.db)。
 //   4. 登记：tenant 取来源（语句行的 tenant_id 不可变）、label 为空、labels / retention_group /
 //      reclaimable / seed 取 opts（seed 蕴含 read_only）、fork_of_world=source、fork_of_snapshot 为空、
@@ -565,7 +567,8 @@ ForkResult fork_world(RegistryDb& reg, const std::string& source, const std::str
 
 // 升级种子（spec §6.2，由人显式来做）：来源不是种子（seed=false）抛 invalid_settings（消息写明不是种子）。
 // new_name 的校验同 fork_world 第 1 步。然后经 RegistryDb::create_populated：只读打开旧种子的库，
-// VACUUM INTO 新世界目录的 world.db.partial，integrity_check，在 partial 上 SqliteAdapter::open（跑迁移
+// VACUUM INTO 新世界目录的 world.db.partial，integrity_check，verify_world_tenant(partial, 旧种子的租户)
+// （world_tenant_mismatch，裁定 R29），在 partial 上 SqliteAdapter::open（跑迁移
 // 到最新）并关闭（WAL 合并进主文件；之后 partial 旁边还有 -wal / -journal 就 snapshot_failed），
 // rename 成 world.db，再只读打开算 digest（缺表时空串，裁定 R10）。迁移可能给语句行加列，所以不与
 // 旧种子的摘要比较。登记：seed=true（蕴含只读）、fork_of_world=source、tenant / label / labels /

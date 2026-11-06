@@ -481,4 +481,42 @@ TEST(WorldReadOnlyOpen, WalHeaderLibraryWithoutSidecarsGrowsNoFiles) {
     EXPECT_EQ(file_sha256(src.db_path), sha);
 }
 
+// 裁定 R29（审查 I2）：分叉用 VACUUM INTO 复制整个文件，摘要只比来源租户。来源库里有别的租户的行时，
+// 新世界每次打开都会 world_tenant_mismatch，所以分叉在 partial 上核对租户（与回滚第 6–7 步同一个函数），
+// 不过就抛 world_tenant_mismatch：不改名、不登记、不留目录。三条复制路径都覆盖。
+TEST(WorldFork, ForeignTenantRowInSourceRefusesTheFork) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    const WorldRecord src = world_with_statements(reg, "deploy-1", 2);
+    insert_statements(src.db_path, "someone-else", 100, 1);
+    const auto dirs = world_dirs(reg);
+    const std::string src_sha = file_sha256(src.db_path);
+
+    EXPECT_EQ(code_of([&] { (void)fork_world(reg, "deploy-1", "rollout-1", fork_opts()); }),
+              "world_tenant_mismatch");
+    EXPECT_EQ(world_dirs(reg), dirs);
+    EXPECT_EQ(code_of([&] { (void)reg.get("rollout-1"); }), "world_not_found");
+
+    {
+        auto writer = persistence::SqliteAdapter::open(src.db_path);
+        EXPECT_EQ(code_of([&] {
+                      (void)fork_world_from_connection(reg, writer->connection(), "deploy-1",
+                                                       "rollout-2", fork_opts());
+                  }),
+                  "world_tenant_mismatch");
+        writer->close();
+    }
+    EXPECT_EQ(world_dirs(reg), dirs);
+    EXPECT_EQ(code_of([&] { (void)reg.get("rollout-2"); }), "world_not_found");
+
+    const WorldRecord old_seed = reg.create("seed-v1", "", {}, "{}", kNow, WorldFlags{.seed = true});
+    insert_statements(old_seed.db_path, old_seed.tenant, 0, 1);
+    insert_statements(old_seed.db_path, "someone-else", 100, 1);
+    const auto with_seed = world_dirs(reg);
+    EXPECT_EQ(code_of([&] { (void)upgrade_seed(reg, "seed-v1", "seed-v2", kNow); }),
+              "world_tenant_mismatch");
+    EXPECT_EQ(world_dirs(reg), with_seed);
+    EXPECT_EQ(code_of([&] { (void)reg.get("seed-v2"); }), "world_not_found");
+}
+
 }  // namespace starling::governance
