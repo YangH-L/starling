@@ -544,7 +544,9 @@ struct ForkOptions {
     std::string retention_group;
     bool reclaimable = false, seed = false;        // seed 蕴含 read_only
     std::string settings_overrides_json;           // 空 = 复制来源的设置
-    std::string now_iso;                           // 调用方给的时刻，记作新世界的 created_at
+    // 调用方给的时刻，记作新世界的 created_at。非空时必须是 YYYY-MM-DDTHH:MM:SSZ，否则 invalid_settings（裁定 R31 M7，
+    // 与 take_snapshot 同一个解析函数），在任何文件 I/O 之前；空串取当前时间。
+    std::string now_iso;
     // 来源的向量后端（裁定 R31 M4）：只有 "sqlite" 的向量在库文件里，其余（zvec）复制出来的世界缺向量，抛
     // snapshot_unsupported_backend（与快照、回滚同一个判定函数），在任何文件 I/O 之前。
     std::string vector_backend = "sqlite";
@@ -564,7 +566,8 @@ struct ForkResult {
 // 分叉一个开着的世界（有引擎）：复制与来源摘要都走引擎自己的连接 source_conn，读到它最近一次提交
 // （spec §6.1）。opts.snapshot_id 必须为空（以快照为来源用 fork_world：快照文件建好之后不再写），否则抛
 // std::invalid_argument。顺序：
-//   1. new_name 不合规则 invalid_world_name；已被占用 world_exists；来源不存在 world_not_found；
+//   1. new_name 不合规则 invalid_world_name；已被占用 world_exists；opts.now_iso 非空且形状不对 invalid_settings
+//      （裁定 R31 M7）；来源不存在 world_not_found；
 //      validate_world(来源)（registry_corrupt 等）；opts.vector_backend 不是 "sqlite" → snapshot_unsupported_backend
 //      （裁定 R31 M4）；opts.settings_overrides_json 合并到来源的设置上
 //      （merge_settings，非法时 invalid_settings 等）。都在任何文件 I/O 之前。

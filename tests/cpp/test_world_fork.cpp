@@ -24,6 +24,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <regex>
 #include <set>
 #include <string>
 #include <system_error>
@@ -700,6 +701,32 @@ TEST(WorldAutoSnapshot, ReclaimableWorldIsSkippedLikeReadOnly) {
     EXPECT_EQ(effective_world_settings(reg.get("deploy-1")).background.auto_snapshot,
               (AutoSnapshotConfig{.on_session = true, .interval_hours = 1}));
     (void)src;
+}
+
+// 裁定 R31 M7：ForkOptions.now_iso 用 parse_utc_seconds 校验（与 take_snapshot 一致），形状不对抛 invalid_settings，
+// 在任何文件 I/O 之前；空串取当前时间。升级种子的 now 走同一条校验。
+TEST(WorldFork, MalformedNowIsInvalidSettingsBeforeAnyIo) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    (void)world_with_statements(reg, "deploy-1", 1);
+    const WorldRecord seed = reg.create("seed-v1", "", {}, "{}", kNow, WorldFlags{.seed = true});
+    insert_statements(seed.db_path, seed.tenant, 0, 1);
+    const auto dirs = world_dirs(reg);
+    for (const char* bad : {"yesterday", "2026-11-06 00:00:00", "2026-11-06T00:00:00.123Z",
+                            "2026-13-06T00:00:00Z"}) {
+        ForkOptions opts;
+        opts.now_iso = bad;
+        EXPECT_EQ(code_of([&] { (void)fork_world(reg, "deploy-1", "rollout-1", opts); }),
+                  "invalid_settings") << bad;
+        EXPECT_EQ(code_of([&] { (void)upgrade_seed(reg, "seed-v1", "seed-v2", bad); }),
+                  "invalid_settings") << bad;
+    }
+    EXPECT_EQ(world_dirs(reg), dirs);
+    EXPECT_EQ(code_of([&] { (void)reg.get("rollout-1"); }), "world_not_found");
+    const ForkResult forked = fork_world(reg, "deploy-1", "rollout-1", ForkOptions{});
+    EXPECT_TRUE(std::regex_match(forked.world.created_at,
+                                 std::regex(R"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)")))
+        << forked.world.created_at;
 }
 
 }  // namespace starling::governance

@@ -1980,6 +1980,11 @@ ForkPlan plan_fork(const RegistryDb& reg, const std::string& source, const std::
     } catch (const WorldStoreError& err) {
         if (err.code() != "world_not_found") { throw; }
     }
+    // 裁定 R31 M7：与 take_snapshot 同一个解析函数；形状不对时在任何 I/O 之前拒（否则写进 created_at）。
+    if (!opts.now_iso.empty() && !parse_utc_seconds(opts.now_iso)) {
+        throw WorldStoreError("invalid_settings",
+                              "now is not YYYY-MM-DDTHH:MM:SSZ: '" + opts.now_iso + "'");
+    }
     ForkPlan plan;
     plan.source = reg.get(source);   // world_not_found
     validate_world(reg, source);
