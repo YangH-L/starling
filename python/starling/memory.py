@@ -428,7 +428,13 @@ class Memory:
 
     @_guarded
     def pending_events(self) -> list[PendingEvent]:
-        """Events recorded in state 'pending', ordered by `seq` ascending."""
+        """Events recorded in state 'pending', ordered by `seq` ascending.
+
+        Lists the pending events of every holder in the world, not only this
+        facade's: each item carries its `holder`. `abandon_event(key)` acts only
+        on this facade's own holder's row (or claims an unowned legacy row), so
+        it raises `KeyError` for a key that belongs to another holder.
+        """
         return [PendingEvent(**row) for row in self._core.pending_events()]
 
     @_guarded

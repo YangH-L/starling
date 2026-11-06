@@ -131,22 +131,17 @@ std::string add_seconds_to_iso(std::string_view epoch_iso, std::int64_t seconds)
                        out.tm_hour, out.tm_min, out.tm_sec);
 }
 
-// remember_prepare 给 engram 的来源身份:source_prefix + sha256(payload) 前 16 hex
-// (src/memory/memory_ops.cpp 的 remember_prepare;两处必须一致,补齐分支靠它找回 engram)。
-std::string source_item_id_for(std::string_view source_prefix, std::string_view payload) {
-    return std::string(source_prefix) + crypto::sha256_hex(payload).substr(0, 16);
-}
-
 // 本租户来源身份为 (adapter_name, source_item_id) 的 engram id;没有则空串。来源身份的
 // 唯一索引 idx_engrams_source_identity 还含 source_version 与 chunk_index,remember_prepare
-// 把这两项固定为 "1" 与 0,所以这两列已能定下唯一一个 engram。
+// 把这两项固定为 "1" 与 0,这里同样绑定,与索引一致。
 std::string engram_with_source_item_id(persistence::Connection& conn,
                                        std::string_view tenant,
                                        std::string_view adapter_name,
                                        std::string_view source_item_id) {
     persistence::Stmt stmt(conn.raw(),
                            "SELECT id FROM engrams WHERE tenant_id=?1 AND adapter_name=?2 "
-                           "AND source_item_id=?3 ORDER BY rowid ASC LIMIT 1");
+                           "AND source_item_id=?3 AND source_version='1' AND chunk_index=0 "
+                           "ORDER BY rowid ASC LIMIT 1");
     stmt.bind(tenant, adapter_name, source_item_id);
     return stmt.step_row() ? column_string(stmt.raw(), 0) : std::string();
 }
@@ -324,7 +319,7 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
     if (retrying_pending) {
         for (const auto& prefix : {params.source_prefix, base.source_prefix}) {
             const std::string engram_id = engram_with_source_item_id(
-                conn, base.tenant_id, base.adapter_name, source_item_id_for(prefix, payload_text));
+                conn, base.tenant_id, base.adapter_name, engram_source_item_id(prefix, params.payload));
             if (engram_id.empty()) {
                 continue;
             }

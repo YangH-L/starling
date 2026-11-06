@@ -65,7 +65,7 @@ def test_old_schema_library_backup_opens_with_new_version(tmp_path):
     _downgrade_to_0037(tmp_path / "old.db")
     with sqlite3.connect(str(tmp_path / "old.db")) as c:      # 旧版本自己做的副本
         c.execute(f"VACUUM INTO '{tmp_path / 'old-copy.db'}'")
-    reopened = _db(tmp_path, "old.db")                       # 新版本打开原库,自动迁到 0038
+    reopened = _db(tmp_path, "old.db")                       # 新版本打开原库,自动迁到最新(0039)
     reopened.backup_to(tmp_path / "new-copy.db")
     for name in ("old-copy.db", "new-copy.db"):
         m = _db(tmp_path, name)

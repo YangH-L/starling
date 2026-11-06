@@ -270,3 +270,45 @@ def test_abandon_unknown_key_raises_keyerror_and_twice_is_noop(tmp_path):
     mem.remember_event(KEY, "bob:hi", interlocutor="bob")
     mem.abandon_event(KEY)
     mem.abandon_event(KEY)                           # 已是终态,幂等
+
+
+def test_two_holders_share_a_world_each_sees_own_statements(tmp_path):
+    # 同一个库文件、同一 tenant、同一个 Runtime,两个 holder 交替写事件:各看各的语句。
+    from starling import runtime as rt
+    r = rt._build_local_store_sqlite_runtime(tmp_path / "w.db")
+    r.start()
+    llm = starling.make_stub_llm(default_response=CANNED_JSON)
+    a = starling.Memory(r, agent="A", tenant_id="default", llm=llm)
+    b = starling.Memory(r, agent="B", tenant_id="default", llm=llm)
+    try:
+        a.remember_event("k#0", "bob:我负责鉴权模块", interlocutor="bob")
+        digest_only_a = a.digest()
+        b.remember_event("k#0", "bob:我负责鉴权模块", interlocutor="bob")   # 同 key 同文本
+        a.remember_event("k#1", "bob:另一件事", interlocutor="bob")
+        b.remember_event("k#2", "bob:B 独有的事", interlocutor="bob")
+
+        a.embed_pending("2026-01-01T00:01:00Z")
+        for mem, name in ((a, "A"), (b, "B")):
+            hits = mem.recall("我负责鉴权模块", k=20, include_volatile=True)
+            assert hits and {h["row"].holder_id for h in hits} == {name}
+        assert a.digest() != digest_only_a                 # B 写过之后库内容变了
+    finally:
+        a.close()
+
+
+def test_pending_events_lists_every_holder_with_its_holder(tmp_path):
+    # 中途失败的事件留在 pending;pending_events 列出世界里每个 holder 的,每项带 holder。
+    from starling import runtime as rt
+    r = rt._build_local_store_sqlite_runtime(tmp_path / "p.db")
+    r.start()
+    llm = _failing_llm()
+    a = starling.Memory(r, agent="A", tenant_id="default", llm=llm)
+    b = starling.Memory(r, agent="B", tenant_id="default", llm=llm)
+    try:
+        a.remember_event("k#0", "bob:hi", interlocutor="bob")
+        b.remember_event("k#0", "bob:hi", interlocutor="bob")
+        pend = a.pending_events()
+        assert sorted(p.holder for p in pend) == ["A", "B"]
+        assert all(p.key == "k#0" for p in pend)
+    finally:
+        a.close()
