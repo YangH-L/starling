@@ -4,6 +4,7 @@
 每个 holder 用自己的 stub LLM,抽取结果确定且互不相同。离线,不发网络请求。
 """
 import sqlite3
+from contextlib import ExitStack, closing
 from datetime import datetime, timedelta, timezone
 
 import starling
@@ -41,16 +42,25 @@ def _open(path):
     return r
 
 
+def _cleanup(stack, r, *mems):
+    """finally 里一次关完:先关各句柄,最后关运行时(Runtime 没有 close,
+    库句柄是 r.adapter,Memory.close 也是关它,重复关是幂等的)。ExitStack 后进先出,
+    任何一个 close 抛错都不会跳过其余的。"""
+    stack.callback(r.adapter.close)
+    for m in mems:
+        stack.callback(m.close)
+
+
 def _stmt_rows(path, ids):
     q = ",".join("?" * len(ids))
-    with sqlite3.connect(str(path)) as c:
+    with closing(sqlite3.connect(str(path))) as c:
         return c.execute(
             f"SELECT id, holder_id, object_value, observed_at FROM statements WHERE id IN ({q})",
             list(ids)).fetchall()
 
 
 def _event_seq(path, holder, key):
-    with sqlite3.connect(str(path)) as c:
+    with closing(sqlite3.connect(str(path))) as c:
         return c.execute("SELECT seq FROM events WHERE holder_id = ? AND key = ?",
                          (holder, key)).fetchone()[0]
 
@@ -66,7 +76,8 @@ def test_1a_two_holders_in_one_world(tmp_path):
     mems = {n: starling.Memory(r, agent=n, tenant_id="default", llm=_llm(n, "unused"))
             for n in ("A", "B")}
     results = {}
-    try:
+    with ExitStack() as stack:
+        _cleanup(stack, r, *mems.values())
         for holder, key, text, obj in WRITES:
             mems[holder]._core.llm = _llm(holder, obj)      # 每次写给出确定的抽取
             res = mems[holder].remember_event(key, text, interlocutor="bob", epoch=EPOCH)
@@ -95,27 +106,23 @@ def test_1a_two_holders_in_one_world(tmp_path):
             expected = {(n, o) for n, _, _, o in WRITES if n == name}
             assert got and {g[0] for g in got} == {name}
             assert not any(g[0] == other for g in got)
-            assert got <= expected
+            assert got == expected
 
         # pending_events:两人写完后都已 committed;留 pending 的用失败抽取另测
         assert mems["A"].pending_events() == []
         digest_both = mems["A"].digest()
-    finally:
-        for m in mems.values():
-            m.close()
 
     # 去掉 B 的写入,按同样的 key、文本重建一个只有 A 的库:摘要不同
     path_a = tmp_path / "only_a.db"
     ra = _open(path_a)
     only_a = starling.Memory(ra, agent="A", tenant_id="default", llm=_llm("A", "unused"))
-    try:
+    with ExitStack() as stack:
+        _cleanup(stack, ra, only_a)
         for holder, key, text, obj in WRITES:
             if holder == "A":
                 only_a._core.llm = _llm("A", obj)
                 only_a.remember_event(key, text, interlocutor="bob", epoch=EPOCH)
         assert only_a.digest() != digest_both
-    finally:
-        only_a.close()
 
 
 def test_1a_pending_events_list_both_holders_with_holder(tmp_path):
@@ -124,7 +131,8 @@ def test_1a_pending_events_list_both_holders_with_holder(tmp_path):
     failing.set_default_response("", False, "stub extraction failure")
     a = starling.Memory(r, agent="A", tenant_id="default", llm=failing)
     b = starling.Memory(r, agent="B", tenant_id="default", llm=failing)
-    try:
+    with ExitStack() as stack:
+        _cleanup(stack, r, a, b)
         a.remember_event(SAME_KEY, SAME_TEXT, interlocutor="bob", epoch=EPOCH)
         b.remember_event(SAME_KEY, SAME_TEXT, interlocutor="bob", epoch=EPOCH)
         a.remember_event("a#1", "bob:A 的第二件事", interlocutor="bob", epoch=EPOCH)
@@ -132,5 +140,3 @@ def test_1a_pending_events_list_both_holders_with_holder(tmp_path):
             pend = mem.pending_events()
             assert sorted((p.holder, p.key) for p in pend) == [
                 ("A", "a#1"), ("A", SAME_KEY), ("B", SAME_KEY)]
-    finally:
-        a.close()
