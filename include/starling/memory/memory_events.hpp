@@ -69,9 +69,12 @@ struct PendingEventRow {
 //    (key 作为前缀写进 Starling 的文本,设计源 4.3),时刻是 epoch_iso + seq 秒。
 //    engram 的来源身份前缀是 base.source_prefix + "h:" + holder + ":":同一段话写进两个
 //    holder 名下是两个 engram,各自抽取、各得各的语句。
-//    补齐分支先按该 payload 的 engram content_hash 找 engrams 行,找到且有语句的
-//    evidence_json 指向它、holder_id 相同时,直接把这批 id(按 rowid 升序)当结果,
-//    不调 LLM;否则照 remember_all 走一遍(用行里存的原文,不是调用方这次传的)。
+//    补齐分支按来源身份(adapter_name + source_item_id)找 engram,不按 content_hash
+//    (同内容可以有多个 engram,每个 holder 一个):先试带 holder 的身份,再试不带 holder
+//    的旧身份 base.source_prefix + sha256(payload)[:16](0039 之前崩溃留下的写入)。第一个
+//    有语句的 evidence_json 指向它、holder_id 相同的 engram,就把这批 id(按 rowid 升序)
+//    当结果,不调 LLM;都没有则照 remember_all 走一遍(用行里存的原文,不是调用方这次传的,
+//    来源身份带 holder)。
 // ③ 短事务:仅当证据真入库(outcome 为 accepted/idempotent)且抽取未失败,行才改
 //    committed,填 engram_ref 与 statement_ids_json、清空 failure_category。其余情形
 //    (抽取失败,或 no_store / rejected / source_missing 这三种未入库的 outcome——它们的

@@ -356,7 +356,9 @@ TEST(MemoryEvents, RememberEventCompletesFromEngramWithoutReextracting) {
     EXPECT_EQ(pending_events(adapter->connection(), "default")[0].failure_category,
               failed.failure_category);
 
-    // ② 用裸 remember_all 把同一 payload 的语句落库(模拟"②成了、③没写成")。
+    // ② 用裸 remember_all 把同一 payload 的语句落库(模拟"②成了、③没写成")。前缀是
+    // event_params 的 "mem-",不带 holder:这是 0039 之前的来源身份。① 已经建了带 holder
+    // 的 engram(空的),补齐要越过它找到旧身份上的语句。
     extractor::FakeLLMAdapter llm;
     llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
     auto landed_params = event_params();
@@ -367,7 +369,7 @@ TEST(MemoryEvents, RememberEventCompletesFromEngramWithoutReextracting) {
     ASSERT_FALSE(landed.statement_ids.empty());
     const int before = row_count(adapter->connection(), "SELECT COUNT(*) FROM statements");
 
-    // ③ 补齐:按 engram 的 content_hash 找到语句,不再抽取一次(故用失败适配器)。
+    // ③ 补齐:按来源身份找到语句,不再抽取一次(故用失败适配器)。
     const auto completed = remember_event(*adapter, failing, event_params(), RememberPrompts{},
                                           "r1/turn#3", "bob:hi", kEpoch);
     EXPECT_FALSE(completed.extraction_failed);
@@ -600,14 +602,21 @@ std::string holder_of(persistence::Connection& conn, std::string_view key) {
                                 std::string(key) + "'");
 }
 
-// 0039 之后、还没被任何 holder 碰过的旧行(holder_id=''),文本哈希是真的,同文本能对上。
-void insert_unclaimed_event(persistence::Connection& conn, std::string_view key,
-                            std::string_view text, std::int64_t seq, std::string_view state) {
+// holder 名下的事件行,文本哈希是真的,同文本能对上。
+void insert_text_event(persistence::Connection& conn, std::string_view holder,
+                       std::string_view key, std::string_view text, std::int64_t seq,
+                       std::string_view state) {
     persistence::Stmt ins(conn.raw(),
         "INSERT INTO events(tenant_id,holder_id,key,text,interlocutor,text_sha256,seq,state) "
-        "VALUES('default','',?1,?2,'bob',?3,?4,?5)");
-    ins.bind(key, text, crypto::sha256_hex(text), seq, state);
+        "VALUES('default',?1,?2,?3,'bob',?4,?5,?6)");
+    ins.bind(holder, key, text, crypto::sha256_hex(text), seq, state);
     ins.step_done();
+}
+
+// 0039 之后、还没被任何 holder 碰过的旧行(holder_id='')。
+void insert_unclaimed_event(persistence::Connection& conn, std::string_view key,
+                            std::string_view text, std::int64_t seq, std::string_view state) {
+    insert_text_event(conn, /*holder=*/"", key, text, seq, state);
 }
 
 RememberParams holder_params(std::string_view holder) {
@@ -616,16 +625,55 @@ RememberParams holder_params(std::string_view holder) {
     return params;
 }
 
+// 语句表里这批 id 的某一列(或列上的表达式)的值(去重)。
+std::set<std::string> values_of_statements(persistence::Connection& conn,
+                                           const std::vector<std::string>& ids,
+                                           const std::string& column_expr) {
+    std::set<std::string> values;
+    for (const auto& stmt_id : ids) {
+        values.insert(text_query(conn, "SELECT " + column_expr +
+                                           " FROM statements WHERE tenant_id='default' AND id='" +
+                                           stmt_id + "'"));
+    }
+    return values;
+}
+
 // 语句表里这批 id 的 holder_id(去重)。
 std::set<std::string> holders_of_statements(persistence::Connection& conn,
                                             const std::vector<std::string>& ids) {
-    std::set<std::string> holders;
-    for (const auto& stmt_id : ids) {
-        holders.insert(text_query(
-            conn, "SELECT holder_id FROM statements WHERE tenant_id='default' AND id='" +
-                      stmt_id + "'"));
+    return values_of_statements(conn, ids, "holder_id");
+}
+
+// 语句的 evidence_json 指向的 engram id(statement_writer.cpp 的 evidence_json 只写一项)。
+constexpr const char* kEngramOfStatement = "json_extract(evidence_json,'$[0].engram_ref')";
+
+// 数 extract() 调用次数、每次都回同一个响应的适配器。
+class CountingLLMAdapter final : public extractor::LLMAdapter {
+public:
+    explicit CountingLLMAdapter(extractor::LLMResponse response)
+        : response_(std::move(response)) {}
+
+    extractor::LLMResponse extract(std::string_view, std::string_view) override {
+        ++calls_;
+        return response_;
     }
-    return holders;
+
+    [[nodiscard]] int calls() const { return calls_; }
+
+private:
+    extractor::LLMResponse response_;
+    int                    calls_ = 0;
+};
+
+// 两条语句:Bob 负责 auth(记在写入者名下),以及 B 自己的偏好。开了
+// attribute_first_order_mental_to_holder 时,第二条在任何写入者的抽取里都记在 B 名下。
+constexpr const char* kPreferenceJson =
+    R"JSON([{"holder":"self","holder_perspective":"FIRST_PERSON","subject":"Bob","predicate":"responsible_for","object":"auth","modality":"BELIEVES","polarity":"POS","nesting_depth":0},)JSON"
+    R"JSON({"holder":"B","holder_perspective":"FIRST_PERSON","subject":"B","subject_kind":"cognizer","cognizer_kind":"human","predicate":"prefers","object":"tea","modality":"PREFERS","polarity":"POS","nesting_depth":0}])JSON";
+
+std::vector<std::string> sorted(std::vector<std::string> ids) {
+    std::sort(ids.begin(), ids.end());
+    return ids;
 }
 
 }  // namespace
@@ -708,6 +756,8 @@ TEST(MemoryEvents0039, FirstHolderClaimsLegacyRow) {
     // 拿到 bob 的语句 id。
     const auto carol = remember_event(*adapter, llm, holder_params("carol"), RememberPrompts{},
                                       "r1/turn#3", "bob:hi", kEpoch);
+    EXPECT_EQ(carol.outcome, "accepted");
+    ASSERT_FALSE(carol.statement_ids.empty());   // 否则下面的不相交检查空转
     EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events WHERE key='r1/turn#3'"), 2);
     EXPECT_EQ(row_count(conn, "SELECT seq FROM events WHERE holder_id='carol'"), 5);
     EXPECT_EQ(next_seq(conn, "default"), 6);
@@ -805,6 +855,131 @@ TEST(MemoryEventsHolder, SameKeySameTextGivesEachHolderOwnStatements) {
         EXPECT_EQ(rows[1].holder, "B");
         EXPECT_EQ(rows[1].seq, 1);
     }
+}
+
+TEST(MemoryEventsHolder, EachHolderGetsOwnEngramAndObservedAt) {
+    // 钉住 Task 2.1 已上的按 holder 来源前缀:同一段话写进两个 holder 名下是两个 engram,
+    // 各自的时刻取各自事件的 seq。中间夹一条无关事件,让两个 seq 隔开。
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    extractor::FakeLLMAdapter llm;
+    llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+
+    const auto holder_a = remember_event(*adapter, llm, holder_params("A"), RememberPrompts{},
+                                         "ep1#3", "B：你好", kEpoch);              // seq 0
+    ASSERT_EQ(remember_event(*adapter, llm, holder_params("A"), RememberPrompts{},
+                             "ep1#4", "C：再见", kEpoch).outcome,
+              "accepted");                                                       // seq 1
+    const auto holder_b = remember_event(*adapter, llm, holder_params("B"), RememberPrompts{},
+                                         "ep1#3", "B：你好", kEpoch);              // seq 2
+    ASSERT_FALSE(holder_a.statement_ids.empty());
+    ASSERT_FALSE(holder_b.statement_ids.empty());
+
+    EXPECT_NE(holder_a.engram_ref, holder_b.engram_ref);
+    EXPECT_EQ(values_of_statements(conn, holder_a.statement_ids, kEngramOfStatement),
+              std::set<std::string>{holder_a.engram_ref});
+    EXPECT_EQ(values_of_statements(conn, holder_b.statement_ids, kEngramOfStatement),
+              std::set<std::string>{holder_b.engram_ref});
+    EXPECT_EQ(values_of_statements(conn, holder_a.statement_ids, "observed_at"),
+              std::set<std::string>{"2026-01-01T00:00:00Z"});
+    EXPECT_EQ(values_of_statements(conn, holder_b.statement_ids, "observed_at"),
+              std::set<std::string>{"2026-01-01T00:00:02Z"});
+    // 摘要按 content_hash 引用 engram,不含来源身份:两个 engram 内容相同,content_hash 相同。
+    const auto hash_of = [&conn](const std::string& engram_id) {
+        return text_query(conn, "SELECT content_hash FROM engrams WHERE id='" + engram_id + "'");
+    };
+    EXPECT_FALSE(hash_of(holder_a.engram_ref).empty());
+    EXPECT_EQ(hash_of(holder_a.engram_ref), hash_of(holder_b.engram_ref));
+}
+
+TEST(MemoryEventsHolder, RetryCompletesFromOwnEngramNotOtherHolders) {
+    // 开 attribute_first_order_mental_to_holder 时,A 的抽取把「B 偏好茶」记在 B 名下,这条语句
+    // 挂在 A 的 engram 上。A、B 的 engram 内容相同(content_hash 相同),按 content_hash 补齐 B
+    // 会先碰到 A 的 engram,把 A 抽出来的那条当成 B 自己的结果。补齐必须按 B 的来源身份找。
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    extractor::ValidationPolicy policy;
+    policy.attribute_first_order_mental_to_holder = true;
+    CountingLLMAdapter llm(extractor::LLMResponse{.raw_xml = kPreferenceJson, .ok = true});
+    const std::string text = "B：我爱喝茶";
+
+    const auto holder_a = remember_event(*adapter, llm, holder_params("A"), RememberPrompts{},
+                                         "ep1#3", text, kEpoch, policy);           // seq 0
+    ASSERT_EQ(holder_a.outcome, "accepted");
+    ASSERT_EQ(holders_of_statements(conn, holder_a.statement_ids),
+              (std::set<std::string>{"A", "B"}));
+    const int calls_per_write = llm.calls();
+    ASSERT_GT(calls_per_write, 0);
+
+    // B 写同一 key 同文本:第 ② 段落了语句,第 ③ 段之前崩溃。行仍是 pending,语句挂在
+    // B 自己的 engram 上(来源身份 source_prefix + "h:B:" + sha256(payload)[:16])。
+    insert_text_event(conn, "B", "ep1#3", text, 1, "pending");
+    auto landed_params = holder_params("B");
+    landed_params.source_prefix = "mem-h:B:";
+    const std::string payload = "[ep1#3] " + text;
+    landed_params.payload.assign(payload.begin(), payload.end());
+    landed_params.created_at_iso8601 = "2026-01-01T00:00:01Z";
+    const auto landed = remember_all(*adapter, llm, landed_params, RememberPrompts{}, policy);
+    ASSERT_EQ(landed.outcome, "accepted");
+    ASSERT_NE(landed.engram_ref, holder_a.engram_ref);
+    ASSERT_FALSE(landed.statement_ids.empty());
+    ASSERT_EQ(llm.calls(), 2 * calls_per_write);
+    const int before = row_count(conn, "SELECT COUNT(*) FROM statements");
+
+    const auto retried = remember_event(*adapter, llm, holder_params("B"), RememberPrompts{},
+                                        "ep1#3", text, kEpoch, policy);
+    EXPECT_EQ(retried.outcome, "idempotent");
+    EXPECT_EQ(retried.engram_ref, landed.engram_ref);
+    EXPECT_EQ(sorted(retried.statement_ids), sorted(landed.statement_ids));
+    EXPECT_EQ(values_of_statements(conn, retried.statement_ids, kEngramOfStatement),
+              std::set<std::string>{landed.engram_ref});
+    EXPECT_EQ(llm.calls(), 2 * calls_per_write);       // 全程两轮:A 一次、B 一次,补齐不调
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM statements"), before);
+    EXPECT_EQ(text_query(conn, "SELECT state || ' ' || engram_ref FROM events "
+                               "WHERE holder_id='B' AND key='ep1#3'"),
+              "committed " + landed.engram_ref);
+}
+
+TEST(MemoryEventsHolder, LegacyPrefixPendingRowCompletesWithoutReextract) {
+    // 0039 之前崩溃留下的写入:engram 的来源身份不带 holder(source_prefix + sha256(payload)[:16]),
+    // H 的语句挂在它上面,(H, K) 的行还是 pending。补齐找不到带 holder 的身份时退回旧身份,
+    // 只收 holder_id == H 的语句,不再抽取(裁定 R9)。
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    extractor::FakeLLMAdapter llm;
+    llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+    const std::string text = "B：你好";
+
+    auto legacy_params = holder_params("H");          // source_prefix 仍是 "mem-",不带 holder
+    const std::string payload = "[ep1#3] " + text;
+    legacy_params.payload.assign(payload.begin(), payload.end());
+    legacy_params.created_at_iso8601 = kEpoch;
+    const auto landed = remember_all(*adapter, llm, legacy_params, RememberPrompts{});
+    ASSERT_EQ(landed.outcome, "accepted");
+    ASSERT_FALSE(landed.statement_ids.empty());
+    // 同一个旧 engram 上另挂一条别的 holder 的语句:补齐不许把它收进 H 的结果。
+    insert_statement(conn, "default", "s-other-holder", "G");
+    {
+        persistence::Stmt upd(conn.raw(),
+                              "UPDATE statements SET evidence_json=?1 WHERE id='s-other-holder'");
+        upd.bind(R"([{"engram_ref":")" + landed.engram_ref + R"(","status":"active"}])");
+        upd.step_done();
+    }
+    insert_text_event(conn, "H", "ep1#3", text, 0, "pending");
+    const int before = row_count(conn, "SELECT COUNT(*) FROM statements");
+
+    CountingLLMAdapter counting(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+    const auto completed = remember_event(*adapter, counting, holder_params("H"),
+                                          RememberPrompts{}, "ep1#3", text, kEpoch);
+    EXPECT_EQ(counting.calls(), 0);
+    EXPECT_EQ(completed.outcome, "idempotent");
+    EXPECT_EQ(completed.engram_ref, landed.engram_ref);
+    EXPECT_EQ(sorted(completed.statement_ids), sorted(landed.statement_ids));
+    EXPECT_EQ(holders_of_statements(conn, completed.statement_ids), std::set<std::string>{"H"});
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM statements"), before);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM engrams"), 1);   // 没另建带 holder 的 engram
+    EXPECT_EQ(text_query(conn, "SELECT state FROM events WHERE holder_id='H' AND key='ep1#3'"),
+              "committed");
 }
 
 }  // namespace starling::memoryops

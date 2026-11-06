@@ -11,7 +11,6 @@
 #include <nlohmann/json.hpp>
 
 #include "starling/crypto/sha256.hpp"
-#include "starling/evidence/engram.hpp"
 #include "starling/governance/write_gate.hpp"
 #include "starling/persistence/stmt.hpp"
 
@@ -132,20 +131,24 @@ std::string add_seconds_to_iso(std::string_view epoch_iso, std::int64_t seconds)
                        out.tm_hour, out.tm_min, out.tm_sec);
 }
 
-// 本租户 content_hash 相同的 engram id(payload 决定 content_hash,S7)。按 rowid
-// 升序,补齐分支逐个找挂在它上面的语句。
-std::vector<std::string> engrams_with_content_hash(persistence::Connection& conn,
-                                                   std::string_view tenant,
-                                                   std::string_view content_hash) {
+// remember_prepare 给 engram 的来源身份:source_prefix + sha256(payload) 前 16 hex
+// (src/memory/memory_ops.cpp 的 remember_prepare;两处必须一致,补齐分支靠它找回 engram)。
+std::string source_item_id_for(std::string_view source_prefix, std::string_view payload) {
+    return std::string(source_prefix) + crypto::sha256_hex(payload).substr(0, 16);
+}
+
+// 本租户来源身份为 (adapter_name, source_item_id) 的 engram id;没有则空串。来源身份的
+// 唯一索引 idx_engrams_source_identity 还含 source_version 与 chunk_index,remember_prepare
+// 把这两项固定为 "1" 与 0,所以这两列已能定下唯一一个 engram。
+std::string engram_with_source_item_id(persistence::Connection& conn,
+                                       std::string_view tenant,
+                                       std::string_view adapter_name,
+                                       std::string_view source_item_id) {
     persistence::Stmt stmt(conn.raw(),
-                           "SELECT id FROM engrams WHERE tenant_id=?1 AND content_hash=?2 "
-                           "ORDER BY rowid ASC");
-    stmt.bind(tenant, content_hash);
-    std::vector<std::string> ids;
-    while (stmt.step_row()) {
-        ids.push_back(column_string(stmt.raw(), 0));
-    }
-    return ids;
+                           "SELECT id FROM engrams WHERE tenant_id=?1 AND adapter_name=?2 "
+                           "AND source_item_id=?3 ORDER BY rowid ASC LIMIT 1");
+    stmt.bind(tenant, adapter_name, source_item_id);
+    return stmt.step_row() ? column_string(stmt.raw(), 0) : std::string();
 }
 
 // evidence_json 指向 engram_id、holder 相同的语句 id,按 rowid 升序。匹配写法与
@@ -306,15 +309,25 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
 
     RememberOutcome result;
     bool completed_from_engram = false;
-    // 补齐分支(只在重试已有 pending 行时走):② 落了语句、③ 没写成。按 payload 的
-    // content_hash 找 engram,挂在它上面的语句就是上次抽取的成果——直接拿来用,不再
-    // 抽取一次。新 key 不进这里:哪怕同一段文本早先被裸 remember 写过,新 key 也该
-    // 照自己的前缀走一遍(前缀不同 → payload 不同 → content_hash 本就不同)。
+    // 补齐分支(只在重试已有 pending 行时走):② 落了语句、③ 没写成。按来源身份找回
+    // 上次的 engram,挂在它上面、holder 相同的语句就是上次抽取的成果——直接拿来用,不再
+    // 抽取一次。不按 content_hash 找:同一段话写进几个 holder 名下就有几个 engram,内容
+    // 相同,按内容找会拿到别的 holder 的 engram(设计源 §4.3)。
+    // 依次试两个来源身份,第一个挂着本 holder 语句的 engram 就是结果:先试带 holder 的
+    // 身份;它没有 engram、或 engram 上没有本 holder 的语句时,再试旧身份
+    // base.source_prefix + sha256(payload)[:16](0039 之前的写入不带 holder,在那时崩溃的
+    // pending 行的语句挂在旧身份的 engram 上;裁定 R9)。两处都只收本 holder 的语句。
+    // 带 holder 的 engram 可能存在却是空的(首次抽取失败时第 ② 段已把它建好),这时也要
+    // 试旧身份,否则旧身份上已落库的语句会被重抽一遍。
+    // 新 key 不进这里:哪怕同一段文本早先被裸 remember 写过,新 key 也该照自己的前缀
+    // 走一遍(不认领别人写的语句)。
     if (retrying_pending) {
-        const std::string content_hash = evidence::compute_engram_content_hash(
-            params.payload, /*declared_transformations=*/{});  // 与 remember_prepare 一致
-        for (const auto& engram_id :
-                 engrams_with_content_hash(conn, base.tenant_id, content_hash)) {
+        for (const auto& prefix : {params.source_prefix, base.source_prefix}) {
+            const std::string engram_id = engram_with_source_item_id(
+                conn, base.tenant_id, base.adapter_name, source_item_id_for(prefix, payload_text));
+            if (engram_id.empty()) {
+                continue;
+            }
             auto ids = statements_for_engram(conn, base.tenant_id, base.holder_id, engram_id);
             if (ids.empty()) {
                 continue;
