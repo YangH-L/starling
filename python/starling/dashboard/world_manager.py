@@ -1208,7 +1208,8 @@ class WorldPool:
                     f"the default world's {section!r} settings come from the dashboard config")
 
     def set_auto_snapshot(self, world: str, on_session: bool, interval_hours: int) -> dict:
-        """改一个世界的自动快照配置（C++ 在注册表锁内合并），返回新配置 {"on_session", "interval_hours"}。
+        """改一个世界的自动快照配置（C++ 在注册表锁内合并），返回生效的配置 {"on_session", "interval_hours"}（按看板的
+        打开方式算，与列表行、详情同一口径，裁定 R38：只读打开的世界恒为全关，存着的值照写）。
         world_not_found / invalid_auto_snapshot 由 C++ 抛。开着的引擎换上新的设置引用。"""
         reg = self._require_registry()
         self._record(world)                           # world_not_found：未知世界名不建世界锁
@@ -1217,7 +1218,8 @@ class WorldPool:
         # 适配器。路由在工作线程里调，不持租约，按锁顺序可以等世界锁。
         with self._world_lock(world):
             _core.world_set_auto_snapshot(reg, world, on_session, interval_hours)
-            settings = _core.world_effective_settings(reg.get(world)["settings"])
+            rec = reg.get(world)
+            settings = _core.world_effective_settings(rec["settings"], record=rec)
             with self._lock:
                 engine = self._engines.get(world)
             if engine is not None:

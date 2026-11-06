@@ -332,6 +332,26 @@ def test_empty_seed_from_registry_create_inspect_leaves_no_sidecars(client):
     assert rows == [] and results == []
 
 
+def test_set_auto_snapshot_on_a_reclaimable_world_returns_the_effective_config(client):
+    """裁定 R38（N2）：可回收世界看板只读打开、不拍自动快照。设置自动快照照常存下请求的值，但返回的是生效的配置
+    （全关），与列表行、详情一致。"""
+    pool = _pool(client)
+    _source_with_content(client)
+    _fork(client, "src", "rollout-1", reclaimable=True)
+    resp = client.put("/api/worlds/rollout-1/auto_snapshot",
+                      json={"on_session": True, "interval_hours": 6})
+    assert resp.status_code == 200, resp.text
+    off = {"on_session": False, "interval_hours": 0}
+    assert resp.json()["auto_snapshot"] == off
+    assert _rows(client)["rollout-1"]["auto_snapshot"] == off
+    assert client.get("/api/worlds/rollout-1").json()["auto_snapshot"] == off
+    stored = pool.record("rollout-1")["settings"]["background"]["auto_snapshot"]
+    assert stored == {"on_session": True, "interval_hours": 6}           # 存着的设置照写
+    # 对照：可写世界返回的就是请求的值。
+    resp = client.put("/api/worlds/src/auto_snapshot", json={"on_session": True, "interval_hours": 6})
+    assert resp.json()["auto_snapshot"] == {"on_session": True, "interval_hours": 6}
+
+
 def test_closed_writable_world_inspect_is_not_frozen(client, monkeypatch):
     """裁定 R36（N1）：关着的可写世界（create_world 建的，WAL 头、旁边没有 -wal/-shm）只持 build=False 租约检视时，
     同一世界上的写请求可以随时出现，所以检视连接一律普通 mode=ro：C++ 收到的 frozen 是 False，URI 不带 immutable，
