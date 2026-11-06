@@ -396,7 +396,7 @@ def test_routes_snapshot_rows_hide_server_paths_and_sort_descending(tmp_path):
     first = client.post("/api/worlds/default/snapshots", json={"note": "a"}).json()
     second = client.post("/api/worlds/default/snapshots", json={"note": "b"}).json()
     assert set(first) == {"id", "kind", "reason", "note", "created_at", "world_time", "size_bytes",
-                          "sessions_complete", "session_id"}
+                          "sessions_complete", "session_id", "digest"}
     listed = client.get("/api/worlds/default/snapshots").json()["snapshots"]
     stamps = [s["created_at"] for s in listed]
     assert stamps == sorted(stamps, reverse=True)
@@ -682,7 +682,7 @@ def test_rollback_closed_world_restores_snapshot_and_keeps_it_closed(pool_reg):
     assert _count(db) == 2
     out = pool.rollback("sim-1", snap["id"])
     assert out == {"world": "sim-1", "snapshot_id": snap["id"], "archived": True,
-                   "reopened": False}
+                   "reopened": False, "digest": snap["digest"]}
     assert _count(db) == 1 and "sim-1" not in pool.open_worlds()
     archives = pool.archives("sim-1")
     assert len(archives) == 1 and archives[0]["size_bytes"] > 0
@@ -719,7 +719,7 @@ def test_rollback_open_world_rebuilds_engine_and_restarts_workers(tmp_path):
         inode = os.stat(db).st_ino
         out = pool.rollback("default", snap["id"])
         assert out == {"world": "default", "snapshot_id": snap["id"], "archived": True,
-                       "reopened": True}
+                       "reopened": True, "digest": snap["digest"]}
         gc.collect()
         assert old_rt() is None, "旧 Runtime 必须在动文件之前已被回收"
         assert all(not t.is_alive() for t in old_threads)
@@ -1012,7 +1012,7 @@ def test_routes_rollback_200_broadcast_and_archives(tmp_path):
                             json=_rollback_body("default", snap["id"]))
             assert r.status_code == 200, r.json()
             assert r.json() == {"world": "default", "snapshot_id": snap["id"],
-                                "archived": True, "reopened": True}
+                                "archived": True, "reopened": True, "digest": snap["digest"]}
             client.portal.call(app.state.ws_manager.broadcast, {"type": "sentinel"})
             frames = []
             while (msg := ws.receive_json())["type"] != "sentinel":

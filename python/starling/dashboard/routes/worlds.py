@@ -236,11 +236,12 @@ def _snapshot_row(snap: dict) -> dict:
     # 白名单：条目里的 path 是服务器上的绝对路径，不外露。文件缺失的条目照常列出（还能
     # 从界面删掉），size_bytes 记 0，并带 missing: true（只在缺失的行上出现的附加字段）。
     # W4 的 sessions_complete / session_id 在 W4 之前的条目里没有，给 None；content_mark 只给
-    # 自动快照的判断用，不在白名单里。
+    # 自动快照的判断用，不在白名单里。digest（裁定 R26）：快照里 library 的摘要，旧条目为 None。
     row = {key: snap[key] for key in ("id", "kind", "reason", "note", "created_at",
                                       "world_time", "size_bytes")}
     row["sessions_complete"] = snap.get("sessions_complete")
     row["session_id"] = snap.get("session_id")
+    row["digest"] = snap.get("digest")
     if _snapshot_missing(snap):
         row["size_bytes"] = 0
         row["missing"] = True

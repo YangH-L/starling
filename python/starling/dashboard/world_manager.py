@@ -53,7 +53,9 @@ DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个�
      C++ 要求按世界串行化快照、恢复、修剪，持这把锁即满足。不同世界的世界锁互不相干：一个世界建引擎
      或恢复时，别的世界照常打开、读写。后台调用方（会话钩子、调度线程）只非阻塞地取，取不到就是
      "busy"，从不等。
-  3. engine._lock（RLock，DashboardEngine 内部）：由持租约的请求和后台线程持有。池从不拿它：quiesce
+  3. engine._lock（RLock，DashboardEngine 内部）：由持租约的请求和后台线程持有。池只在一处拿它：fork_world
+     分叉开着的来源时，先取来源的世界锁、在 pool._lock 内查表拿到引擎并放开 pool._lock，再取 engine._lock，持着它
+     走引擎自己的连接复制（裁定 R5、R22 M5）；顺序与本表一致（世界锁 → engine._lock），且不持租约。别处不拿：quiesce
      在不持引擎锁的情况下 join 后台线程（线程分段拿锁，持锁 join 会卡满 5 秒误报 world_busy）。
   4. supervisor 互斥锁（C++ Runtime 内部）：只在持 engine._lock 时取（见 engine.py 的
      _sample_backpressure 一带），从不反向。
@@ -1229,7 +1231,8 @@ class WorldPool:
     def rollback(self, world: str, snapshot_id: str) -> dict:
         """把 world 恢复到快照 snapshot_id（丢掉快照之后的一切）。替换、校验、归档都在 C++
         （world_rollback）；被替换的库留在 <世界目录>/archive/。返回 {"world", "snapshot_id", "archived",
-        "reopened"}（reopened：恢复前开着、恢复后已重新打开）。
+        "reopened", "digest"}（reopened：恢复前开着、恢复后已重新打开；digest：C++ 在恢复后的库上算的摘要，裁定 R26，
+        缺表的库为 None）。
 
         只停被恢复的世界：持它的世界锁、置它的关闭标志、等它的租约（含只读检视）归零、停它的线程、丢它
         的引擎并确认 Runtime 已回收，然后才调 C++；别的世界的租约与写入照常（需求 §7 第 1b 条）。
@@ -1278,7 +1281,8 @@ class WorldPool:
             self._write_stats_cache(world, rec["db_path"], rec["tenant"])
             reopened = self._reopen_after_rollback(world, was_open, None)
         return {"world": world, "snapshot_id": snapshot_id,
-                "archived": bool(result["archive_path"]), "reopened": reopened}
+                "archived": bool(result["archive_path"]), "reopened": reopened,
+                "digest": result["digest"]}
 
     @staticmethod
     def _rollback_in_cpp(reg, world: str, snapshot_id: str, backend: str) -> dict:

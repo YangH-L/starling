@@ -105,12 +105,15 @@ def test_2_seed_forks_share_digest_and_seed_bytes_unchanged(client):
     c2 = _fork(client, "seed-1", "c2")
     assert c1["digest"] == c2["digest"] == seed_digest
     assert _dig(client, "c1") == _dig(client, "c2") == seed_digest
+    c2_db = pool.record("c2")["db_path"]
+    c2_sha = _sha256(c2_db)
 
     _write(client, "c1", "Alice owns billing")
     assert _dig(client, "c1") != seed_digest
     assert _dig(client, "seed-1") == seed_digest
     assert _dig(client, "c2") == seed_digest
     assert _sha256(seed_db) == seed_sha
+    assert _sha256(c2_db) == c2_sha                    # 写 c1 不碰另一个副本的字节
 
 
 def test_3_snapshot_write_restore_digest(client):
@@ -119,9 +122,8 @@ def test_3_snapshot_write_restore_digest(client):
     assert snap.status_code == 200, snap.text
     snap = snap.json()
     before = _dig(client, "src")
-    # 路由的白名单不外露 digest；注册表条目带着它（裁定 R10），与拍快照时的库摘要对照。
-    entry = next(e for e in _pool(client).snapshots("src") if e["id"] == snap["id"])
-    assert entry["digest"] == before
+    # 快照路由返回 digest（裁定 R26），等于拍快照时的库摘要。
+    assert snap["digest"] == before
 
     _write(client, "src", "Alice owns billing")
     assert _dig(client, "src") != before
@@ -130,8 +132,9 @@ def test_3_snapshot_write_restore_digest(client):
                        json={"snapshot_id": snap["id"], "confirm": "src",
                              "mode": "discard_after"})
     assert resp.status_code == 200, resp.text
+    # 恢复路由返回 C++ 在恢复后的库上算的 digest，等于快照返回的那个，也等于此刻库的摘要。
+    assert resp.json()["digest"] == snap["digest"]
     assert _dig(client, "src") == before
-    assert entry["digest"] == _dig(client, "src")
 
 
 def test_read_only_recall_keeps_sha256(lane_client):
