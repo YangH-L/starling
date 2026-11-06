@@ -161,7 +161,16 @@ def _build_local_store_sqlite_runtime(db_path: Path) -> "Runtime":
     M0.4+KMS), so the supervisor is built with embedded=True. The index probe is
     the bound C++ SqliteAdapter::has_index (no raw Python sqlite3 read).
     """
-    adapter = _core.SqliteAdapter.open(str(db_path))
+    return _runtime_over(_core.SqliteAdapter.open(str(db_path)))
+
+
+def _build_read_only_sqlite_runtime(db_path: Path) -> "Runtime":
+    """同 _build_local_store_sqlite_runtime，但库经 SqliteAdapter.open_read_only 打开（spec §6.3）：不跑迁移、
+    不改日志模式、不建目录；write_admitted() 恒为 False，经写门的写入抛 WriteGateRejected。"""
+    return _runtime_over(_core.SqliteAdapter.open_read_only(str(db_path)))
+
+
+def _runtime_over(adapter) -> "Runtime":
     cap = adapter.declare_capability()
     rt = Runtime(
         capability=cap,
@@ -178,4 +187,5 @@ __all__ = [
     "RuntimeUnreadyError",
     "EX_CONFIG",
     "_build_local_store_sqlite_runtime",
+    "_build_read_only_sqlite_runtime",
 ]

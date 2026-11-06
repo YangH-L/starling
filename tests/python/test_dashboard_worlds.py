@@ -277,7 +277,8 @@ def test_routes_list_rows_do_not_open_any_database(tmp_path, monkeypatch):
     assert rows["sim-1"]["last_write_at"] and rows["sim-2"]["statements"] == 0
     keys = {"name", "label", "labels", "tenant", "created_at", "open", "holders", "statements",
             "last_write_at", "snapshots", "snapshot_bytes", "archives", "archive_bytes",
-            "auto_snapshot"}
+            "auto_snapshot", "seed", "read_only", "reclaimable", "retention_group",
+            "fork_of_world", "fork_of_snapshot", "open_mode", "schema_behind"}
     assert set(rows["sim-1"]) == keys and set(rows["default"]) == keys
     pool.close_all()
 
@@ -788,6 +789,45 @@ def test_rollback_reopen_failure_code_says_whether_the_db_changed(tmp_path, cpp_
         pool.close_all()
 
 
+@pytest.mark.parametrize("reopen_fails", [False, True])
+def test_rollback_digest_mismatch_reopens_the_replaced_library(tmp_path, reopen_fails):
+    """快照文件登记之后被改过：C++ 换上库之后才发现摘要不等，抛 restore_digest_mismatch（库已替换，spec §7.2）。
+    池按「库已替换」处理：统计缓存刷成新库的计数，开着的世界在新库上重开；重开失败报 rollback_reopen_failed。"""
+    pool, reg = _pool(tmp_path)
+    try:
+        pool.create_world("sim-1", "")
+        snap = _write_snapshot_write(pool, "sim-1")
+        db = _db(reg, "sim-1")
+        con = sqlite3.connect(snap["path"])
+        con.execute("UPDATE statements SET object_value = 'tampered'")
+        con.commit()
+        con.close()
+        assert "sim-1" in pool.open_worlds()
+        inode = os.stat(db).st_ino
+        real = pool._factory
+        if reopen_fails:
+            pool._factory = lambda ctx, providers: (_ for _ in ()).throw(RuntimeError("disk on fire"))
+        out, code = _rollback_outcome(pool, "sim-1", snap["id"])
+        assert out is None
+        assert os.stat(db).st_ino != inode and _count(db) == 1        # 库已换成（被改过的）快照
+        assert reg.get("sim-1")["statements"] == 1                   # 缓存是新库的计数
+        if reopen_fails:
+            assert code == "rollback_reopen_failed"
+            assert "sim-1" not in pool.open_worlds()
+            pool._factory = real
+        else:
+            assert code == "restore_digest_mismatch"
+            assert "sim-1" in pool.open_worlds()                     # 在替换后的库上重开了
+        assert _remember(pool, "sim-1", "Dave owns search")["outcome"] == "accepted"
+        assert _count(db) == 2                                        # 重开的引擎写的是替换后的库
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        values = {row[0] for row in con.execute("SELECT object_value FROM statements")}
+        con.close()
+        assert "tampered" in values
+    finally:
+        pool.close_all()
+
+
 def test_rollback_refuses_while_the_old_runtime_is_still_referenced(tmp_path, monkeypatch, caplog):
     """被恢复的世界丢了引擎、旧 Runtime 却回收不了（别处钉着它，写连接还开着）：world_busy，库文件不动；
     此后也不在同一个库上开第二条写连接。回收之后照常恢复。"""
@@ -1089,6 +1129,26 @@ def test_routes_rollback_reopen_failure_after_replace_is_500_and_broadcasts(tmp_
     assert "default" not in pool.open_worlds() and _count(db) == 1
     pool._factory = _stub_factory
     assert client.post("/api/tick", json={}).status_code == 200  # 下一次租约重新建
+    pool.close_all()
+
+
+def test_routes_rollback_digest_mismatch_is_500_and_broadcasts(tmp_path):
+    """快照文件登记之后被改过：库已替换（spec §7.2），路由回 500 restore_digest_mismatch，并照常广播
+    world_rolled_back（库变了，别的标签页要重新取数）。"""
+    client, app = _client(tmp_path)
+    pool = app.state.pool
+    sent = _recording(app)
+    snap = _write_snapshot_write(pool, "default")
+    con = sqlite3.connect(pool.snapshots("default")[0]["path"])
+    con.execute("UPDATE statements SET object_value = 'tampered'")
+    con.commit()
+    con.close()
+    r = client.post("/api/worlds/default/rollback", json=_rollback_body("default", snap["id"]))
+    assert (r.status_code, r.json()["detail"]) == (500, "restore_digest_mismatch")
+    assert sent == [{"type": "world_rolled_back", "world": "default",
+                     "payload": {"world": "default", "snapshot_id": snap["id"]}}]
+    assert "default" in pool.open_worlds()
+    assert client.get("/api/overview").json()["counts"]["statements"] == 1
     pool.close_all()
 
 

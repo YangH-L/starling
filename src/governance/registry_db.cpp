@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
 // 第 3 期给 snapshots 加了 digest 列，schema_version 仍是 1：之前建的注册表（含用户 8787 的
 // ~/.starling/registry.db）在 CREATE TABLE IF NOT EXISTS 之后还是旧形状，打开时就地补列。只加一列、
 // 带默认值，旧条目读出空串（rollback_world 对空 digest 不比较）。列已在时什么都不做，所以幂等。
+// 调用方已在 BEGIN IMMEDIATE 之内（RegistryDb::open）：查与补之间别的连接插不进来。
 void add_snapshot_digest_column(pst::Connection& conn) {
     bool present = false;
     {
@@ -347,6 +348,12 @@ struct RegistryDb::Impl {
     }
 };
 
+OpenMode decide_open_mode(const WorldRecord& rec, bool for_client_write) {
+    if (rec.read_only || rec.seed) { return OpenMode::ReadOnly; }   // seed 蕴含 read_only
+    if (rec.reclaimable && !for_client_write) { return OpenMode::ReadOnly; }
+    return OpenMode::ReadWrite;
+}
+
 RegistryDb::RegistryDb(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 RegistryDb::RegistryDb(RegistryDb&&) noexcept = default;
 RegistryDb& RegistryDb::operator=(RegistryDb&&) noexcept = default;
@@ -362,8 +369,10 @@ RegistryDb RegistryDb::open(const fs::path& data_dir, const fs::path& default_db
         fs::create_directories(impl->data_dir, mkdir_err);
         impl->conn = std::make_unique<pst::Connection>(pst::Connection::open(file));
         impl->conn->exec(kSchemaSql);
-        add_snapshot_digest_column(*impl->conn);
         pst::TransactionGuard guard(*impl->conn);
+        // 在 BEGIN IMMEDIATE 之内查列、补列：两个进程同时第一次打开旧注册表时，后到的一个等前一个提交，
+        // 再查就看得见新列，不会第二次 ALTER（duplicate column → registry_corrupt）。
+        add_snapshot_digest_column(*impl->conn);
         std::optional<std::string> version;
         {
             pst::Stmt stmt(impl->db(), "SELECT value FROM meta WHERE key = 'schema_version'");

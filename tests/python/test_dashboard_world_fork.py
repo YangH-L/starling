@@ -1,0 +1,357 @@
+"""看板按世界类型只读打开、分叉与升级种子的 HTTP 路由（记忆服务第 3 期 Task 3.3，spec §6.1–§6.4）。
+
+打开方式由 C++ 判（_core.world_decide_open_mode）：只读世界（含种子）与可回收世界看板一律只读打开，不跑迁移、
+不起后台线程、写入类请求回 409 world_read_only；其余世界照旧可写。列表与详情带注册表的原始标记（seed、
+read_only、reclaimable 等）与看板实际执行的 open_mode（裁定 R18）；schema_behind 列表只给开着的世界、详情对
+关着的世界短暂只读打开来算（裁定 R17）。
+"""
+import hashlib
+import os
+import sqlite3
+import threading
+
+import pytest
+from fastapi.testclient import TestClient
+
+from starling import _core
+from starling.dashboard import DashboardConfig, create_app
+from starling.dashboard.engine import DashboardEngine
+
+_STUB = ('[{"holder":"self","holder_perspective":"FIRST_PERSON","subject":"Bob",'
+         '"predicate":"responsible_for","object":"auth","modality":"BELIEVES",'
+         '"polarity":"POS","nesting_depth":0}]')
+
+
+def _fake():
+    fake = _core.FakeLLMAdapter()
+    fake.set_default_response(_STUB, True, "")
+    return fake
+
+
+def _stub_factory(ctx, providers):
+    """池的引擎工厂：照常建引擎（只读与否由 ctx 决定），再换上离线的抽取适配器。"""
+    engine = DashboardEngine(ctx, providers)
+    engine.llm = _fake()
+    return engine
+
+
+@pytest.fixture
+def client(tmp_path):
+    # 进 lifespan：后台开着（tick 600 秒、摄入按世界设置），只读世界必须不起线程。
+    cfg = DashboardConfig(db_path=str(tmp_path / "dashboard.db"), token="",
+                          tick_interval_s=600.0, source_lane_enabled=False,
+                          ingest_spool_path=str(tmp_path / "spool"))
+    with TestClient(create_app(cfg, engine_factory=_stub_factory)) as test_client:
+        yield test_client
+
+
+def _pool(client):
+    return client.app.state.pool
+
+
+def _sha256(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def _dir_files(db_path: str) -> set[str]:
+    return set(os.listdir(os.path.dirname(db_path)))
+
+
+def _digest(db_path: str, tenant: str) -> str:
+    adapter = _core.SqliteAdapter.open_read_only(db_path)
+    try:
+        return _core.memory_digest(adapter.connection(), tenant)
+    finally:
+        adapter.close()
+
+
+def _source_with_content(client, name: str = "src") -> dict:
+    """建世界 name，经 HTTP 写一条、跑一轮 tick（占位嵌入把向量补上，召回才有东西可读）。"""
+    rec = _pool(client).create_world(name, "")
+    resp = client.post(f"/api/w/{name}/remember", json={"text": "Bob owns auth"})
+    assert resp.status_code == 200, resp.text
+    assert client.post(f"/api/w/{name}/tick", json={}).status_code == 200
+    return rec
+
+
+def _fork(client, source: str, new_name: str, **body) -> dict:
+    resp = client.post(f"/api/worlds/{source}/fork", json={"new_name": new_name, **body})
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _rows(client) -> dict:
+    return {row["name"]: row for row in client.get("/api/worlds").json()["worlds"]}
+
+
+def _engine_of(pool, world: str):
+    with pool.lease(world, build=False) as engine:
+        return engine
+
+
+def _lock_is_free(lock) -> bool:
+    """另一个线程能不能拿到 lock（RLock 对持有它的线程自己总是可重入）。"""
+    got: list = []
+
+    def _try():
+        ok = lock.acquire(blocking=False)
+        if ok:
+            lock.release()
+        got.append(ok)
+    worker = threading.Thread(target=_try)
+    worker.start()
+    worker.join()
+    return got[0]
+
+
+# ───────────────────────── 分叉路由 ─────────────────────────
+
+def test_fork_through_http_digest_matches(client, monkeypatch):
+    pool = _pool(client)
+    src = _source_with_content(client)
+    assert "src" in pool.open_worlds()
+
+    # 裁定 R5：开着（可写）的来源走引擎自己的连接，持着引擎锁；关着的来源持它的世界锁走 world_fork；
+    # 快照为来源直接 world_fork。用替身记下走的是哪条路、当时锁的状态。
+    calls: list = []
+    real_from_conn, real_fork = _core.world_fork_from_connection, _core.world_fork
+
+    def _spy_from_conn(reg, conn, source, new_name, opts):
+        engine = _engine_of(pool, source)
+        calls.append(("from_connection", source, _lock_is_free(engine._lock)))
+        engine = None
+        return real_from_conn(reg, conn, source, new_name, opts)
+
+    def _spy_fork(reg, source, new_name, opts):
+        calls.append(("fork", source, opts.get("snapshot_id"),
+                      _lock_is_free(pool._world_lock(source))))
+        return real_fork(reg, source, new_name, opts)
+    monkeypatch.setattr(_core, "world_fork_from_connection", _spy_from_conn)
+    monkeypatch.setattr(_core, "world_fork", _spy_fork)
+
+    live = _digest(src["db_path"], src["tenant"])
+    out = _fork(client, "src", "rollout-1", labels={"run": "r1"}, retention_group="grp-a",
+                reclaimable=True)
+    assert out["digest"] == live
+    row = out["world"]
+    assert row["name"] == "rollout-1" and row["fork_of_world"] == "src"
+    assert row["fork_of_snapshot"] is None and row["labels"] == {"run": "r1"}
+    assert row["retention_group"] == "grp-a" and row["reclaimable"] is True
+    assert row["tenant"] == "src" and "db_path" not in row and "snapshot_dir" not in row
+    assert calls[-1] == ("from_connection", "src", False)          # 引擎锁被持着
+    forked = pool.record("rollout-1")
+    assert _digest(forked["db_path"], forked["tenant"]) == live
+
+    # 关着的来源：世界锁持着，不经引擎。
+    pool.close_world("src")
+    out = _fork(client, "src", "rollout-2")
+    assert out["digest"] == live and calls[-1] == ("fork", "src", None, False)
+    assert "src" not in pool.open_worlds()                          # 分叉不打开来源
+
+    # 快照为来源：fork_of_snapshot 记下快照 id。
+    snap = client.post("/api/worlds/src/snapshots", json={}).json()
+    out = _fork(client, "src", "replay-1", snapshot_id=snap["id"])
+    assert out["world"]["fork_of_snapshot"] == snap["id"] and out["digest"] == live
+    assert calls[-1][:3] == ("fork", "src", snap["id"])
+
+    # 设置覆盖经 C++ 合并（与建世界同一条路）。
+    out = _fork(client, "src", "tuned-1", settings={"source_lane": {"k_source": 9}})
+    detail = client.get("/api/worlds/tuned-1").json()
+    assert detail["settings"]["source_lane"]["k_source"] == 9
+
+    # 错误码：重名 409、来源不存在 404、名字不合规则 400、快照不存在 404、设置带服务端键 400。
+    for body, source, expected in (
+            ({"new_name": "rollout-1"}, "src", (409, "world_exists")),
+            ({"new_name": "fresh"}, "nope", (404, "world_not_found")),
+            ({"new_name": "../x"}, "src", (400, "invalid_world_name")),
+            ({"new_name": "fresh", "snapshot_id": "20261106T000000Z-0000"}, "src",
+             (404, "snapshot_not_found")),
+            ({"new_name": "fresh", "settings": {"embedding": {"key_set": True}}}, "src",
+             (400, "invalid_settings"))):
+        resp = client.post(f"/api/worlds/{source}/fork", json=body)
+        assert (resp.status_code, resp.json()["detail"]) == expected, body
+    assert "fresh" not in _rows(client)
+
+
+def test_fork_of_schema_behind_source_is_409(client):
+    pool = _pool(client)
+    src = _source_with_content(client)
+    pool.close_world("src")
+    with sqlite3.connect(src["db_path"]) as conn:
+        conn.execute("DELETE FROM schema_migrations "
+                     "WHERE version = (SELECT MAX(version) FROM schema_migrations)")
+    conn.close()
+    resp = client.post("/api/worlds/src/fork", json={"new_name": "rollout-1"})
+    assert (resp.status_code, resp.json()["detail"]) == (409, "world_schema_behind")
+    assert "rollout-1" not in _rows(client)
+
+
+# ───────────────────────── 只读打开 ─────────────────────────
+
+def test_reclaimable_world_opens_read_only_and_bytes_unchanged(client):
+    pool = _pool(client)
+    _source_with_content(client)
+    _fork(client, "src", "rollout-1", reclaimable=True)
+    rec = pool.record("rollout-1")
+    assert rec["settings"]["background"]["ingest"]                 # 设置里后台开着，只读打开照样不起
+    db = rec["db_path"]
+    sha, files = _sha256(db), _dir_files(db)
+
+    rows = client.get("/api/w/rollout-1/statements").json()["rows"]
+    assert [row["object_value"] for row in rows] == ["auth"]
+    resp = client.post("/api/w/rollout-1/recall", json={"query": "who owns auth"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["results"], "召回要真的读到分叉过来的语句"
+    assert client.get("/api/w/rollout-1/working_set",
+                      params={"interlocutor": "claude"}).status_code == 200
+
+    assert "rollout-1" in pool.open_worlds()
+    engine = _engine_of(pool, "rollout-1")
+    assert engine.read_only is True and engine._rt.adapter.read_only is True
+    assert engine._tick_thread is None and engine._ingest_thread is None
+    assert engine.session_snapshot_hook is None
+    engine = None
+
+    pool.close_world("rollout-1")
+    assert _sha256(db) == sha
+    after = _dir_files(db)
+    assert after == files, after - files                             # 没有新的 -wal / -shm / -journal
+    assert not any(name.endswith(("-wal", "-shm", "-journal")) for name in after)
+
+    # 可写的普通世界照旧可写打开、起后台线程（对照）。
+    engine = _engine_of(pool, "src")
+    assert engine.read_only is False and engine._tick_thread is not None
+    engine = None
+
+
+@pytest.mark.parametrize("kind", ["reclaimable", "seed"])
+def test_write_to_read_only_world_is_409_world_read_only(client, kind):
+    _source_with_content(client)
+    _fork(client, "src", "ro-1", **{kind: True})
+    db = _pool(client).record("ro-1")["db_path"]
+    sha = _sha256(db)
+    stmt_id = client.get("/api/w/ro-1/statements").json()["rows"][0]["id"]
+    writes = (("/remember", {"text": "Carol owns billing"}),
+              ("/converse", {"message": "who owns billing?"}),
+              ("/tick", {}),
+              ("/forget", {"ids": [stmt_id]}),
+              ("/clear_memory", {"confirm": "src"}),
+              ("/review", {"stmt_id": stmt_id}),
+              ("/replay_trigger", {"mode": "idle"}),
+              ("/reconsolidate", {"stmt_id": stmt_id}),
+              ("/commitment/fulfill", {"stmt_id": stmt_id}),
+              ("/commitment/withdraw", {"stmt_id": stmt_id}))
+    for path, body in writes:
+        resp = client.post(f"/api/w/ro-1{path}", json=body)
+        assert (resp.status_code, resp.json()) == (409, {"detail": "world_read_only"}), path
+    with client.websocket_connect("/ws/converse") as ws:
+        ws.send_json({"message": "who owns billing?", "world": "ro-1"})
+        assert ws.receive_json() == {"type": "error", "error": "world_read_only"}
+    assert client.get("/api/w/ro-1/statements").json()["rows"][0]["id"] == stmt_id
+    _pool(client).close_world("ro-1")
+    assert _sha256(db) == sha
+
+
+def test_read_only_engine_maps_write_rejections_to_world_read_only(client, monkeypatch):
+    """读路径上万一碰到写入拒绝（C++ 写门的 WriteGateRejected，或 mode=ro 连接拒绝写入的 SQLite 错误），只读引擎
+    一律报 world_read_only（409），不报 500。别的错误照常抛。"""
+    _source_with_content(client)
+    _fork(client, "src", "rollout-1", reclaimable=True)
+    assert client.post("/api/w/rollout-1/recall", json={"query": "auth"}).status_code == 200
+    engine = _engine_of(_pool(client), "rollout-1")
+    core = engine._core
+    engine = None
+    raised = {"exc": None}
+
+    def _recall(*_args, **_kwargs):
+        raise raised["exc"]
+    monkeypatch.setattr(core, "recall", _recall)
+    for exc in (_core.WriteGateRejected("write rejected: runtime not accepting writes"),
+                RuntimeError("Stmt: step failed: attempt to write a readonly database")):
+        raised["exc"] = exc
+        resp = client.post("/api/w/rollout-1/recall", json={"query": "auth"})
+        assert (resp.status_code, resp.json()) == (409, {"detail": "world_read_only"}), exc
+    raised["exc"] = ValueError("something else")
+    with pytest.raises(ValueError):
+        client.post("/api/w/rollout-1/recall", json={"query": "auth"})
+
+
+# ───────────────────────── 列表、详情与升级种子 ─────────────────────────
+
+def test_seed_shows_flags_in_list(client):
+    pool = _pool(client)
+    _source_with_content(client)
+    snap = client.post("/api/worlds/src/snapshots", json={}).json()
+    _fork(client, "src", "seed-1", seed=True)
+    _fork(client, "src", "rollout-1", reclaimable=True, retention_group="grp-a",
+          snapshot_id=snap["id"])
+    pool.create_world("plain", "")
+
+    upgraded = client.post("/api/worlds/seed-1/upgrade_seed", json={"new_name": "seed-2"})
+    assert upgraded.status_code == 200, upgraded.text
+    body = upgraded.json()
+    assert body["world"]["fork_of_world"] == "seed-1" and body["world"]["seed"] is True
+    assert body["digest"] == _digest(pool.record("seed-2")["db_path"], "src")
+    resp = client.post("/api/worlds/plain/upgrade_seed", json={"new_name": "seed-3"})
+    assert (resp.status_code, resp.json()["detail"]) == (400, "invalid_settings")
+    resp = client.post("/api/worlds/seed-1/upgrade_seed", json={"new_name": "seed-2"})
+    assert (resp.status_code, resp.json()["detail"]) == (409, "world_exists")
+
+    rows = _rows(client)
+    expected = {   # (seed, read_only, reclaimable, open_mode)：read_only 是注册表原始标记（裁定 R18）
+        "seed-1": (True, True, False, "ro"), "seed-2": (True, True, False, "ro"),
+        "rollout-1": (False, False, True, "ro"),
+        "plain": (False, False, False, "rw"), "src": (False, False, False, "rw"),
+        "default": (False, False, False, "rw")}
+    for name, flags in expected.items():
+        row = rows[name]
+        assert (row["seed"], row["read_only"], row["reclaimable"], row["open_mode"]) == flags, name
+        detail = client.get(f"/api/worlds/{name}").json()
+        assert (detail["seed"], detail["read_only"], detail["reclaimable"],
+                detail["open_mode"]) == flags, name
+    assert rows["seed-1"]["fork_of_world"] == "src" and rows["seed-1"]["fork_of_snapshot"] is None
+    assert rows["rollout-1"]["fork_of_snapshot"] == snap["id"]
+    assert rows["rollout-1"]["retention_group"] == "grp-a"
+    assert rows["plain"]["fork_of_world"] is None and rows["plain"]["retention_group"] is None
+    # 种子打开也是只读，不起线程。
+    assert client.post("/api/w/seed-1/recall", json={"query": "auth"}).status_code == 200
+    engine = _engine_of(pool, "seed-1")
+    assert engine.read_only and engine._tick_thread is None and engine._ingest_thread is None
+    engine = None
+
+
+def test_schema_behind_world_opens_and_is_flagged(client, monkeypatch):
+    pool = _pool(client)
+    _source_with_content(client)
+    _fork(client, "src", "old-1", reclaimable=True)
+    db = pool.record("old-1")["db_path"]
+    with sqlite3.connect(db) as conn:   # 模拟旧版 Starling 写出的库：少了最后一条迁移
+        conn.execute("DELETE FROM schema_migrations "
+                     "WHERE version = (SELECT MAX(version) FROM schema_migrations)")
+    conn.close()
+    sha = _sha256(db)
+
+    # 关着：列表不打开库（裁定 R17），给 null；详情短暂只读打开来算。
+    opened: list = []
+    real_open = _core.SqliteAdapter.open_read_only
+
+    def _spy(path):
+        opened.append(path)
+        return real_open(path)
+    monkeypatch.setattr(_core.SqliteAdapter, "open_read_only", staticmethod(_spy))
+    assert _rows(client)["old-1"]["schema_behind"] is None and opened == []
+    assert client.get("/api/worlds/old-1").json()["schema_behind"] is True
+    assert opened == [db] and "old-1" not in pool.open_worlds()
+    monkeypatch.setattr(_core.SqliteAdapter, "open_read_only", staticmethod(real_open))
+    assert client.get("/api/worlds/src").json()["schema_behind"] is False
+
+    # 打开：照常打开（不跑迁移），召回可用；列表与详情都标出 schema_behind。
+    resp = client.post("/api/w/old-1/recall", json={"query": "who owns auth"})
+    assert resp.status_code == 200, resp.text
+    assert "old-1" in pool.open_worlds()
+    assert _rows(client)["old-1"]["schema_behind"] is True
+    assert client.get("/api/worlds/old-1").json()["schema_behind"] is True
+    assert _rows(client)["src"]["schema_behind"] is False
+    pool.close_world("old-1")
+    assert _sha256(db) == sha

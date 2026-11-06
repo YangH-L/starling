@@ -562,6 +562,22 @@ void bind_15_world(pybind11::module_& m) {
         return gov::purge_rollback_archives(reg, world);
     }, py::arg("registry"), py::arg("world"));
 
+    // 打开方式（spec §6.4）：record 是注册表记录 dict（WorldRegistry.get / list 的一行），只读 seed、read_only、
+    // reclaimable 三个键（缺的键按 False）。规则在 C++ decide_open_mode。返回 "rw" | "ro"。
+    m.def("world_decide_open_mode",
+          [](const py::dict& record, bool for_client_write) {
+              const auto flag = [&record](const char* key) {
+                  const py::object val = record.attr("get")(key, false);
+                  return val.cast<bool>();
+              };
+              gov::WorldRecord rec;
+              rec.seed = flag("seed");
+              rec.read_only = flag("read_only");
+              rec.reclaimable = flag("reclaimable");
+              return gov::decide_open_mode(rec, for_client_write) == gov::OpenMode::ReadOnly ? "ro"
+                                                                                           : "rw";
+          }, py::arg("record"), py::arg("for_client_write") = false);
+
     // ---- 分叉、种子与升级种子（spec §6.1、§6.2） ----
     // 规则、校验与错误码全在 C++（world_store.hpp fork_world / upgrade_seed）。opts 见 fork_options_in。
     // 复制、算摘要可能要几百毫秒，释放 GIL。返回 {"world": <记录 dict>, "digest": str}。

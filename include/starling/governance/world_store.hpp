@@ -57,7 +57,8 @@ private:
 //           | world_schema_behind（fork_world：来源库 schema_migrations 的最高版本低于本构建内嵌的最高版本）
 //           | fork_digest_mismatch（fork_world：来源没变，复制出来的库的摘要却与来源不同）
 //           | restore_digest_mismatch（rollback_world：恢复后的摘要与快照条目记的不同；库已替换）
-//           | world_busy（fork_world_from_connection：复制途中来源有写入；瞬态，调用方重试）
+//           | world_busy（fork_world_from_connection：复制途中来源有写入，或来源连接上开着事务、有没走完的
+//             语句；瞬态，调用方重试）
 //           | world_read_only（只读世界上写入；由引擎层抛，见第 3 期 Task 3.3）
 
 struct SnapshotEntry {
@@ -529,8 +530,11 @@ struct ForkResult {
 //      → world_schema_behind。不在来源上跑迁移，来源字节不变。
 //   3. 经 RegistryDb::create_populated 选 dir_id、建 worlds/<dir_id>/（与 create_world 同一套布局），
 //      然后在注册表锁之外：
-//      a. 读来源的 PRAGMA data_version 与 sqlite3_total_changes64（裁定 R11），在来源上算 digest；
-//      b. VACUUM INTO worlds/<dir_id>/world.db.partial；调用 opts.after_copy_for_test（非空时）；
+//      a. source_conn 开着事务（sqlite3_get_autocommit == 0）→ world_busy：事务里看到的视图可能含没提交的
+//         写入，写入标记也说明不了什么。然后读来源的 PRAGMA data_version 与 sqlite3_total_changes64
+//         （裁定 R11），在来源上算 digest；
+//      b. VACUUM INTO worlds/<dir_id>/world.db.partial（SQLite 以 "cannot VACUUM from within a transaction"
+//         或 "SQL statements in progress" 拒绝时 → world_busy）；调用 opts.after_copy_for_test（非空时）；
 //      c. 再读一次 data_version 与 total_changes：任一变了（别的连接或同一条连接在复制途中提交了
 //         写入）→ world_busy（瞬态，调用方重试）。所以 fork_digest_mismatch 只表示「来源没变，复制
 //         却不同」；

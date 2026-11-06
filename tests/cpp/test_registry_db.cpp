@@ -357,6 +357,28 @@ TEST(RegistryDb, CreateRecordsWorldFlags) {
     EXPECT_EQ(reg.get("seed").read_only, true);
 }
 
+// 打开方式（spec §6.4）：只读或可回收的世界看板一律只读打开；客户端写入（第 4 期）只对只读世界只读。
+TEST(RegistryDb, OpenModeRule) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    const auto plain = reg.create("plain", "", {}, "{}", kNow);
+    const auto seed = reg.create("seed", "", {}, "{}", kNow, WorldFlags{.seed = true});
+    const auto frozen = reg.create("frozen", "", {}, "{}", kNow, WorldFlags{.read_only = true});
+    const auto rollout = reg.create("rollout", "", {}, "{}", kNow, WorldFlags{.reclaimable = true});
+
+    EXPECT_EQ(decide_open_mode(plain, false), OpenMode::ReadWrite);
+    EXPECT_EQ(decide_open_mode(seed, false), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(frozen, false), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(rollout, false), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(reg.get("default"), false), OpenMode::ReadWrite);
+
+    // 客户端写入：可回收世界（rollout）可写，种子与只读世界仍只读。
+    EXPECT_EQ(decide_open_mode(plain, true), OpenMode::ReadWrite);
+    EXPECT_EQ(decide_open_mode(seed, true), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(frozen, true), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(rollout, true), OpenMode::ReadWrite);
+}
+
 TEST(RegistryDb, CorruptRegistryFileIsReported) {
     const TempDir tmp;
     {

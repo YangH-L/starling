@@ -35,6 +35,9 @@ _STATUS = {
     "endpoint_changed": 409, "world_protected": 409, "world_tenant_mismatch": 409,
     "invalid_settings": 400,
     "world_open_failed": 500, "rollback_reopen_failed": 500,
+    # 第 3 期（spec §6、§13.2）：只读世界上写入、分叉来源 schema 落后、分叉或恢复后摘要对不上。
+    "world_read_only": 409, "world_schema_behind": 409,
+    "fork_digest_mismatch": 500, "restore_digest_mismatch": 500,
 }
 
 

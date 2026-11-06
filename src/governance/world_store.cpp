@@ -1973,6 +1973,18 @@ NewWorld new_world_of(const ForkPlan& plan, const std::string& new_name, const F
                     .flags = plan.flags,};
 }
 
+// SQLite 拒绝在这条连接上 VACUUM 的两种情况：连接开着事务，或还有没走完的语句。共用的引擎连接上
+// 这是「别的调用正在用它」，与复制途中有写入同属瞬态，报 world_busy。
+bool vacuum_refused_as_busy(const persistence::SqliteError& err) {
+    const std::string_view text = err.what();
+    return text.find("cannot VACUUM from within a transaction") != std::string_view::npos ||
+           text.find("SQL statements in progress") != std::string_view::npos;
+}
+
+[[noreturn]] void source_busy(const std::string& source, const std::string& why) {
+    throw WorldStoreError("world_busy", "source '" + source + "' " + why + "; retry");
+}
+
 // 分叉第 3 步：从 source_conn 复制到 db_file，返回摘要。见 world_store.hpp fork_world_from_connection。
 // 调用方已查过 schema（第 2 步，require_current_schema）。
 std::string copy_verified(persistence::Connection& source_conn, const std::string& source,
@@ -1980,9 +1992,19 @@ std::string copy_verified(persistence::Connection& source_conn, const std::strin
                           const ForkOptions& opts) {
     sqlite3* dbh = source_conn.raw();
     const fs::path partial = db_file.string() + ".partial";
+    // 连接开着事务时 data_version 与摘要读到的是这个事务里的视图（可能含没提交的写入），写入标记也就
+    // 不能说明「复制期间没人写」：在取标记之前拒绝。
+    if (sqlite3_get_autocommit(dbh) == 0) { source_busy(source, "has a transaction open"); }
     const WriteMark before = write_mark(dbh);
     const std::string expected = memoryops::digest(source_conn, tenant);
-    vacuum_into(dbh, partial);
+    try {
+        vacuum_into(dbh, partial);
+    } catch (const persistence::SqliteError& err) {
+        std::error_code ignore;
+        fs::remove(partial, ignore);
+        if (vacuum_refused_as_busy(err)) { source_busy(source, "is in use by another call"); }
+        throw;
+    }
     if (opts.after_copy_for_test) { opts.after_copy_for_test(partial); }
     if (write_mark(dbh) != before) {
         throw WorldStoreError("world_busy", "source '" + source +

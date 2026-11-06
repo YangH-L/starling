@@ -279,10 +279,10 @@ TEST(WorldFork, UpgradeSeedMigratesCopyAndKeepsOld) {
     auto reg = open_registry(tmp);
     const WorldRecord old_seed =
         reg.create("seed-v1", "情境一", {{"scenario", "s1"}}, "{}", kNow, WorldFlags{.seed = true});
-    // 旧版 Starling 写出的种子：库里只有一张空的 schema_migrations（版本 0，落后于当前代码）。
-    run_sql(old_seed.db_path,
-            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, "
-            "applied_at TEXT NOT NULL, checksum TEXT NOT NULL)");
+    // 旧版 Starling 写出的种子：有内容（3 条语句），schema_migrations 少了最后一条（落后于当前代码）。
+    insert_statements(old_seed.db_path, old_seed.tenant, 0, 3);
+    run_sql(old_seed.db_path, "DELETE FROM schema_migrations "
+                              "WHERE version = (SELECT MAX(version) FROM schema_migrations)");
     ASSERT_LT(schema_of(old_seed.db_path), persistence::MigrationRunner::latest_embedded_version());
     const std::string old_sha = file_sha256(old_seed.db_path);
 
@@ -295,6 +295,22 @@ TEST(WorldFork, UpgradeSeedMigratesCopyAndKeepsOld) {
     EXPECT_EQ(upgraded.world.fork_of_world, "seed-v1");
     EXPECT_EQ(upgraded.world.tenant, old_seed.tenant);
     EXPECT_EQ(upgraded.world.labels, old_seed.labels);
+    // 内容随复制过来：旧种子的 3 条语句都在新种子里，值不变。
+    {
+        auto conn = persistence::Connection::open_read_only(upgraded.world.db_path);
+        persistence::Stmt rows(conn.raw(),
+                               "SELECT id, object_value FROM statements WHERE tenant_id = ?1 ORDER BY id");
+        rows.bind(old_seed.tenant);
+        std::map<std::string, std::string> found;
+        while (rows.step_row()) {
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+            found.emplace(reinterpret_cast<const char*>(sqlite3_column_text(rows.raw(), 0)),
+                          // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+                          reinterpret_cast<const char*>(sqlite3_column_text(rows.raw(), 1)));
+        }
+        EXPECT_EQ(found, (std::map<std::string, std::string>{
+                             {"st-0", "object-0"}, {"st-1", "object-1"}, {"st-2", "object-2"}}));
+    }
     // 迁移后的副本是一份文件：没有挂着的 -wal / -shm，也没有 partial。
     EXPECT_FALSE(fs::exists(upgraded.world.db_path + "-wal"));
     EXPECT_FALSE(fs::exists(upgraded.world.db_path + "-shm"));
@@ -374,6 +390,45 @@ TEST(WorldFork, ConcurrentWriteDuringForkIsWorldBusy) {
               }),
               "world_busy");
     EXPECT_EQ(world_dirs(reg), dirs);
+    writer->close();
+}
+
+// 共用的引擎连接上开着事务（或有没走完的语句）时不能 VACUUM：报 world_busy（瞬态，调用方重试），
+// 不报 snapshot_failed；不留目录、不留注册项。
+TEST(WorldFork, ForkFromConnectionInAnOpenTransactionIsWorldBusy) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    const WorldRecord src = world_with_statements(reg, "deploy-1", 2);
+    auto writer = persistence::SqliteAdapter::open(src.db_path);
+    const auto dirs = world_dirs(reg);
+
+    writer->connection().exec("BEGIN");
+    EXPECT_EQ(code_of([&] {
+                  (void)fork_world_from_connection(reg, writer->connection(), "deploy-1",
+                                                   "rollout-1", fork_opts());
+              }),
+              "world_busy");
+    writer->connection().exec("ROLLBACK");
+    EXPECT_EQ(world_dirs(reg), dirs);
+    EXPECT_EQ(code_of([&] { (void)reg.get("rollout-1"); }), "world_not_found");
+
+    // 自动提交模式下、还有一条读到一半的语句：VACUUM 报 "SQL statements in progress"。
+    {
+        persistence::Stmt reading(writer->connection().raw(), "SELECT id FROM statements");
+        ASSERT_TRUE(reading.step_row());
+        EXPECT_EQ(code_of([&] {
+                      (void)fork_world_from_connection(reg, writer->connection(), "deploy-1",
+                                                       "rollout-1", fork_opts());
+                  }),
+                  "world_busy");
+    }
+    EXPECT_EQ(world_dirs(reg), dirs);
+    EXPECT_EQ(code_of([&] { (void)reg.get("rollout-1"); }), "world_not_found");
+
+    // 语句走完之后照常分叉。
+    const ForkResult forked =
+        fork_world_from_connection(reg, writer->connection(), "deploy-1", "rollout-1", fork_opts());
+    EXPECT_EQ(forked.world.fork_of_world, "deploy-1");
     writer->close();
 }
 

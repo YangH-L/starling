@@ -45,6 +45,9 @@ _STATUS = {
     "insufficient_disk": 507, "world_busy": 503, "worlds_unavailable": 503,
     "world_open_failed": 500, "snapshot_failed": 500, "registry_corrupt": 500,
     "rollback_reopen_failed": 500,
+    # 第 3 期（spec §6、§13.2）。
+    "world_read_only": 409, "world_schema_behind": 409,
+    "fork_digest_mismatch": 500, "restore_digest_mismatch": 500,
 }
 
 # 世界设置里带 provider 密钥的段（返回时每段加 key_set）。
@@ -75,6 +78,22 @@ class CreateWorldBody(BaseModel):
 
 class SnapshotBody(BaseModel):
     note: str = ""
+
+
+class ForkBody(BaseModel):
+    # spec §6.1。snapshot_id 为空 = 以世界当前状态为来源。settings 原样转发（部分设置，C++ 合并、校验，同
+    # CreateWorldBody）。严格布尔：宽松模式会把 "yes" 转成 True，到不了 C++。
+    new_name: str
+    snapshot_id: str | None = None
+    labels: dict[str, str] = {}
+    retention_group: str | None = None
+    reclaimable: StrictBool = False
+    seed: StrictBool = False
+    settings: dict | None = None
+
+
+class UpgradeSeedBody(BaseModel):
+    new_name: str
 
 
 # 回滚语义 A（spec §5.1）。语义 B（"scene"，只回滚该场景）属于 W5，现在一律拒绝。
@@ -173,9 +192,19 @@ def _archive_totals(pool, name: str) -> tuple[int, int]:
     return len(listed), sum(item["size_bytes"] for item in listed)
 
 
+def _text_flag(value: str):
+    # 注册表里没有的文本标记（retention_group、fork_of_*）是空串；契约给 null。
+    return value or None
+
+
 def _world_row(pool, rec: dict, open_worlds: set[str]) -> dict:
     """列表的一行。不打开任何库（几百个世界时逐个打开撑不住，spec §5.1）：开着的世界的计数由池现读
-    （持一份不建引擎的租约），关着的取注册表缓存列（关闭时与每 30 秒写入）。快照与归档只读注册表与目录。"""
+    （持一份不建引擎的租约），关着的取注册表缓存列（关闭时与每 30 秒写入）。快照与归档只读注册表与目录。
+
+    第 3 期（spec §6）：seed、read_only、reclaimable、retention_group、fork_of_* 是注册表的原始标记（read_only
+    只在只读世界与种子上为真，裁定 R18）；open_mode 是看板实际怎么打开它（C++ world_decide_open_mode：可回收
+    世界 read_only 为假、open_mode 却是 "ro"）。schema_behind 只给开着的世界（引擎打开时记下的），关着的为
+    null：列表不打开库（裁定 R17），详情另算。"""
     name = rec["name"]
     is_open = name in open_worlds
     counts = {"holders": rec["holders"], "statements": rec["statements"],
@@ -193,7 +222,13 @@ def _world_row(pool, rec: dict, open_worlds: set[str]) -> dict:
             "snapshots": len(snaps),
             "snapshot_bytes": sum(s["size_bytes"] for s in snaps if not _snapshot_missing(s)),
             "archives": archives, "archive_bytes": archive_bytes,
-            "auto_snapshot": _auto_snapshot_of(rec)}
+            "auto_snapshot": _auto_snapshot_of(rec),
+            "seed": rec["seed"], "read_only": rec["read_only"], "reclaimable": rec["reclaimable"],
+            "retention_group": _text_flag(rec["retention_group"]),
+            "fork_of_world": _text_flag(rec["fork_of_world"]),
+            "fork_of_snapshot": _text_flag(rec["fork_of_snapshot"]),
+            "open_mode": _core.world_decide_open_mode(rec),
+            "schema_behind": pool.schema_behind(name, open_only=True) if is_open else None}
 
 
 def _snapshot_row(snap: dict) -> dict:
@@ -245,9 +280,11 @@ def _list_worlds(pool, labels: dict, offset: int, limit: int) -> dict:
 
 def _world_detail(pool, providers: dict, name: str) -> dict:
     """详情：列表的一行，加上库的完整统计（只读打开库，持不建引擎的租约）与实际生效的设置（不含密钥）。
-    库存在但读不出时统计置 0 并带 stats_error: true，详情照常给出（坏世界还能从界面删掉）。"""
+    库存在但读不出时统计置 0 并带 stats_error: true，详情照常给出（坏世界还能从界面删掉）。schema_behind 对
+    关着的世界也给：持不建引擎的租约短暂只读打开库读一次（裁定 R17），读不出时 null。"""
     rec = pool.record(name)
     row = _world_row(pool, rec, set(pool.open_worlds()))
+    row["schema_behind"] = pool.schema_behind(name)
     try:
         stats = pool.db_stats(name)
     except _core.WorldStoreError as exc:
@@ -266,6 +303,23 @@ def _create_world(pool, body: CreateWorldBody) -> dict:
     rec = pool.create_world(body.name, body.label, labels=body.labels, overrides=body.settings,
                             auto_snapshot=auto)
     return _world_row(pool, rec, set(pool.open_worlds()))
+
+
+def _fork_out(pool, out: dict) -> dict:
+    """{"world": 新世界的列表行, "digest"}：记录经列表行的白名单（不外露 db_path、snapshot_dir）。"""
+    return {"world": _world_row(pool, out["world"], set(pool.open_worlds())),
+            "digest": out["digest"]}
+
+
+def _fork_world(pool, source: str, body: ForkBody) -> dict:
+    out = pool.fork_world(source, body.new_name, snapshot_id=body.snapshot_id, labels=body.labels,
+                          retention_group=body.retention_group, reclaimable=body.reclaimable,
+                          seed=body.seed, settings=body.settings)
+    return _fork_out(pool, out)
+
+
+def _upgrade_seed(pool, source: str, new_name: str) -> dict:
+    return _fork_out(pool, pool.upgrade_seed(source, new_name))
 
 
 def _update_settings(pool, providers: dict, name: str, overrides: dict) -> dict:
@@ -361,6 +415,22 @@ def build_worlds_router(require_token) -> APIRouter:
         await _run(pool.delete_world, name)
         return {"deleted": name}
 
+    @router.post("/worlds/{name}/fork")
+    async def fork_world(request: Request, name: str, body: ForkBody):
+        # spec §6.1：复制、校验、摘要比较、登记全在 C++；池按来源开没开着选路、持锁（裁定 R5）。新世界不打开。
+        pool = _pool(request)
+        _require_registry(pool)
+        if body.settings is not None:
+            _require_client_settings(body.settings)
+        return await _run(_fork_world, pool, name, body)
+
+    @router.post("/worlds/{name}/upgrade_seed")
+    async def upgrade_seed(request: Request, name: str, body: UpgradeSeedBody):
+        # spec §6.2：复制旧种子、在副本上跑迁移、登记成新种子；旧种子原样保留。
+        pool = _pool(request)
+        _require_registry(pool)
+        return await _run(_upgrade_seed, pool, name, body.new_name)
+
     @router.put("/worlds/{name}/settings")
     async def update_settings(request: Request, name: str, body=Body(...)):
         # body 原样转发（裁定 R35）：部分设置，没给的键不出现，C++ 逐叶合并；不经模型转换，免得把没给的
@@ -435,8 +505,9 @@ def build_worlds_router(require_token) -> APIRouter:
         try:
             out = await _run(pool.rollback, name, body.snapshot_id)
         except HTTPException as exc:
-            if exc.detail == "rollback_reopen_failed":
-                # 库已经换成了快照的内容，只是引擎没能重开：别的标签页同样要知道库变了。
+            if exc.detail in ("rollback_reopen_failed", "restore_digest_mismatch"):
+                # 库已经换成了快照的内容（引擎没能重开，或换上之后才发现摘要对不上）：别的标签页同样要知道
+                # 库变了。
                 await _broadcast(request, "world_rolled_back", name, rolled_back)
             raise
         await _broadcast(request, "world_rolled_back", name, rolled_back)

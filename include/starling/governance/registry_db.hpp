@@ -44,6 +44,15 @@ struct WorldQuery {
     std::int64_t offset = 0, limit = 50;         // limit 1–500
 };
 
+// 一个世界怎么打开（spec §6.4，判定在 C++，Python 只问）。
+enum class OpenMode { ReadWrite, ReadOnly };
+
+// 看板打开一个世界（for_client_write=false）：read_only（含种子）或 reclaimable（rollout 世界、验证分叉）
+// → ReadOnly，不跑迁移、不起后台线程、拒绝写入；其余（部署世界、用户建的世界、默认世界）→ ReadWrite。
+// 客户端为写入而打开（for_client_write=true，第 4 期的会话句柄用）：可回收世界正是 rise 写入的地方，
+// 只有 read_only → ReadOnly。第 4 期在这里加「被别的会话占用写入」一维。
+[[nodiscard]] OpenMode decide_open_mode(const WorldRecord& rec, bool for_client_write);
+
 class RegistryDb {
 public:
     // 打开或创建 <data_dir>/registry.db（WAL）。不存在时建表，并登记默认世界：
