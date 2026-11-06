@@ -729,4 +729,35 @@ TEST(WorldFork, MalformedNowIsInvalidSettingsBeforeAnyIo) {
         << forked.world.created_at;
 }
 
+// 裁定 R22 M6：新分叉（与升级种子）的世界登记时带着统计缓存，值在复制出来的库上算，与来源当前的统计相同；
+// stats_at 是登记时刻。新世界在列表上不再显示 0。
+TEST(WorldFork, RegisteredStatsMatchTheSource) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    const WorldRecord src = world_with_statements(reg, "deploy-1", 3);
+    const WorldStats live = world_stats(src.db_path, src.tenant);
+    ASSERT_EQ(live.statements, 3);
+    reg.update_stats("deploy-1", live.holders, live.statements, live.last_write_at, kNow);
+
+    const ForkResult forked = fork_world(reg, "deploy-1", "rollout-1", fork_opts());
+    const WorldRecord got = reg.get("rollout-1");
+    EXPECT_EQ(got.statements, live.statements);
+    EXPECT_EQ(got.holders, live.holders);
+    EXPECT_EQ(got.last_write_at, live.last_write_at);
+    EXPECT_EQ(got.stats_at, kNow);
+    EXPECT_EQ(forked.world.statements, live.statements);
+    EXPECT_EQ(got.statements, reg.get("deploy-1").statements);
+
+    const WorldRecord old_seed = reg.create("seed-v1", "", {}, "{}", kNow, WorldFlags{.seed = true});
+    insert_statements(old_seed.db_path, old_seed.tenant, 0, 2);
+    const ForkResult upgraded = upgrade_seed(reg, "seed-v1", "seed-v2", kNow);
+    EXPECT_EQ(reg.get("seed-v2").statements, 2);
+    EXPECT_EQ(upgraded.world.holders, world_stats(upgraded.world.db_path, old_seed.tenant).holders);
+
+    // create_world（没有统计）照旧是 0 与空串。
+    const WorldRecord fresh = reg.create_world("fresh", "", {}, "{}", kNow);
+    EXPECT_EQ(fresh.statements, 0);
+    EXPECT_EQ(fresh.stats_at, "");
+}
+
 }  // namespace starling::governance

@@ -114,8 +114,10 @@ public:
     // 注册表只在前后各短暂持锁一次（spec §6.1「分叉不持全局锁，只在最后登记时短暂写注册表」）：
     //   1. 持锁：spec.name 不合规则 invalid_world_name、已被占用 world_exists；与 create 同一套布局选
     //      dir_id，建 worlds/<dir_id>/ 与 snapshots/。
-    //   2. 不持锁：populate(worlds/<dir_id>/world.db)，它负责把库写到这个路径上。
-    //   3. 持锁：登记（tenant、label、labels、settings_json、flags 照 spec 原样写入；seed 蕴含 read_only，
+    //   2. 不持锁：populate(worlds/<dir_id>/world.db)，它负责把库写到这个路径上；随后在写好的库上算统计缓存
+    //      （world_stats 的 holders、statements、last_write_at，裁定 R22 M6）。
+    //   3. 持锁：登记（tenant、label、labels、settings_json、flags 照 spec 原样写入，统计缓存写第 2 步算出的值、
+    //      stats_at = spec.now_iso；seed 蕴含 read_only，
     //      read_only 时设置强制关后台）。第 1、2 步之间名字被别的调用抢先登记 → world_exists。spec.provider_endpoints
     //      给出时先按 create_world 的规则核对 settings_json 里继承来的 endpoint（endpoint_changed，裁定 R31 M3）。
     // 任何一步抛错都删掉整个世界目录、不写注册项，原样抛出。

@@ -294,13 +294,15 @@ struct RegistryDb::Impl {
         pst::Stmt stmt(db(),
                        "INSERT INTO worlds (name, dir_id, tenant, db_path, snapshot_dir, label, "
                        "created_at, settings_json, seed, read_only, reclaimable, retention_group, "
-                       "fork_of_world, fork_of_snapshot) "
-                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                       "fork_of_world, fork_of_snapshot, holders, statements, last_write_at, stats_at) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        // 统计缓存（裁定 R22 M6）：spec 带着就随登记写入，stats_at 记登记时刻；没带时与表的默认值相同。
         stmt.bind(spec.name, home.filename().string(), spec.tenant, (home / "world.db").string(),
                   (home / "snapshots").string(), spec.label, spec.now_iso, settings,
                   static_cast<int>(flags.seed), static_cast<int>(flags.read_only),
                   static_cast<int>(flags.reclaimable), flags.retention_group, flags.fork_of_world,
-                  flags.fork_of_snapshot);
+                  flags.fork_of_snapshot, spec.holders, spec.statements, spec.last_write_at,
+                  spec.has_stats ? spec.now_iso : std::string());
         stmt.step_done();
         insert_labels(spec.name, spec.labels);
         guard.commit();
@@ -519,8 +521,9 @@ WorldRecord RegistryDb::create_world(const std::string& name, const std::string&
 }
 
 WorldRecord RegistryDb::create_populated(
-    const NewWorld& spec, const std::function<void(const fs::path& db_file)>& populate) {
-    require_valid_name(spec.name);
+    const NewWorld& spec_in, const std::function<void(const fs::path& db_file)>& populate) {
+    require_valid_name(spec_in.name);
+    NewWorld spec = spec_in;
     fs::path home;
     {
         const std::scoped_lock lock(impl_->mutex);
@@ -532,6 +535,12 @@ WorldRecord RegistryDb::create_populated(
     };
     try {
         populate(home / "world.db");   // 不持锁：复制可能要几百毫秒
+        // 统计缓存在写好的库上算（裁定 R22 M6）：与关闭时 update_stats 写的同一组值，同样不持锁。
+        const WorldStats stats = world_stats((home / "world.db").string(), spec.tenant);
+        spec.holders = stats.holders;
+        spec.statements = stats.statements;
+        spec.last_write_at = stats.last_write_at;
+        spec.has_stats = true;
         const std::scoped_lock lock(impl_->mutex);
         // 第 1 步之后名字可能被别的调用抢先登记（dir_id 不会撞：目录已经在，reserve_home 跳过它）。
         if (impl_->find(spec.name)) {

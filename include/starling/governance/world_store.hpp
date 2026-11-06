@@ -157,6 +157,12 @@ struct NewWorld {
     // 给出时 create_populated 在登记的那次持锁内、写之前按 require_endpoint_unchanged 核对 settings_json 里继承来的
     // endpoint（与 create_world 同一条规则，裁定 R40、R51、R31 M3），endpoint_changed 时不登记、删掉世界目录。
     std::optional<ProviderEndpoints> provider_endpoints;
+    // 统计缓存（与关闭时 RegistryDb::update_stats 写的同一组列，裁定 R22 M6）：populate 写好库之后填，登记时写入
+    // holders、statements、last_write_at，stats_at 取 now_iso。没填（create_world）时这几列取默认值（0 / 空串）。
+    std::int64_t holders = 0;
+    std::int64_t statements = 0;
+    std::string last_write_at;
+    bool has_stats = false;
 };
 
 class RegistryDb;   // registry_db.hpp：世界注册表 registry.db（SQLite）
@@ -589,7 +595,9 @@ struct ForkResult {
 //      e. rename(partial, world.db)。
 //   4. 登记：tenant 取来源（语句行的 tenant_id 不可变）、label 为空、labels / retention_group /
 //      reclaimable / seed 取 opts（seed 蕴含 read_only）、fork_of_world=source、fork_of_snapshot 为空、
-//      设置是第 1 步合并的结果（只读时后台强制关）。第 3 步之后名字被抢先登记 → world_exists。opts.provider_endpoints
+//      设置是第 1 步合并的结果（只读时后台强制关）。统计缓存（holders、statements、last_write_at）在复制出来的库上
+//      算（world_stats），随登记一起写入（裁定 R22 M6），新世界在列表上不是 0。第 3 步之后名字被抢先登记 → world_exists。
+//      opts.provider_endpoints
 //      给出时在这次持锁内、写之前核对设置里继承来的 endpoint（endpoint_changed，裁定 R31 M3）。
 // 任何一步失败：删掉整个新世界目录，不登记。不在注册表锁内复制。
 // 前提（调用方保证，Task 3.3 的 Python 侧持该世界的世界锁）：分叉期间没有别的写入落到来源上；有的话

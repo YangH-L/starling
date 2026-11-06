@@ -142,6 +142,9 @@ def test_fork_through_http_digest_matches(client, monkeypatch):
     assert calls[-1] == ("from_connection", "src", False)          # 引擎锁被持着
     forked = pool.record("rollout-1")
     assert _digest(forked["db_path"], forked["tenant"]) == live
+    # 裁定 R22 M6：新分叉的世界没打开过，列表用注册表的统计缓存；C++ 登记时已从复制出来的库算好。
+    assert "rollout-1" not in pool.open_worlds()
+    assert _rows(client)["rollout-1"]["statements"] == 1 == forked["statements"]
 
     # 关着的来源：世界锁持着，不经引擎。
     pool.close_world("src")
