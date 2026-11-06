@@ -58,6 +58,7 @@ private:
 //           | world_schema_behind（fork_world：来源库 schema_migrations 的最高版本低于本构建内嵌的最高版本）
 //           | fork_digest_mismatch（fork_world：来源没变，复制出来的库的摘要却与来源不同）
 //           | restore_digest_mismatch（rollback_world：恢复后的摘要与快照条目记的不同；库已替换）
+//           | world_not_seed（upgrade_seed：来源不是种子，裁定 R31 M2）
 //           | world_busy（fork_world_from_connection：复制途中来源有写入，或来源连接上开着事务、有没走完的
 //             语句；瞬态，调用方重试）
 //           | world_read_only（只读世界上写入；由引擎层抛，见第 3 期 Task 3.3。check_rollback / rollback_world：
@@ -567,7 +568,7 @@ ForkResult fork_world_from_connection(RegistryDb& reg, persistence::Connection& 
 ForkResult fork_world(RegistryDb& reg, const std::string& source, const std::string& new_name,
                       const ForkOptions& opts);
 
-// 升级种子（spec §6.2，由人显式来做）：来源不是种子（seed=false）抛 invalid_settings（消息写明不是种子）。
+// 升级种子（spec §6.2，由人显式来做）：来源不是种子（seed=false）抛 world_not_seed（裁定 R31 M2）。
 // new_name 的校验同 fork_world 第 1 步。然后经 RegistryDb::create_populated：只读打开旧种子的库，
 // VACUUM INTO 新世界目录的 world.db.partial，integrity_check，verify_world_tenant(partial, 旧种子的租户)
 // （world_tenant_mismatch，裁定 R29），在 partial 上 SqliteAdapter::open（跑迁移

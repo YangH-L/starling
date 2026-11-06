@@ -46,7 +46,7 @@ _STATUS = {
     "world_open_failed": 500, "snapshot_failed": 500, "registry_corrupt": 500,
     "rollback_reopen_failed": 500,
     # 第 3 期（spec §6、§13.2）。
-    "world_read_only": 409, "world_schema_behind": 409,
+    "world_read_only": 409, "world_schema_behind": 409, "world_not_seed": 409,
     "fork_digest_mismatch": 500, "restore_digest_mismatch": 500,
 }
 

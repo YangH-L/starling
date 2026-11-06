@@ -1056,7 +1056,7 @@ class WorldPool:
 
     def upgrade_seed(self, source: str, new_name: str) -> dict:
         """升级种子（spec §6.2，C++ world_upgrade_seed）：复制旧种子、在副本上跑迁移、登记成新种子，旧种子不动。
-        返回 {"world", "digest"}。来源不是种子 invalid_settings（C++ 判）。持来源的世界锁：种子只会被只读打开，
+        返回 {"world", "digest"}。来源不是种子 world_not_seed（C++ 判）。持来源的世界锁：种子只会被只读打开，
         持锁挡住的是同一世界上的恢复、删除与快照修剪。"""
         reg = self._require_registry()
         self._record(source)                          # world_not_found

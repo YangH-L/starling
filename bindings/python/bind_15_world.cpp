@@ -619,7 +619,7 @@ void bind_15_world(pybind11::module_& m) {
           }, py::arg("registry"), py::arg("connection"), py::arg("source"), py::arg("new_name"),
           py::arg("opts"));
 
-    // 复制旧种子 → 副本上跑迁移 → 登记为新种子；旧种子原样保留。来源不是种子抛 invalid_settings。
+    // 复制旧种子 → 副本上跑迁移 → 登记为新种子；旧种子原样保留。来源不是种子抛 world_not_seed。
     m.def("world_upgrade_seed",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
           [](gov::RegistryDb& reg, const std::string& source, const std::string& new_name,

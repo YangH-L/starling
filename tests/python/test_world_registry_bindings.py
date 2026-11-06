@@ -245,7 +245,7 @@ def test_fork_binding_releases_gil_and_returns_digest(tmp_path):
     for call, code in (
             (lambda: _core.world_fork(reg, "deploy-1", "rollout-1", {}), "world_exists"),
             (lambda: _core.world_fork(reg, "deploy-1", "x", {"bogus": 1}), "invalid_settings"),
-            (lambda: _core.world_upgrade_seed(reg, "deploy-1", "s9", NOW), "invalid_settings")):
+            (lambda: _core.world_upgrade_seed(reg, "deploy-1", "s9", NOW), "world_not_seed")):
         with pytest.raises(_core.WorldStoreError) as ei:
             call()
         assert _code(ei.value) == code

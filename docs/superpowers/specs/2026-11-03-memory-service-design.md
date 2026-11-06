@@ -293,6 +293,7 @@ starling-serve --data-dir D --host 127.0.0.1 --port P [--token-file F]
 | `world_busy` | 是 | 恢复、关闭时还有在途调用 |
 | `world_read_only` | 否 | 只读世界上写入 |
 | `world_schema_behind` | 否 | 分叉来源的 schema 落后 |
+| `world_not_seed` | 否 | 升级种子的来源不是种子 |
 | `world_settings_mismatch` | 否 | 打开时给的设置与存储的不同 |
 | `labels_immutable` | 否 | 试图改已建世界的标签 |
 | `fork_digest_mismatch` | 否 | 分叉出的世界摘要与来源不同 |

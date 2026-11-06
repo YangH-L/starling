@@ -387,7 +387,7 @@ def test_seed_shows_flags_in_list(client):
     assert body["world"]["fork_of_world"] == "seed-1" and body["world"]["seed"] is True
     assert body["digest"] == _digest(pool.record("seed-2")["db_path"], "src")
     resp = client.post("/api/worlds/plain/upgrade_seed", json={"new_name": "seed-3"})
-    assert (resp.status_code, resp.json()["detail"]) == (400, "invalid_settings")
+    assert (resp.status_code, resp.json()["detail"]) == (409, "world_not_seed")   # 裁定 R31 M2
     resp = client.post("/api/worlds/seed-1/upgrade_seed", json={"new_name": "seed-2"})
     assert (resp.status_code, resp.json()["detail"]) == (409, "world_exists")
 

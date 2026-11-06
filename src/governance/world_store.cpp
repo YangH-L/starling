@@ -2092,7 +2092,7 @@ ForkResult fork_world(RegistryDb& reg, const std::string& source, const std::str
 ForkResult upgrade_seed(RegistryDb& reg, const std::string& source, const std::string& new_name,
                         const std::string& now_iso) {
     if (!reg.get(source).seed) {   // world_not_found
-        throw WorldStoreError("invalid_settings", "world '" + source + "' is not a seed");
+        throw WorldStoreError("world_not_seed", "world '" + source + "' is not a seed");
     }
     ForkOptions opts;
     opts.seed = true;

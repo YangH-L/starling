@@ -327,7 +327,7 @@ TEST(WorldFork, UpgradeSeedRequiresASeed) {
     (void)world_with_statements(reg, "deploy-1", 1);
     const auto dirs = world_dirs(reg);
     EXPECT_EQ(code_of([&] { (void)upgrade_seed(reg, "deploy-1", "seed-v2", kNow); }),
-              "invalid_settings");
+              "world_not_seed");   // 裁定 R31 M2
     EXPECT_EQ(world_dirs(reg), dirs);
     EXPECT_EQ(code_of([&] { (void)reg.get("seed-v2"); }), "world_not_found");
 }
