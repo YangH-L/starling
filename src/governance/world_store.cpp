@@ -2022,7 +2022,8 @@ NewWorld new_world_of(const ForkPlan& plan, const std::string& new_name, const F
     return NewWorld{.name = new_name, .tenant = plan.source.tenant, .label = "",
                     .labels = opts.labels, .settings_json = plan.settings_json,
                     .now_iso = opts.now_iso.empty() ? iso_now() : opts.now_iso,
-                    .flags = plan.flags, .provider_endpoints = opts.provider_endpoints,};
+                    .flags = plan.flags, .provider_endpoints = opts.provider_endpoints,
+                    .stats_for_test = opts.stats_for_test,};
 }
 
 // SQLite 拒绝在这条连接上 VACUUM 的两种情况：连接开着事务，或还有没走完的语句。共用的引擎连接上

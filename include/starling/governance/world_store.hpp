@@ -166,6 +166,8 @@ struct NewWorld {
     std::int64_t statements = 0;
     std::string last_write_at;
     bool has_stats = false;
+    // 仅测试用：create_populated 算统计之前调用；抛异常即模拟「world_stats 失败」（裁定 R38）。为空时不调用。
+    std::function<void()> stats_for_test;
 };
 
 class RegistryDb;   // registry_db.hpp：世界注册表 registry.db（SQLite）
@@ -570,6 +572,8 @@ struct ForkOptions {
     // 测试注入用：VACUUM INTO 写完 partial 之后、再读来源的 data_version 之前调用，参数是 partial 的
     // 路径（模拟复制被篡改、复制途中来源被写）。为空时不调用（生产）。
     std::function<void(const std::filesystem::path& partial)> after_copy_for_test;
+    // 仅测试用：转给 NewWorld::stats_for_test（模拟登记时算统计失败，裁定 R38）。为空时不调用。
+    std::function<void()> stats_for_test;
 };
 
 struct ForkResult {

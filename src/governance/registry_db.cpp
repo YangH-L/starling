@@ -540,14 +540,23 @@ WorldRecord RegistryDb::create_populated(
     };
     try {
         populate(home / "world.db");   // 不持锁：复制可能要几百毫秒
-        // 统计缓存在写好的库上算（裁定 R22 M6）：与关闭时 update_stats 写的同一组值，同样不持锁。
-        // 登记之前的新世界目录只有这次操作知道（裁定 R36）：冻结打开，不在旁边留旁车。
-        const WorldStats stats = world_stats((home / "world.db").string(), spec.tenant,
-                                             pst::ReadOnlyFreeze::Frozen);
-        spec.holders = stats.holders;
-        spec.statements = stats.statements;
-        spec.last_write_at = stats.last_write_at;
-        spec.has_stats = true;
+        // 统计缓存在写好的库上算（裁定 R22 M6）：与关闭时 update_stats 写的同一组值，同样不持锁。登记之前的新世界目录
+        // 只有这次操作知道（裁定 R36）：冻结打开，不在旁边留旁车。尽力而为（裁定 R38，与 Python _write_stats_cache
+        // 一致）：算不出时照常登记，统计列取默认值（0 / 空串）、stats_at 留空，下次关闭或刷新再写。
+        try {
+            if (spec.stats_for_test) { spec.stats_for_test(); }
+            const WorldStats stats = world_stats((home / "world.db").string(), spec.tenant,
+                                                 pst::ReadOnlyFreeze::Frozen);
+            spec.holders = stats.holders;
+            spec.statements = stats.statements;
+            spec.last_write_at = stats.last_write_at;
+            spec.has_stats = true;
+        } catch (const std::exception&) {
+            spec.holders = 0;
+            spec.statements = 0;
+            spec.last_write_at.clear();
+            spec.has_stats = false;
+        }
         const std::scoped_lock lock(impl_->mutex);
         // 第 1 步之后名字可能被别的调用抢先登记（dir_id 不会撞：目录已经在，reserve_home 跳过它）。
         if (impl_->find(spec.name)) {

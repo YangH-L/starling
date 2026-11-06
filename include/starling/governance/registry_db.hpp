@@ -121,7 +121,8 @@ public:
     //   1. 持锁：spec.name 不合规则 invalid_world_name、已被占用 world_exists；与 create 同一套布局选
     //      dir_id，建 worlds/<dir_id>/ 与 snapshots/。
     //   2. 不持锁：populate(worlds/<dir_id>/world.db)，它负责把库写到这个路径上；随后在写好的库上算统计缓存
-    //      （world_stats 的 holders、statements、last_write_at，裁定 R22 M6）。
+    //      （world_stats 的 holders、statements、last_write_at，裁定 R22 M6）。算统计失败不让登记失败（裁定 R38）：
+    //      统计列取默认值、stats_at 留空。
     //   3. 持锁：登记（tenant、label、labels、settings_json、flags 照 spec 原样写入，统计缓存写第 2 步算出的值、
     //      stats_at = spec.now_iso；seed 蕴含 read_only，
     //      read_only 时设置强制关后台）。第 1、2 步之间名字被别的调用抢先登记 → world_exists。spec.provider_endpoints

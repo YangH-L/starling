@@ -802,4 +802,22 @@ TEST(WorldFork, RegisteredStatsMatchTheSource) {
     EXPECT_EQ(fresh.stats_at, "");
 }
 
+// 裁定 R38（N3）：登记时算统计缓存失败不让分叉失败。照常登记，统计列是默认值（0 / 空串）、stats_at 留空，与
+// Python _write_stats_cache 的尽力而为一致；新世界照常可用（摘要等于来源）。
+TEST(WorldFork, StatsFailureAtRegistrationDoesNotFailTheFork) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    const WorldRecord src = world_with_statements(reg, "deploy-1", 3);
+    ForkOptions opts = fork_opts();
+    opts.stats_for_test = [] { throw std::runtime_error("injected stats failure"); };
+    const ForkResult forked = fork_world(reg, "deploy-1", "rollout-1", opts);
+    const WorldRecord got = reg.get("rollout-1");
+    EXPECT_EQ(got.statements, 0);
+    EXPECT_EQ(got.holders, 0);
+    EXPECT_EQ(got.last_write_at, "");
+    EXPECT_EQ(got.stats_at, "");
+    EXPECT_EQ(forked.digest, digest_of(src.db_path, src.tenant));
+    EXPECT_EQ(world_stats(got.db_path, got.tenant).statements, 3);   // 库本身完好
+}
+
 }  // namespace starling::governance
