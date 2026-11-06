@@ -64,7 +64,7 @@ EventRow read_event(persistence::Connection& conn, std::string_view tenant,
 // (设计源 §4.3 的认领规则:旧库都是一库一 holder,第一个碰到它的 holder 就是它的主人)。
 // 必须在调用方的写事务里调:认领与随后的状态机判断同进同退——状态机抛 EventConflict
 // 时事务回滚,认领也一并撤销,被拒绝的调用不在库里留下任何改动。
-// holder 本身是 '' 时第一步就读到了那行,不会走到认领。
+// 两个调用方都先经 require_holder 拒绝了空 holder;下面的 holder.empty() 只是防御。
 EventRow read_or_claim_event(persistence::Connection& conn, std::string_view tenant,
                              std::string_view holder, std::string_view key) {
     EventRow row = read_event(conn, tenant, holder, key);
@@ -165,6 +165,50 @@ std::vector<std::string> statements_for_engram(persistence::Connection& conn,
     return ids;
 }
 
+// holder 为空一律拒绝(裁定 R15),在任何 DB 读写之前。'' 是迁移 0039 给回填不出主人的
+// 旧行留的标记:拿 '' 当 holder,read_or_claim_event 第一步就读到无主旧行,把它当成自己
+// 的行去重试或放弃,认领规则形同虚设。与 remember_holders 对空 holder 的拒绝同一口径
+// (那里逐个回 holder_identity_failure,这里是单个调用,直接抛)。
+void require_holder(std::string_view holder, const char* caller) {
+    if (holder.empty()) {
+        throw std::invalid_argument(std::string(caller) + ": holder must be nonempty");
+    }
+}
+
+// 本租户里记着这个 key 的 holder,按 holder_id 升序。abandon_event 在 (holder, key) 与
+// ('', key) 都找不到时用它写消息:key 在别的 holder 名下,多半是调用方用错了句柄。
+std::vector<std::string> holders_owning_key(persistence::Connection& conn,
+                                            std::string_view tenant, std::string_view key) {
+    persistence::Stmt stmt(conn.raw(),
+                           "SELECT holder_id FROM events WHERE tenant_id=?1 AND key=?2 "
+                           "ORDER BY holder_id");
+    stmt.bind(tenant, key);
+    std::vector<std::string> owners;
+    while (stmt.step_row()) {
+        owners.push_back(column_string(stmt.raw(), 0));
+    }
+    return owners;
+}
+
+// abandon_event 找不到行时的消息。key 在别的 holder 名下就点名它们(裁定 R14):rise 的
+// 世界级短连接以 agent "world" 放弃事件,只说 "no such key" 会让人以为 key 拼错了。
+std::string missing_key_message(persistence::Connection& conn, std::string_view tenant,
+                                std::string_view holder, std::string_view key) {
+    const auto owners = holders_owning_key(conn, tenant, key);
+    if (owners.empty()) {
+        return "abandon_event: no such key (key=" + std::string(key) + ")";
+    }
+    std::string names;
+    for (const auto& owner : owners) {
+        if (!names.empty()) {
+            names += ", ";
+        }
+        names += owner;
+    }
+    return "abandon_event: key '" + std::string(key) + "' is recorded under holder(s) " +
+           names + ", not '" + std::string(holder) + "'";
+}
+
 // 第 3 段收尾的 UPDATE 只许改 state='pending' 的行,改完必须查受影响行数。零行只有
 // 两种成因,都发生在第 2 段(抽取走网络,事务外):abandon_event 把这行改成了终态
 // 'abandoned',或 clear_tenant 把这行删了。两种都不能静默收尾——
@@ -223,6 +267,7 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
                                std::string_view text,
                                std::string_view epoch_iso,
                                const extractor::ValidationPolicy& policy) {
+    require_holder(base.holder_id, "remember_event");   // 零 DB 读写
     governance::require_write_admission(adapter);   // 门前抛 = 零 DB 写
     auto& conn = adapter.connection();
     const std::string text_sha = crypto::sha256_hex(text);
@@ -396,6 +441,7 @@ void abandon_event(persistence::SqliteAdapter& adapter,
                    std::string_view tenant,
                    std::string_view holder,
                    std::string_view key) {
+    require_holder(holder, "abandon_event");        // 零 DB 读写
     governance::require_write_admission(adapter);   // 门前抛 = 零 DB 写
     auto& conn = adapter.connection();
 
@@ -405,7 +451,8 @@ void abandon_event(persistence::SqliteAdapter& adapter,
     persistence::TransactionGuard txn(conn);
     const EventRow row = read_or_claim_event(conn, tenant, holder, key);
     if (!row.found) {
-        throw std::out_of_range("abandon_event: no such key (key=" + std::string(key) + ")");
+        // 仍是 out_of_range(绑定译成 KeyError);key 在别的 holder 名下时消息点名它们。
+        throw std::out_of_range(missing_key_message(conn, tenant, holder, key));
     }
     if (row.state == "committed") {
         throw EventConflict(

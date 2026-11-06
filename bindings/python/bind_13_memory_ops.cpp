@@ -777,7 +777,8 @@ void bind_13_memory_ops(pybind11::module_& m) {
     // 放弃一个 key(events 表,迁移 0038):一个短本地事务,无网络;C++ 调用期间释放 GIL。
     // committed → starling.EventConflict(上面已注册);未知 key → C++ 抛
     // std::out_of_range。pybind11 对 out_of_range 的默认译法是 IndexError,不是
-    // KeyError,所以这里显式改译:调用方拼错 key 该得到 KeyError。
+    // KeyError,所以这里显式改译:调用方拼错 key 该得到 KeyError。空 holder → C++ 抛
+    // std::invalid_argument,照 pybind11 默认译法成 ValueError,不在这里改译。
     m.def("memory_abandon_event",
           [](starling::persistence::SqliteAdapter& adapter, const std::string& tenant,
              const std::string& holder, const std::string& key) {

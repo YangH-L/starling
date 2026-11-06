@@ -312,3 +312,42 @@ def test_pending_events_lists_every_holder_with_its_holder(tmp_path):
         assert all(p.key == "k#0" for p in pend)
     finally:
         a.close()
+
+
+def test_abandon_from_another_holder_raises_keyerror_naming_the_owner(tmp_path):
+    # rise 的世界级短连接以 agent "world" 打开;事件记在 A 名下。放弃要在 A 的句柄上做,
+    # 从 "world" 放弃抛 KeyError,消息点名主人,行不动。
+    from starling import runtime as rt_mod
+    runtime = rt_mod._build_local_store_sqlite_runtime(tmp_path / "o.db")
+    runtime.start()
+    llm = _failing_llm()
+    owner = starling.Memory(runtime, agent="A", tenant_id="default", llm=llm)
+    world = starling.Memory(runtime, agent="world", tenant_id="default", llm=llm)
+    try:
+        owner.remember_event("ep1#3@A", "bob:hi", interlocutor="bob")
+        with pytest.raises(KeyError) as err:
+            world.abandon_event("ep1#3@A")
+        assert "recorded under holder(s) A, not 'world'" in str(err.value)
+        pending = [(evt.key, evt.holder) for evt in world.pending_events()]
+        assert pending == [("ep1#3@A", "A")]
+        owner.abandon_event("ep1#3@A")                   # 主人的句柄上放弃照常
+        assert world.pending_events() == []
+    finally:
+        owner.close()
+
+
+def test_empty_holder_is_rejected_with_valueerror_before_any_write(tmp_path):
+    # '' 是 0039 无主旧行的标记,不能当 holder 用(裁定 R15):C++ 抛 invalid_argument,
+    # pybind 译成 ValueError,库里不留行。
+    mem = starling.Memory.open(str(tmp_path / "m.db"), agent="",
+                               llm=starling.make_stub_llm(default_response=CANNED_JSON))
+    try:
+        with pytest.raises(ValueError):
+            mem.remember_event(KEY, "bob:hi", interlocutor="bob")
+        with pytest.raises(ValueError):
+            mem.abandon_event(KEY)
+        assert mem.next_seq() == 0
+        assert mem.pending_events() == []
+    finally:
+        mem.close()
+    assert _count(tmp_path, "SELECT COUNT(*) FROM events") == 0

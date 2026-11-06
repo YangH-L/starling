@@ -1,7 +1,7 @@
 // test_memory_events.cpp — events 表(迁移 0038,0039 起按 holder 区分)。读侧:next_seq 与
 // pending_events,直接插行、不经写侧。写侧:remember_event 的四条主路径(新 key、同文本
 // 已提交、异文本冲突、补齐不抽取),LLM 用 FakeLLMAdapter,零网络。末尾是 0039 的回填、
-// 旧行认领与同 key 两个 holder 的用例。
+// 旧行认领、同 key 两个 holder、放弃时点名主人与空 holder 拒绝的用例。
 
 #include "starling/memory/memory_events.hpp"
 
@@ -13,6 +13,7 @@
 #include "starling/persistence/stmt.hpp"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -980,6 +981,159 @@ TEST(MemoryEventsHolder, LegacyPrefixPendingRowCompletesWithoutReextract) {
     EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM engrams"), 1);   // 没另建带 holder 的 engram
     EXPECT_EQ(text_query(conn, "SELECT state FROM events WHERE holder_id='H' AND key='ep1#3'"),
               "committed");
+}
+
+// ── 裁定 R14:放弃别的 holder 的 key 时,消息点名主人 ──
+
+namespace {
+
+// 抛出的 std::out_of_range 的消息;没抛则返回空串(调用方随后断言非空)。
+template <typename Fn>
+std::string out_of_range_message(Fn&& call) {
+    try {
+        call();
+    } catch (const std::out_of_range& err) {
+        return err.what();
+    }
+    return {};
+}
+
+}  // namespace
+
+TEST(MemoryEventsHolder, AbandonEventNamesOwningHoldersWhenKeyIsNotThisHolders) {
+    // rise 的世界级短连接用 agent "world" 放弃事件。key 记在 pa、pb 名下,(world, K) 与
+    // ('', K) 都没有:仍是 out_of_range(绑定译成 KeyError),但消息要点名主人,按 holder_id
+    // 升序;别的租户的同名行不算。行一条都不动。
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    insert_event(conn, "default", "ep1#3", 0, "pending", "bob", "", "pb");
+    insert_event(conn, "default", "ep1#3", 1, "pending", "bob", "", "pa");
+    insert_event(conn, "other", "ep1#3", 0, "pending", "bob", "", "pz");
+
+    const auto msg = out_of_range_message(
+        [&] { abandon_event(*adapter, "default", "world", "ep1#3"); });
+    EXPECT_EQ(msg, "abandon_event: key 'ep1#3' is recorded under holder(s) pa, pb, not 'world'");
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events WHERE tenant_id='default' AND "
+                              "state='pending'"),
+              2);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events"), 3);
+
+    // 本租户谁都没有这个 key:保留原来的 "no such key"。
+    const auto missing = out_of_range_message(
+        [&] { abandon_event(*adapter, "default", "world", "ep1#4"); });
+    EXPECT_EQ(missing, "abandon_event: no such key (key=ep1#4)");
+}
+
+// ── 裁定 R15:holder 为空一律拒绝,'' 只留给无主旧行 ──
+
+TEST(MemoryEventsHolder, RememberEventRejectsEmptyHolderWithoutWriting) {
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    CountingLLMAdapter llm(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+
+    // 新 key:不插 pending 行、不分配 seq、不抽取。
+    EXPECT_THROW(remember_event(*adapter, llm, holder_params(""), RememberPrompts{}, "ep1#3",
+                                "bob:hi", kEpoch),
+                 std::invalid_argument);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events"), 0);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM engrams"), 0);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM statements"), 0);
+
+    // 有 ('', K) 的无主旧行:空 holder 不许把它当成自己的行去重试并收成 committed。
+    insert_unclaimed_event(conn, "ep1#4", "bob:hi", 0, "pending");
+    EXPECT_THROW(remember_event(*adapter, llm, holder_params(""), RememberPrompts{}, "ep1#4",
+                                "bob:hi", kEpoch),
+                 std::invalid_argument);
+    EXPECT_EQ(event_state(conn, "ep1#4"), "pending");
+    EXPECT_EQ(holder_of(conn, "ep1#4"), "");
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events"), 1);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM engrams"), 0);
+    EXPECT_EQ(llm.calls(), 0);
+}
+
+TEST(MemoryEventsHolder, AbandonEventRejectsEmptyHolderWithoutWriting) {
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    insert_unclaimed_event(conn, "ep1#3", "bob:hi", 0, "pending");
+
+    // 不是 out_of_range(那是「key 不存在」),也不许把无主行改成 abandoned。
+    EXPECT_THROW(abandon_event(*adapter, "default", "", "ep1#3"), std::invalid_argument);
+    EXPECT_EQ(event_state(conn, "ep1#3"), "pending");
+    EXPECT_EQ(holder_of(conn, "ep1#3"), "");
+    EXPECT_THROW(abandon_event(*adapter, "default", "", "ep1#9"), std::invalid_argument);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events"), 1);
+}
+
+// ── 复核 M2:旧库已提交行的重入,以及无主行上的冲突回滚认领 ──
+
+TEST(MemoryEvents0039, BackfilledCommittedRowReentryIsIdempotentWithoutExtraction) {
+    // 0038 时代 alice 写的一条已提交事件:语句挂在不带 holder 的旧来源身份的 engram 上。
+    // 0039 按语句把行回填给 alice;alice 同 key 同文本重入,原样拿回存的结果,不抽取。
+    auto adapter = make_adapter_at_0038();
+    auto& conn = adapter->connection();
+    extractor::FakeLLMAdapter llm;
+    llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+    const std::string text = "bob:hi";
+    auto legacy_params = holder_params("alice");      // source_prefix "mem-",不带 holder
+    const std::string payload = "[ep1#3] " + text;
+    legacy_params.payload.assign(payload.begin(), payload.end());
+    legacy_params.created_at_iso8601 = kEpoch;
+    const auto landed = remember_all(*adapter, llm, legacy_params, RememberPrompts{});
+    ASSERT_EQ(landed.outcome, "accepted");
+    ASSERT_FALSE(landed.statement_ids.empty());
+    {
+        persistence::Stmt ins(conn.raw(),
+            "INSERT INTO events(tenant_id,key,text,interlocutor,text_sha256,engram_ref,"
+            "statement_ids_json,seq,state) VALUES('default',?1,?2,'bob',?3,?4,?5,0,'committed')");
+        ins.bind("ep1#3", text, crypto::sha256_hex(text), landed.engram_ref,
+                 nlohmann::json(landed.statement_ids).dump());
+        ins.step_done();
+    }
+
+    persistence::MigrationRunner(conn.raw()).migrate_to_latest();
+    ASSERT_EQ(holder_of(conn, "ep1#3"), "alice");
+    const int before = row_count(conn, "SELECT COUNT(*) FROM statements");
+
+    CountingLLMAdapter counting(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+    const auto again = remember_event(*adapter, counting, holder_params("alice"),
+                                      RememberPrompts{}, "ep1#3", text, kEpoch);
+    EXPECT_EQ(again.outcome, "idempotent");
+    EXPECT_EQ(again.statement_ids, landed.statement_ids);
+    EXPECT_EQ(again.engram_ref, landed.engram_ref);
+    EXPECT_EQ(counting.calls(), 0);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM statements"), before);
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events"), 1);
+    EXPECT_EQ(next_seq(conn, "default"), 1);
+}
+
+TEST(MemoryEvents0039, ConflictOnUnclaimedPendingRowRollsBackTheClaim) {
+    // ('', K) 的 pending 行:alice 认领后状态机抛 EventConflict,短事务回滚,认领一并撤销,
+    // 行仍无主——换文本、换说话对象两种冲突都如此。两次都不抽取、不另插行、不分配 seq。
+    auto adapter = make_adapter();
+    auto& conn = adapter->connection();
+    insert_unclaimed_event(conn, "ep1#3", "bob:hi", 0, "pending");   // interlocutor 'bob'
+    CountingLLMAdapter llm(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+
+    const auto text_msg = conflict_message([&] {
+        remember_event(*adapter, llm, holder_params("alice"), RememberPrompts{}, "ep1#3",
+                       "bob:bye", kEpoch);
+    });
+    EXPECT_NE(text_msg.find("different text"), std::string::npos) << text_msg;
+    EXPECT_EQ(holder_of(conn, "ep1#3"), "");
+
+    auto carol_params = holder_params("alice");
+    carol_params.interlocutor = "carol";
+    const auto party_msg = conflict_message([&] {
+        remember_event(*adapter, llm, carol_params, RememberPrompts{}, "ep1#3", "bob:hi",
+                       kEpoch);
+    });
+    EXPECT_NE(party_msg.find("different interlocutor"), std::string::npos) << party_msg;
+    EXPECT_EQ(holder_of(conn, "ep1#3"), "");
+
+    EXPECT_EQ(event_state(conn, "ep1#3"), "pending");
+    EXPECT_EQ(row_count(conn, "SELECT COUNT(*) FROM events"), 1);
+    EXPECT_EQ(next_seq(conn, "default"), 1);
+    EXPECT_EQ(llm.calls(), 0);
 }
 
 }  // namespace starling::memoryops

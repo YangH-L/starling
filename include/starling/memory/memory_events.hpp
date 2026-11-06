@@ -91,6 +91,8 @@ struct PendingEventRow {
 //
 // base 提供 tenant_id / holder_id / interlocutor / adapter_name / source_prefix;
 // base 的 payload 与 created_at_iso8601 被忽略(由 key+text 与 epoch+seq 推出)。
+// base.holder_id 为空 → 抛 std::invalid_argument(pybind 译成 ValueError),在任何 DB 读写
+// 之前:'' 是 0039 无主旧行的标记,不能当 holder 用(裁定 R15,与 remember_holders 一致)。
 // 重试 pending 行时用行里原来的 seq、text 与 interlocutor,时钟不漂移,也不另分配序号。
 // 走 SqliteAdapter(而非裸 Connection)以便经过写准入门。
 RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
@@ -110,9 +112,13 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
 //   pending   → UPDATE state='abandoned'(failure_category 原样留着,供事后查原因)
 //   abandoned → 不动,返回(幂等)
 //   committed → 抛 EventConflict:语句已经落库,放弃改不掉它,不能让收据说谎
-//   无此行    → 抛 std::out_of_range:未知 key 多半是调用方拼错了,不静默。
+//   无此行    → 抛 std::out_of_range:未知 key 多半是调用方拼错了,不静默。key 在本租户
+//               别的 holder 名下时,消息点名这些 holder(按 holder_id 升序,裁定 R14),
+//               例如 "abandon_event: key 'K' is recorded under holder(s) pa, pb, not 'world'";
+//               谁都没有这个 key 才是 "no such key"。
 //               std::out_of_range 不继承 EventConflict;pybind11 默认把它译成
 //               IndexError,绑定层在转发时改译成 KeyError(见 memory_abandon_event)。
+//   holder 为空 → 抛 std::invalid_argument(ValueError),在任何 DB 读写之前(裁定 R15)。
 //
 // 只改事件行,不碰 statements 与 engrams。注意:pending 行并不保证没有语句——
 // remember_event 的第 2 段(抽取与入库)跑完、第 3 段写收据前崩溃时,语句与 engram 已经

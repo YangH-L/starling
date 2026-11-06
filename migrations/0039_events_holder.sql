@@ -11,6 +11,12 @@
 -- parse_statement_ids 同一口径,迁移不因一行坏数据失败。CASE 按顺序短路求值,
 -- json_type 不会碰到非法 JSON。'' 行由第一个碰到它的 holder 认领(见
 -- memory_events.cpp 的 read_or_claim_event)。
+--
+-- 已知残留(裁定 R16,与裁定 R9 的残留并列):回填取的是第一条查得到的语句的 holder。
+-- 写入时开着 ValidationPolicy.attribute_first_order_mental_to_holder 的话,一阶欲望类
+-- 语句记在欲望的主体(subject)名下,不在写入者名下;这样一条语句排在数组第一位时,
+-- 行会被回填给主体,而不是写入者。这个策略默认关闭,没有哪份配置打开它,所以只有手动
+-- 开过它写下的旧库才会碰到。
 
 CREATE TABLE events_new (
     tenant_id          TEXT NOT NULL,
