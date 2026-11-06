@@ -22,8 +22,19 @@ public:
     // path is a real file.
     static Connection open(const std::filesystem::path& db_path);
 
+    // 只读打开一个已有的库(spec §6.3):SQLITE_OPEN_READONLY + file:<path>?mode=ro,
+    // 不设 journal_mode,不建目录,也不建库文件(不存在时抛 SqliteError)。只设
+    // busy_timeout=5000。
+    //
+    // 库头是 WAL 模式、旁边却没有 -wal 和 -shm 时(写连接已正常关闭),普通 mode=ro
+    // 连接会新建这两个文件,所以这种库改用 immutable=1 打开:WAL 里没有内容,主文件
+    // 就是最近一次提交。immutable 连接不加锁,也看不到之后的写入,因此这条连接开着
+    // 期间不能有写连接打开这个库。其余情况(rollback 日志模式的库,或 -wal / -shm
+    // 已经在,通常是写连接开着)走普通 mode=ro,读到写连接最近一次提交。
+    static Connection open_read_only(const std::filesystem::path& db_path);
+
     // nullptr once close() has run.
-    sqlite3* raw() noexcept { return handle_.get(); }
+    sqlite3* raw() const noexcept { return handle_.get(); }
 
     // Releases the sqlite handle. Idempotent. After close(), raw() is nullptr,
     // exec() throws SqliteError, and the transaction helpers are no-ops. The

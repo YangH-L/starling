@@ -14,7 +14,30 @@ std::unique_ptr<SqliteAdapter> SqliteAdapter::open(
     // unique_ptr<...>(new SqliteAdapter(...)) because the ctor is private —
     // std::make_unique can't reach a private ctor without a friend declaration.
     return std::unique_ptr<SqliteAdapter>(
-        new SqliteAdapter(std::move(conn), db_path));
+        new SqliteAdapter(std::move(conn), db_path, /*read_only=*/false));
+}
+
+std::unique_ptr<SqliteAdapter> SqliteAdapter::open_read_only(
+        const std::filesystem::path& db_path) {
+    auto conn = Connection::open_read_only(db_path);
+    return std::unique_ptr<SqliteAdapter>(
+        new SqliteAdapter(std::move(conn), db_path, /*read_only=*/true));
+}
+
+int SqliteAdapter::schema_version() const {
+    if (!conn_.is_open()) {
+        throw std::logic_error("adapter closed");
+    }
+    Stmt table(conn_.raw(),
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'");
+    if (!table.step_row()) {
+        return 0;
+    }
+    Stmt query(conn_.raw(), "SELECT COALESCE(MAX(version), 0) FROM schema_migrations");
+    if (!query.step_row()) {
+        return 0;
+    }
+    return sqlite3_column_int(query.raw(), 0);
 }
 
 Connection& SqliteAdapter::connection() {
@@ -26,6 +49,10 @@ Connection& SqliteAdapter::connection() {
 
 void SqliteAdapter::close() {
     if (!conn_.is_open()) {
+        return;
+    }
+    if (read_only_) {   // 只读连接不能 checkpoint,WAL 留给写连接合并
+        conn_.close();
         return;
     }
     try {
@@ -65,7 +92,7 @@ bool SqliteAdapter::check_final_query(const std::string& sql) const {
 // composite-key invariant). Kept because TC-NEW-PREFLIGHT pins idx_statement_id_tenant.
 bool SqliteAdapter::has_index(std::string_view name) {
     // Non-const to match the persistence/bus store convention (e.g. ConsumerCheckpoint
-    // read methods): Connection::raw() is the only handle accessor and is non-const.
+    // read methods).
     Stmt stmt(connection().raw(), "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1 LIMIT 1");
     stmt.bind(name);
     return stmt.step_row();

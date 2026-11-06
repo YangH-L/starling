@@ -2,6 +2,7 @@
 #include "starling/crypto/sha256.hpp"
 #include "starling/migrations.inc"
 
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <iomanip>
@@ -37,6 +38,14 @@ std::string MigrationRunner::checksum_of(std::string_view sql) {
 }
 
 MigrationRunner::MigrationRunner(sqlite3* db) : db_(db) {}
+
+int MigrationRunner::latest_embedded_version() {
+    int latest = 0;
+    for (const auto& mig : detail::kEmbeddedMigrations) {
+        latest = std::max(latest, mig.version);
+    }
+    return latest;
+}
 
 void MigrationRunner::migrate_to_latest() {
     exec_or_throw(db_,

@@ -10,6 +10,7 @@
 #include "starling/bus/bus_event.hpp"
 #include "starling/bus/outbox_writer.hpp"
 #include "starling/persistence/connection.hpp"
+#include "starling/persistence/migration_runner.hpp"
 #include "starling/persistence/sqlite_adapter.hpp"
 
 namespace starling::bindings {
@@ -57,6 +58,17 @@ void bind_02_persistence(pybind11::module_& m) {
         .def_static("open", [](const std::string& path) {
             return starling::persistence::SqliteAdapter::open(path);
         }, py::arg("db_path"))
+        .def_static("open_read_only", [](const std::string& path) {
+            return starling::persistence::SqliteAdapter::open_read_only(path);
+        }, py::arg("db_path"), py::call_guard<py::gil_scoped_release>(),
+           "Open an existing database read-only (mode=ro): no migrations, no "
+           "journal_mode change, no directories. write_admitted() is always False.")
+        .def_property_readonly("read_only",
+             &starling::persistence::SqliteAdapter::read_only)
+        .def("schema_version",
+             &starling::persistence::SqliteAdapter::schema_version,
+             py::call_guard<py::gil_scoped_release>(),
+             "MAX(version) of schema_migrations; 0 when the table does not exist.")
         .def("declare_capability",
              &starling::persistence::SqliteAdapter::declare_capability)
         .def("has_index",
@@ -99,6 +111,10 @@ void bind_02_persistence(pybind11::module_& m) {
         .def("connection",
              &starling::persistence::SqliteAdapter::connection,
              py::return_value_policy::reference_internal);
+
+    m.def("latest_schema_version",
+          &starling::persistence::MigrationRunner::latest_embedded_version,
+          "Highest migration version embedded in this build.");
 }
 
 }  // namespace starling::bindings
