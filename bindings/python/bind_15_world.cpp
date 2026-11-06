@@ -187,6 +187,8 @@ void bind_15_world(pybind11::module_& m) {
     world_store_error.call_once_and_store_result([&m] {
         return py::object(py::exception<gov::WorldStoreError>(m, "WorldStoreError", PyExc_RuntimeError));
     });
+    // 签名由 pybind11 定死（ExceptionTranslator = void (*)(std::exception_ptr)），不能改成 const 引用。
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
     py::register_exception_translator([](std::exception_ptr thrown) {
         try {
             if (thrown) { std::rethrow_exception(thrown); }
