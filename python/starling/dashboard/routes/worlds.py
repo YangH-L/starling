@@ -172,7 +172,8 @@ def _require_client_settings(settings) -> None:
 
 
 def _auto_snapshot_of(rec: dict) -> dict:
-    auto = _core.world_effective_settings(rec["settings"])["background"]["auto_snapshot"]
+    # 生效的设置（按看板的打开方式，C++ 判，裁定 R33）：只读打开的世界不拍自动快照，显示为全关。
+    auto = _core.world_effective_settings(rec["settings"], record=rec)["background"]["auto_snapshot"]
     return {"on_session": auto["on_session"], "interval_hours": auto["interval_hours"]}
 
 
@@ -279,7 +280,8 @@ def _list_worlds(pool, labels: dict, offset: int, limit: int) -> dict:
 
 
 def _world_detail(pool, providers: dict, name: str) -> dict:
-    """详情：列表的一行，加上库的完整统计（只读打开库，持不建引擎的租约）与实际生效的设置（不含密钥）。
+    """详情：列表的一行，加上库的完整统计（只读打开库，持不建引擎的租约）与实际生效的设置（不含密钥；按看板的打开
+    方式算，只读打开的世界后台全关，裁定 R33）。
     库存在但读不出时统计置 0 并带 stats_error: true，详情照常给出（坏世界还能从界面删掉）。schema_behind 对
     关着的世界也给：持不建引擎的租约短暂只读打开库读一次（裁定 R17），读不出时 null。"""
     rec = pool.record(name)
@@ -293,7 +295,7 @@ def _world_detail(pool, providers: dict, name: str) -> dict:
         row["stats_error"] = True
     row.update(db_bytes=stats["db_bytes"], live_bytes=stats["live_bytes"],
                engrams=stats["engrams"],
-               settings=_public_settings(_core.world_effective_settings(rec["settings"]),
+               settings=_public_settings(_core.world_effective_settings(rec["settings"], record=rec),
                                          providers))
     return row
 

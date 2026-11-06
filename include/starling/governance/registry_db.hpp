@@ -51,6 +51,11 @@ enum class OpenMode : std::uint8_t { ReadWrite, ReadOnly };
 // 只有 read_only → ReadOnly。第 4 期在这里加「被别的会话占用写入」一维。
 [[nodiscard]] OpenMode decide_open_mode(const WorldRecord& rec, bool for_client_write);
 
+// 一个世界看板打开时实际生效的设置（裁定 R33，R22 M4）：settings_from_json(rec.settings_json) 补齐默认值；
+// decide_open_mode(rec, false) 为 ReadOnly（只读世界、种子、可回收世界）时 background 全关（与 merge_settings 的只读
+// 同一组值），因为这样打开的世界不起 tick、摄入，也不拍自动快照。存着的设置不变。take_auto_snapshot 与看板详情都用它。
+[[nodiscard]] WorldSettings effective_world_settings(const WorldRecord& rec);
+
 class RegistryDb {
 public:
     // 打开或创建 <data_dir>/registry.db（WAL）。不存在时建表，并登记默认世界：

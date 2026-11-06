@@ -354,6 +354,11 @@ OpenMode decide_open_mode(const WorldRecord& rec, bool for_client_write) {
     return OpenMode::ReadWrite;
 }
 
+WorldSettings effective_world_settings(const WorldRecord& rec) {
+    const bool read_only_open = decide_open_mode(rec, false) == OpenMode::ReadOnly;
+    return merge_settings(settings_from_json(rec.settings_json), "{}", read_only_open);
+}
+
 RegistryDb::RegistryDb(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 RegistryDb::RegistryDb(RegistryDb&&) noexcept = default;
 RegistryDb& RegistryDb::operator=(RegistryDb&&) noexcept = default;

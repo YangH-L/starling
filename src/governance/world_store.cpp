@@ -1775,10 +1775,10 @@ AutoSnapshotResult take_auto_snapshot(RegistryDb& reg, const std::string& world,
     // 向量在库文件之外的后端拍不出完整的世界：直接不拍，不算失败（用户裁定 2026-10-28）。
     if (base.vector_backend != "sqlite") { return skipped_because("unsupported_backend"); }
 
-    // 配置在世界设置的 background.auto_snapshot 里（裁定 R10）。范围已由 settings_from_json 与
-    // validate_world 查过（裁定 R11），这里再查一次是纵深防御。
-    const AutoSnapshotConfig config =
-        settings_from_json(entry.settings_json).background.auto_snapshot;
+    // 配置在世界设置的 background.auto_snapshot 里（裁定 R10），取生效的设置（裁定 R33）：看板只读打开的世界（只读、
+    // 种子、可回收）后台全关，于是按 disabled 跳过。范围已由 settings_from_json 与 validate_world 查过（裁定 R11），
+    // 这里再查一次是纵深防御。
+    const AutoSnapshotConfig config = effective_world_settings(entry).background.auto_snapshot;
     require_valid_auto_snapshot(config);
     SnapshotOptions opts = base;
     opts.kind = "auto";

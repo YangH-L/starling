@@ -665,4 +665,41 @@ TEST(WorldRollback, ReplacedMarkerSaysWhetherTheLibraryWasSwapped) {
     }
 }
 
+// 裁定 R33（R22 M4）：可回收世界看板只读打开，与只读世界一样不拍自动快照。设置里的后台（继承自来源）原样存着，
+// 生效的设置（effective_world_settings，按 decide_open_mode）后台全关，take_auto_snapshot 按它跳过（disabled）。
+TEST(WorldAutoSnapshot, ReclaimableWorldIsSkippedLikeReadOnly) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    const WorldRecord src = world_with_statements(reg, "deploy-1", 2);
+    set_auto_snapshot(reg, "deploy-1", AutoSnapshotConfig{.on_session = true, .interval_hours = 1});
+    ForkOptions opts = fork_opts();
+    opts.reclaimable = true;
+    (void)fork_world(reg, "deploy-1", "rollout-1", opts);
+    const WorldRecord rec = reg.get("rollout-1");
+    ASSERT_EQ(settings_from_json(rec.settings_json).background.auto_snapshot,
+              (AutoSnapshotConfig{.on_session = true, .interval_hours = 1}));   // 存着的设置没被改
+    const auto background = effective_world_settings(rec).background;
+    EXPECT_EQ(background.tick_interval_s, 0.0);
+    EXPECT_FALSE(background.ingest);
+    EXPECT_EQ(background.auto_snapshot, (AutoSnapshotConfig{.on_session = false, .interval_hours = 0}));
+
+    const auto interval = take_auto_snapshot(reg, "rollout-1",
+                                             AutoTrigger{"interval", "", "2030-01-01T00:00:00Z"}, {});
+    const auto session = take_auto_snapshot(reg, "rollout-1",
+                                            AutoTrigger{"session", "s-new", "2030-01-01T00:00:00Z"}, {});
+    for (const auto& result : {interval, session}) {
+        EXPECT_FALSE(result.taken.has_value());
+        EXPECT_EQ(result.skipped, "disabled");
+        EXPECT_TRUE(result.refused.empty());
+    }
+    EXPECT_TRUE(reg.snapshots("rollout-1").empty());
+    // 对照：可写的来源照常拍。
+    EXPECT_TRUE(take_auto_snapshot(reg, "deploy-1",
+                                   AutoTrigger{"interval", "", "2030-01-01T00:00:00Z"}, {})
+                    .taken.has_value());
+    EXPECT_EQ(effective_world_settings(reg.get("deploy-1")).background.auto_snapshot,
+              (AutoSnapshotConfig{.on_session = true, .interval_hours = 1}));
+    (void)src;
+}
+
 }  // namespace starling::governance

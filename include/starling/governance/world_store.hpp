@@ -373,6 +373,8 @@ struct AutoSnapshotResult {
 // base 的 free_space / before_vacuum / note 照传，kind / reason / session_id / now_iso 由这里决定。
 // take_snapshot 的磁盘守卫与保留策略照常生效，失败照常抛出。第 5 步的修剪若删掉了旧条目，这些
 // 删除（文件与注册项）在随后拍快照抛错时也已经落盘。
+// 配置取 effective_world_settings(世界记录).background.auto_snapshot（裁定 R33）：只读世界、种子、可回收世界恒为
+// {false, 0}，两种触发都返回 skipped="disabled"。
 AutoSnapshotResult take_auto_snapshot(RegistryDb& reg, const std::string& world,
                                       const AutoTrigger& trigger,
                                       const SnapshotOptions& base = SnapshotOptions{});

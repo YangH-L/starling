@@ -235,7 +235,16 @@ def test_reclaimable_world_opens_read_only_and_bytes_unchanged(client):
     _source_with_content(client)
     _fork(client, "src", "rollout-1", reclaimable=True)
     rec = pool.record("rollout-1")
-    assert rec["settings"]["background"]["ingest"]                 # 设置里后台开着，只读打开照样不起
+    assert rec["settings"]["background"]["ingest"]                 # 存着的设置（继承自来源）后台开着
+    # 裁定 R33（R22 M4）：详情给的是生效的设置。可回收世界看板只读打开，后台全关（判定在 C++），列表行的
+    # auto_snapshot 同样全关。
+    detail = client.get("/api/worlds/rollout-1").json()
+    assert detail["open_mode"] == "ro"
+    assert detail["settings"]["background"] == {
+        "tick_interval_s": 0.0, "ingest": False,
+        "auto_snapshot": {"on_session": False, "interval_hours": 0}}
+    assert detail["auto_snapshot"] == {"on_session": False, "interval_hours": 0}
+    assert client.get("/api/worlds/src").json()["settings"]["background"]["ingest"] is True
     db = rec["db_path"]
     sha, files = _sha256(db), _dir_files(db)
 

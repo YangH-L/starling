@@ -385,15 +385,30 @@ void bind_15_world(pybind11::module_& m) {
 
     // 一份（可能不完整的）设置 dict → C++ 补齐默认值后的完整设置 dict（settings_from_json →
     // settings_to_json）。默认值只在 C++：引擎池建引擎前用它得到实际生效的设置。非法输入同 settings_from_json。
-    m.def("world_effective_settings", [](const py::dict& settings) {
-        const auto text = from_py(settings);
+    // record（注册表记录 dict，只读 seed、read_only、reclaimable 三个键）给出时按看板的打开方式算（C++
+    // effective_world_settings，裁定 R33）：只读打开的世界后台全关。
+    m.def("world_effective_settings", [](const py::dict& settings, const py::object& record) {
+        gov::WorldRecord rec;
+        rec.settings_json = from_py(settings);
+        const bool by_open_mode = !record.is_none();
+        if (by_open_mode) {
+            const auto flags = py::reinterpret_borrow<py::dict>(record);
+            const auto flag = [&flags](const char* key) {
+                return flags.attr("get")(key, false).cast<bool>();
+            };
+            rec.seed = flag("seed");
+            rec.read_only = flag("read_only");
+            rec.reclaimable = flag("reclaimable");
+        }
         std::string normalized;
         {
             const py::gil_scoped_release release;
-            normalized = gov::settings_to_json(gov::settings_from_json(text));
+            normalized = gov::settings_to_json(by_open_mode
+                                                   ? gov::effective_world_settings(rec)
+                                                   : gov::settings_from_json(rec.settings_json));
         }
         return to_py(normalized);
-    }, py::arg("settings"));
+    }, py::arg("settings"), py::kw_only(), py::arg("record") = py::none());
 
     m.def("world_ingest_partition", &gov::ingest_partition, py::arg("is_default"),
           py::arg("tenant"), py::arg("dir_id"));
