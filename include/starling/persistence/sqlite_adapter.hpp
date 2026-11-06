@@ -26,6 +26,9 @@ public:
     // 绕过写门的 SQL 写由 mode=ro 连接拒绝(SqliteError)。close() 不做 checkpoint。
     static std::unique_ptr<SqliteAdapter> open_read_only(const std::filesystem::path& db_path);
     [[nodiscard]] bool read_only() const noexcept { return read_only_; }
+    // 只读连接是否以 immutable=1 打开(Connection::open_read_only):true 时看不到之后
+    // 别的连接写入的内容。可写适配器恒为 false。
+    [[nodiscard]] bool immutable() const noexcept { return conn_.immutable(); }
 
     // schema_migrations 的 MAX(version);表不存在时为 0。只读打开 schema 落后的库时
     // 小于 MigrationRunner::latest_embedded_version()。Throws std::logic_error after close().

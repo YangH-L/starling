@@ -123,6 +123,7 @@ TEST(SqliteAdapterReadOnly, OpenDoesNotMigrateOrChangeBytes) {
 
     auto reader = SqliteAdapter::open_read_only(db);
     EXPECT_TRUE(reader->read_only());
+    EXPECT_TRUE(reader->immutable());   // WAL 库头、无旁车 → immutable 分支
     EXPECT_EQ(reader->schema_version(), behind);   // 打开没有补跑迁移
     EXPECT_LT(reader->schema_version(), MigrationRunner::latest_embedded_version());
     reader->close();
@@ -170,6 +171,7 @@ TEST(SqliteAdapterReadOnly, ReadsLatestCommitWhileWriterOpen) {
     ASSERT_EQ(sidecars_before.size(), 2U);
 
     auto reader = SqliteAdapter::open_read_only(db);
+    EXPECT_FALSE(reader->immutable());   // 旁车在 → 普通 mode=ro 分支
     EXPECT_EQ(reader->schema_version(), behind);
     EXPECT_NO_THROW(reader->close());   // 只读连接不做 checkpoint
     reader.reset();
@@ -188,12 +190,46 @@ TEST(SqliteAdapterReadOnly, RollbackJournalLibraryOpensWithoutSidecars) {
     const std::string sha_before = file_sha256(copy);
 
     auto reader = SqliteAdapter::open_read_only(copy);
+    EXPECT_FALSE(reader->immutable());   // rollback 日志库头 → 普通 mode=ro 分支
     EXPECT_EQ(reader->schema_version(), MigrationRunner::latest_embedded_version());
     reader->close();
     reader.reset();
 
     EXPECT_EQ(file_sha256(copy), sha_before);
     EXPECT_TRUE(sidecars(copy).empty());
+}
+
+TEST(SqliteAdapterReadOnly, SymlinkSeesWalNextToRealFile) {
+    // SQLite 把 -wal / -shm 建在解析后的真实文件旁边:符号链接旁边没有旁车,不能据此
+    // 走 immutable、读漏 WAL 里的提交。
+    const TempDir dir;
+    const fs::path real_dir = dir.path() / "real";
+    const fs::path link_dir = dir.path() / "link";
+    fs::create_directories(real_dir);
+    fs::create_directories(link_dir);
+    const fs::path real_db = real_dir / "world.db";
+    const fs::path link_db = link_dir / "world.db";
+    auto writer = SqliteAdapter::open(real_db);
+    writer->connection().exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    drop_newest_migration_row(writer->connection());   // 这次提交只在 WAL 里
+    const int behind = max_applied_version(writer->connection());
+    ASSERT_TRUE(fs::exists(real_db.string() + "-wal"));
+    fs::create_symlink(real_db, link_db);
+    ASSERT_TRUE(sidecars(link_db).empty());
+
+    auto reader = SqliteAdapter::open_read_only(link_db);
+    EXPECT_FALSE(reader->immutable());
+    EXPECT_EQ(reader->schema_version(), behind);
+    reader->close();
+    reader.reset();
+    writer->close();
+}
+
+TEST(SqliteAdapterReadOnly, WritableAdapterIsNotImmutable) {
+    const TempDir dir;
+    auto writer = SqliteAdapter::open(dir.path() / "world.db");
+    EXPECT_FALSE(writer->read_only());
+    EXPECT_FALSE(writer->immutable());
 }
 
 TEST(SqliteAdapterReadOnly, MissingPathIsNotCreated) {

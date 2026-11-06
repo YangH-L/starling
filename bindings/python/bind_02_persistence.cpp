@@ -65,6 +65,10 @@ void bind_02_persistence(pybind11::module_& m) {
            "journal_mode change, no directories. write_admitted() is always False.")
         .def_property_readonly("read_only",
              &starling::persistence::SqliteAdapter::read_only)
+        .def_property_readonly("immutable",
+             &starling::persistence::SqliteAdapter::immutable,
+             "True when the read-only connection was opened with immutable=1 "
+             "(WAL-mode library with no -wal/-shm): it does not see later writes.")
         .def("schema_version",
              &starling::persistence::SqliteAdapter::schema_version,
              py::call_guard<py::gil_scoped_release>(),

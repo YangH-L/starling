@@ -29,6 +29,7 @@ def test_read_only_open_forwards_and_leaves_file_alone(tmp_path):
 
     reader = _core.SqliteAdapter.open_read_only(str(db))
     assert reader.read_only is True
+    assert reader.immutable is True  # WAL 库头、无旁车
     assert reader.write_admitted() is False
     assert reader.schema_version() == _core.latest_schema_version() - 1
     reader.close()
@@ -40,5 +41,6 @@ def test_read_only_open_forwards_and_leaves_file_alone(tmp_path):
 def test_writable_open_is_not_read_only(tmp_path):
     adapter = _core.SqliteAdapter.open(str(tmp_path / "rw.db"))
     assert adapter.read_only is False
+    assert adapter.immutable is False
     assert adapter.schema_version() == _core.latest_schema_version()
     adapter.close()

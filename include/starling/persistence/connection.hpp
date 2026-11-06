@@ -30,8 +30,17 @@ public:
     // 连接会新建这两个文件,所以这种库改用 immutable=1 打开:WAL 里没有内容,主文件
     // 就是最近一次提交。immutable 连接不加锁,也看不到之后的写入,因此这条连接开着
     // 期间不能有写连接打开这个库。其余情况(rollback 日志模式的库,或 -wal / -shm
-    // 已经在,通常是写连接开着)走普通 mode=ro,读到写连接最近一次提交。
+    // 已经在,通常是写连接开着)走普通 mode=ro,读到写连接最近一次提交。走了哪条
+    // 由 immutable() 报告。
+    //
+    // SQLite 把 -wal / -shm 建在解析后的真实文件旁边,所以库头与旁车都按
+    // std::filesystem::canonical(db_path) 查,URI 也用解析后的路径;解析失败时走普通
+    // mode=ro(宁可建旁车,也不读漏 WAL 里的提交)。
     static Connection open_read_only(const std::filesystem::path& db_path);
+
+    // true = 这条连接是 open_read_only 以 immutable=1 打开的(见上)。close() 之后仍报告
+    // 当初走的路径。open() 打开的连接恒为 false。
+    [[nodiscard]] bool immutable() const noexcept { return immutable_; }
 
     // nullptr once close() has run.
     [[nodiscard]] sqlite3* raw() const noexcept { return handle_.get(); }
@@ -54,8 +63,10 @@ public:
     int64_t last_insert_rowid() const noexcept;
 
 private:
-    explicit Connection(SqliteHandle h) : handle_(std::move(h)) {}
+    explicit Connection(SqliteHandle handle, bool immutable = false)
+        : handle_(std::move(handle)), immutable_(immutable) {}
     SqliteHandle handle_;
+    bool immutable_ = false;
 };
 
 class TransactionGuard {
