@@ -59,7 +59,13 @@ class WorldContext:
 
     vector_backend / vector_store_path 不从 settings 取（裁定 R26）：注册表里的设置只收 sqlite，默认世界
     「原地」沿用 config 的向量后端与路径（zvec 的默认世界也照常打开，只是拍快照会被 C++ 拒绝），其余世界
-    一律 sqlite、没有路径。"""
+    一律 sqlite、没有路径。
+
+    read_only（spec §6.3、§6.4）：C++ world_decide_open_mode 判为 "ro" 的世界（只读世界、种子、可回收世界）。
+    引擎只读打开库（不跑迁移、不改日志模式），不起后台线程，写入类方法一律 world_read_only。
+
+    frozen（裁定 R36）：C++ world_read_only_frozen 的判定，这个世界的只读连接能不能冻结（immutable=1）。只在
+    只读打开的世界上为 True；检视连接（queries）、统计、租户核对、只读引擎都把它传给 C++，Python 不自己判。"""
     name: str
     dir_id: str
     db_path: str
@@ -70,6 +76,8 @@ class WorldContext:
     is_default: bool = True
     vector_backend: str = "sqlite"
     vector_store_path: str = ""
+    read_only: bool = False
+    frozen: bool = False
 
     @classmethod
     def from_config(cls, config) -> "WorldContext":
@@ -139,6 +147,11 @@ def _tick_did_work(stats: dict) -> bool:
     """tick 这一轮有没有做事。stage_timings_ms 总在（9 项）、DEGRADED 时 stages_skipped 非空，两者都不算
     （否则每个空闲的 DEGRADED 轮都会误发心跳，3b L8）。"""
     return any(v for k, v in stats.items() if k not in ("stage_timings_ms", "stages_skipped"))
+
+
+def _world_read_only(world: str) -> Exception:
+    """只读世界上的写入（spec §6.3）：WorldStoreError("world_read_only")，路由回 409。只点名世界。"""
+    return _core.WorldStoreError(f"world_read_only: world '{world}' is opened read-only")
 
 
 # Routes run engine calls in worker threads (anyio to_thread), so the transient
@@ -329,8 +342,18 @@ class DashboardEngine:
         # 裁定 R52：每个角色的适配器建时用的密钥的指纹（_key_fingerprint）。与 _built_endpoints 同时记、同时丢。
         # 地址核对通过之后再比 provider 此刻的密钥指纹，不同（换了密钥、删了密钥、新加了密钥）就重建该角色。
         self._built_key_fps: dict[str, str | None] = {}
-        rt = _runtime._build_local_store_sqlite_runtime(Path(ctx.db_path))
+        # 只读世界（ctx.read_only，spec §6.3）：库经 open_read_only 打开，不跑迁移；schema 落后照常打开。
+        # 落后与否在打开时记一次（只读库不迁移，可写库刚迁移到最新，之后都不会变），列表与详情据此标出
+        # schema_behind，不必再碰这条连接。
+        self.read_only = bool(ctx.read_only)
+        self.schema_behind = False
+        if self.read_only:
+            # 冻结与否由调用方按记录给（WorldContext.frozen，C++ 判，裁定 R36）。
+            rt = _runtime._build_read_only_sqlite_runtime(Path(ctx.db_path), frozen=bool(ctx.frozen))
+        else:
+            rt = _runtime._build_local_store_sqlite_runtime(Path(ctx.db_path))
         try:
+            self.schema_behind = rt.adapter.schema_behind     # 判定在 C++（裁定 R31 M5）
             rt.start()
             self._rt = rt   # the live Runtime (holds the C++ RuntimeSupervisor); the
                             # host drain reaches the supervisor through begin_drain().
@@ -418,6 +441,23 @@ class DashboardEngine:
     @property
     def tenant(self) -> str:
         return self._ctx.tenant
+
+    def _require_writable(self) -> None:
+        """写入类方法的第一步：只读引擎（spec §6.3）一律 world_read_only，什么都不做。"""
+        if self.read_only:
+            raise _world_read_only(self._ctx.name)
+
+    @contextmanager
+    def _read_only_rejections(self):
+        """读方法在只读引擎上万一碰到写入（C++ 写门的 WriteGateRejected，或只读连接拒绝写入时 C++ 抛的
+        ReadOnlyWriteRejected，裁定 R33），统一报 world_read_only，不让它变成 500。按类型认，不看错误文本。可写引擎原样放行。"""
+        if not self.read_only:
+            yield
+            return
+        try:
+            yield
+        except (_core.WriteGateRejected, _core.ReadOnlyWriteRejected):
+            raise _world_read_only(self._ctx.name) from None
 
     def _provider_snapshot(self, ep: dict | None) -> dict | None:
         """裁定 R57：ep 引用的 provider 条目此刻的一份拷贝（dict(prov)）；ep 不引用 provider（客户端显式给的端点、没有
@@ -845,6 +885,9 @@ class DashboardEngine:
         with broken embeddings is worse than a clear heads-up)."""
         # 裁定 R38：在删任何向量之前核对嵌入的继承地址；改了就抛 endpoint_changed，一行不删。
         self._require_embedding_unchanged()
+        if self.read_only:
+            # 只读世界（spec §6.3）：库只读打开，向量一行不删；换上的嵌入只用于查询。
+            return "re-embed skipped: the world is opened read-only; vectors NOT cleared"
         if not self._rt.adapter.write_admitted():
             # 前台写门 follow-up(P3.c write-gate):这个 config-save 重嵌是绕过 C++ 核心的
             # 裸 sqlite 写(DELETE statement_vectors + tick_one_batch),核心门管不到 → host-side
@@ -967,6 +1010,7 @@ class DashboardEngine:
         clear_generation:ingest worker 传 claim 时的 `_clear_generation` 快照;
         与当前值不同 = 该 job 被 claim 后发生过 clear_memory,抛 _TenantCleared,
         不再写入。锁外抽取期间被清空的情况由 C++ commit 守卫兜底(source_missing)。"""
+        self._require_writable()
         now = now or datetime.now(timezone.utc)
         with self._lock:                                    # ① 短:写门 + engram
             if clear_generation is not None and clear_generation != self._clear_generation:
@@ -1013,6 +1057,7 @@ class DashboardEngine:
         的结构保证不变(remember 的写事务仍是 commit 阶段,在 generate 之后)。
 
         prepare 与 commit 必须共用同一时刻(幂等键/召回哈希含 created_at)。"""
+        self._require_writable()                            # 回合末要抽取、写入
         now = now or datetime.now(timezone.utc)
         with self._lock:                                    # ① 短:读 + prompt
             chat = self._resolve_chat(provider)
@@ -1061,7 +1106,7 @@ class DashboardEngine:
 
     def recall(self, query: str, *, perspective="first_person", k=10, mode="semantic",
                holder=None) -> list:
-        with self._lock:
+        with self._lock, self._read_only_rejections():
             self._require_embedding_unchanged()   # 语义召回要嵌入查询词
             return self._core.recall(query, perspective=perspective, k=k, mode=mode,
                                      holder=holder)
@@ -1070,7 +1115,9 @@ class DashboardEngine:
         """后台维护一轮。嵌入阶段走 embedding 端点，先核对继承来的地址（占位嵌入不核对）。核对不过
         （endpoint_changed，裁定 R54）只跳过嵌入阶段（C++ tick_all 的 skip_embed，stages_skipped 记 "embed"），
         承诺触发、grounding、回放、投影、出箱照常跑；是否被拒记在 embedding_refused（后台循环据此按状态变化记一次
-        日志）。做了事（任一计数非零）就通知一次 on_commit（与 _loop 的 did_work 同一判据）。"""
+        日志）。做了事（任一计数非零）就通知一次 on_commit（与 _loop 的 did_work 同一判据）。只读引擎
+        world_read_only（维护要写库）。"""
+        self._require_writable()
         with self._lock:
             skip_embed = not self._embedding_usable()
             stats = self._core.tick(now, skip_embed=skip_embed)
@@ -1107,6 +1154,7 @@ class DashboardEngine:
                         self._ctx.name)
 
     def forget(self, ids, *, now=None) -> dict:
+        self._require_writable()
         with self._lock:
             out = self._core.forget(ids, now=now)
         self._notify_commit()
@@ -1121,6 +1169,7 @@ class DashboardEngine:
         worker 的 claim 也在这把锁内快照代数(见 _ingest_drain_once),所以任何 job
         要么在清空前被 claim(代数不符 → 作废),要么已被这里移走,不会把清空前排队
         的旧会话重新灌回来。"""
+        self._require_writable()
         if confirm != self._ctx.tenant:
             raise ClearConfirmMismatch("confirm_mismatch")
         with self._lock:
@@ -1135,18 +1184,22 @@ class DashboardEngine:
 
     # 片 6 干预集:全经 self._lock 串行(对单写者 + 后台 tick)。
     def approve_review(self, stmt_id: str, *, now=None) -> dict:
+        self._require_writable()
         with self._lock:
             return self._core.approve_review(stmt_id, now=now)
 
     def fulfill_commitment(self, stmt_id: str, *, now=None) -> dict:
+        self._require_writable()
         with self._lock:
             return self._core.fulfill_commitment(stmt_id, now=now)
 
     def withdraw_commitment(self, stmt_id: str, *, now=None) -> dict:
+        self._require_writable()
         with self._lock:
             return self._core.withdraw_commitment(stmt_id, now=now)
 
     def run_replay(self, mode: str, *, now=None) -> dict:
+        self._require_writable()
         with self._lock:
             self._prepare_role("consolidation")             # 离线回放用 consolidation 判 gist
             if not self._rt.adapter.write_admitted():
@@ -1157,13 +1210,14 @@ class DashboardEngine:
             return self._core.run_replay(mode, now=now)
 
     def request_reconsolidation(self, stmt_id: str, *, request_id: str, now=None) -> dict:
+        self._require_writable()
         with self._lock:
             return self._core.request_reconsolidation(stmt_id, request_id=request_id, now=now)
 
     def plan_query(self, text: str, *, intent: str, perspective=None,
                    target=None, k: int = 10) -> dict:
         """P3.a1 检索规划(9 意图 + 8 标签 + 拒答);JSON-able 摘要给路由层。"""
-        with self._lock:
+        with self._lock, self._read_only_rejections():
             self._require_embedding_unchanged()   # 规划里的语义召回要嵌入查询词
             r = self._core.plan_query(text, intent=intent,
                                       perspective=perspective, target=target, k=k)
@@ -1260,9 +1314,9 @@ class DashboardEngine:
         - sample_embed_depth()/_sample_backpressure() 每轮都跑,不受 on_tick
           的 did_work 门控(它们采的是绝对状态快照,空闲/卡死轮也要采);
         - 异常记日志后继续循环(网络嵌入失败不杀线程);
-        - interval_s <= 0 或已启动时为 no-op。
+        - interval_s <= 0 或已启动时为 no-op；只读引擎（spec §6.3）同样 no-op。
         """
-        if interval_s <= 0 or self._tick_thread is not None:
+        if interval_s <= 0 or self._tick_thread is not None or self.read_only:
             return
         stop = threading.Event()
 
@@ -1571,8 +1625,8 @@ class DashboardEngine:
         result falls straight through to the normal poll_interval_s sleep —
         no busy-spin on a persistently-retryable job. daemon thread; an
         exception from one job never kills the loop (caught + logged, next
-        poll continues)."""
-        if self._ingest_thread is not None:
+        poll continues). 只读引擎（spec §6.3）不起摄入：no-op。"""
+        if self._ingest_thread is not None or self.read_only:
             return
         self._ingest_reap_stale_processing()
         stop = threading.Event()
@@ -1631,7 +1685,7 @@ class DashboardEngine:
 
     def working_set(self, interlocutor, *, goal=None, token_budget=2000, holder=None) -> dict:
         """Like Memory.render_working_set but returns a JSON-able dict (API shape)."""
-        with self._lock:
+        with self._lock, self._read_only_rejections():
             self._require_embedding_unchanged()   # relevant_memories 走语义召回
             cb = self._core.build_working_set(interlocutor, goal=goal,
                                               token_budget=token_budget, holder=holder)

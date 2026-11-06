@@ -31,6 +31,9 @@ public:
     // Returns rows from schema_migrations ordered by version.
     std::vector<AppliedMigration> applied() const;
 
+    // 本构建内嵌的最高迁移版本(migrate_to_latest 之后 schema_migrations 的 MAX(version))。
+    static int latest_embedded_version();
+
     // sha256 hex of the SQL string. Exposed for tests.
     static std::string checksum_of(std::string_view sql);
 

@@ -1,9 +1,80 @@
 #include "starling/persistence/connection.hpp"
 
+#include <array>
 #include <atomic>
+#include <fstream>
 #include <stdexcept>
+#include <system_error>
 
 namespace starling::persistence {
+
+namespace {
+
+// URI 里 %、?、# 有特殊含义,路径里出现时必须百分号编码。
+std::string uri_escape_path(const std::string& path) {
+    std::string out;
+    out.reserve(path.size());
+    for (const char chr : path) {
+        switch (chr) {
+            case '%': out += "%25"; break;
+            case '?': out += "%3f"; break;
+            case '#': out += "%23"; break;
+            default: out += chr; break;
+        }
+    }
+    return out;
+}
+
+// 库头第 19 字节是读版本:2 = WAL 模式(SQLite 据此决定是否走 WAL 读)。
+// 读不到完整的头(文件不存在、空文件)按非 WAL 处理,交给 sqlite3_open_v2 报错。
+bool header_is_wal(const std::filesystem::path& db_path) {
+    constexpr std::size_t kReadVersionOffset = 19;
+    std::array<char, kReadVersionOffset + 1> header{};
+    std::ifstream input(db_path, std::ios::binary);
+    if (!input.read(header.data(), static_cast<std::streamsize>(header.size()))) {
+        return false;
+    }
+    return header.back() == 2;   // 数组只读到读版本那一字节为止
+}
+
+// 查不清(权限等错误)时按存在处理:走普通 mode=ro,宁可建旁车也不读漏 WAL 里的提交。
+bool sidecar_present(const std::filesystem::path& db_path, const char* suffix) {
+    std::error_code err;
+    const bool found = std::filesystem::exists(db_path.string() + suffix, err);
+    return found || static_cast<bool>(err);
+}
+
+}  // namespace
+
+Connection::ReadOnlyUri Connection::read_only_uri(const std::filesystem::path& db_path,
+                                                  ReadOnlyFreeze freeze) {
+    // 旁车跟着真实文件走:符号链接旁边没有 -wal 不等于真实文件旁边没有。
+    std::error_code resolve_err;
+    const std::filesystem::path resolved = std::filesystem::canonical(db_path, resolve_err);
+    const bool frozen_wal = freeze == ReadOnlyFreeze::Frozen && !resolve_err && header_is_wal(resolved) &&
+                            !sidecar_present(resolved, "-wal") &&
+                            !sidecar_present(resolved, "-shm");
+    const std::filesystem::path& target = resolve_err ? db_path : resolved;
+    return ReadOnlyUri{.uri = "file:" + uri_escape_path(target.string()) +
+                              (frozen_wal ? "?mode=ro&immutable=1" : "?mode=ro"),
+                       .immutable = frozen_wal,};
+}
+
+Connection Connection::open_read_only(const std::filesystem::path& db_path, ReadOnlyFreeze freeze) {
+    const ReadOnlyUri target = read_only_uri(db_path, freeze);
+    sqlite3* raw = nullptr;
+    const int code = sqlite3_open_v2(
+        target.uri.c_str(), &raw, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_FULLMUTEX,
+        nullptr);
+    SqliteHandle handle(raw);
+    if (code != SQLITE_OK) {
+        throw SqliteError(std::string("sqlite3_open_v2 (read-only) failed: ") +
+            (raw != nullptr ? sqlite3_errmsg(raw) : "alloc failure"), code);
+    }
+    Connection conn(std::move(handle), target.immutable);
+    conn.exec("PRAGMA busy_timeout = 5000");
+    return conn;
+}
 
 Connection Connection::open(const std::filesystem::path& db_path) {
     if (db_path != ":memory:" && db_path.has_parent_path()) {
@@ -27,6 +98,14 @@ Connection Connection::open(const std::filesystem::path& db_path) {
     return c;
 }
 
+void throw_sqlite_error(std::string msg, int code) {
+    constexpr unsigned kPrimaryMask = 0xFFU;   // 扩展码的低 8 位是主码
+    if ((static_cast<unsigned>(code) & kPrimaryMask) == static_cast<unsigned>(SQLITE_READONLY)) {
+        throw ReadOnlyWriteRejected(std::move(msg), code);
+    }
+    throw SqliteError(std::move(msg), code);
+}
+
 void Connection::exec(std::string_view sql) {
     if (!handle_) {
         throw SqliteError("exec failed: connection closed", SQLITE_MISUSE);
@@ -36,7 +115,7 @@ void Connection::exec(std::string_view sql) {
                      nullptr, nullptr, &err) != SQLITE_OK) {
         std::string msg = err ? err : "unknown sqlite_exec error";
         sqlite3_free(err);
-        throw SqliteError("exec failed: " + msg, sqlite3_errcode(handle_.get()));
+        throw_sqlite_error("exec failed: " + msg, sqlite3_extended_errcode(handle_.get()));
     }
 }
 

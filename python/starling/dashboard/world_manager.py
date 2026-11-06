@@ -53,7 +53,9 @@ DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个�
      C++ 要求按世界串行化快照、恢复、修剪，持这把锁即满足。不同世界的世界锁互不相干：一个世界建引擎
      或恢复时，别的世界照常打开、读写。后台调用方（会话钩子、调度线程）只非阻塞地取，取不到就是
      "busy"，从不等。
-  3. engine._lock（RLock，DashboardEngine 内部）：由持租约的请求和后台线程持有。池从不拿它：quiesce
+  3. engine._lock（RLock，DashboardEngine 内部）：由持租约的请求和后台线程持有。池只在一处拿它：fork_world
+     分叉开着的来源时，先取来源的世界锁、在 pool._lock 内查表拿到引擎并放开 pool._lock，再取 engine._lock，持着它
+     走引擎自己的连接复制（裁定 R5、R22 M5）；顺序与本表一致（世界锁 → engine._lock），且不持租约。别处不拿：quiesce
      在不持引擎锁的情况下 join 后台线程（线程分段拿锁，持锁 join 会卡满 5 秒误报 world_busy）。
   4. supervisor 互斥锁（C++ Runtime 内部）：只在持 engine._lock 时取（见 engine.py 的
      _sample_backpressure 一带），从不反向。
@@ -90,6 +92,13 @@ DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个�
 提交时不写 registry.db。开着的世界的计数由 live_stats 从库里现读（C++ world_stats，持一份租约）；关闭时
 （close_world、close_all）与 30 秒的后台刷新把它写进注册表的缓存列。引擎的 on_commit 由池设置：每个世界
 每秒至多通知一次 on_world_changed（尾沿去抖：一秒内的一串写入，最后一次通知带最终计数）。
+
+只读打开（spec §6.3、§6.4，第 3 期）
+-----------------------------------
+建引擎时问 C++ world_decide_open_mode：只读世界（含种子）与可回收世界只读打开（WorldContext.read_only），
+库经 open_read_only 打开，不跑迁移；引擎不起 tick、摄入，池不给它挂按会话的自动快照钩子；写入类调用一律
+world_read_only。分叉（fork_world）按来源选路、持锁（裁定 R5）：开着的来源持引擎锁、走引擎自己的连接，
+关着的来源持它的世界锁，快照来源直接复制。
 
 本期不做：没有空闲自动关闭（C++ 的空闲判定在第 4 期，裁定 R21）。世界开着直到 close_world、
 delete_world 或关停（close_all），默认世界只在关停时关。
@@ -151,6 +160,9 @@ class WorldSwitchError(Exception):
     """code: "world_not_found" | "world_busy" | "world_protected" | "worlds_unavailable"
     | "world_open_failed" | "rollback_reopen_failed" """
 
+    # 恢复的出口：库已经换成快照的内容（裁定 R32），路由据此广播 world_rolled_back。只有 rollback_reopen_failed 会是 True。
+    pool_replaced = False
+
     def __init__(self, code: str, detail: str = "") -> None:
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code = code
@@ -170,6 +182,12 @@ def _same_db(left: str, right: str) -> bool:
 
 def _store_code(exc: BaseException) -> str | None:
     return _core.world_store_error_code(exc) if isinstance(exc, _core.WorldStoreError) else None
+
+
+def _replaced_by_rollback(exc: BaseException) -> bool:
+    """world_rollback 抛出时库是不是已经换掉了：C++ 的标记（WorldStoreError.replaced，裁定 R31 M5、R32），不看错误码、
+    不看文件。不是 C++ 抛的异常（没有这个属性）按 False。"""
+    return bool(getattr(exc, "replaced", False))
 
 
 class EngineLease:
@@ -301,7 +319,8 @@ class WorldPool:
     def context(self, world: str) -> WorldContext:
         """一个世界打开引擎需要的全部输入：库、租户、C++ 补齐默认值后的设置、摄入分区目录
         （<config.ingest_spool_root()>/<world_ingest_partition(...)>，裁定 R4）。默认世界的向量后端与路径
-        取 config（裁定 R26，默认世界「原地」），其余世界 sqlite、没有路径。"""
+        取 config（裁定 R26，默认世界「原地」），其余世界 sqlite、没有路径。打开方式（read_only）问 C++
+        world_decide_open_mode（spec §6.4：只读世界、种子、可回收世界看板只读打开）。"""
         rec = self._record(world)
         is_default = world == self.default_world()
         partition = _core.world_ingest_partition(is_default, rec["tenant"], rec["dir_id"])
@@ -311,7 +330,9 @@ class WorldPool:
             agent=self._config.agent,
             settings=_core.world_effective_settings(rec["settings"]),
             ingest_spool_dir=str(self._config.ingest_spool_root() / partition),
-            is_default=is_default, vector_backend=backend, vector_store_path=store_path)
+            is_default=is_default, vector_backend=backend, vector_store_path=store_path,
+            read_only=_core.world_decide_open_mode(rec) == "ro",
+            frozen=_core.world_read_only_frozen(rec))
 
     def _vector_store(self, world: str, is_default: bool | None = None) -> tuple[str, str]:
         """(向量后端, 路径)：默认世界取 config（裁定 R26），其余世界 ("sqlite", "")。快照、恢复、自动快照
@@ -426,7 +447,7 @@ class WorldPool:
         world_open_failed。默认世界（原地的 dashboard.db）早于世界管理，既有部署可按租户过滤地存多个租户，
         不核对（与旧的启动校验一致）。"""
         try:
-            _core.world_verify_tenant(ctx.db_path, ctx.tenant)
+            _core.world_verify_tenant(ctx.db_path, ctx.tenant, frozen=ctx.frozen)
         except _core.WorldStoreError as exc:
             code = "world_tenant_mismatch" if _store_code(exc) == "world_tenant_mismatch" \
                 else "world_open_failed"
@@ -526,9 +547,10 @@ class WorldPool:
         return engine
 
     def _wire(self, world: str, engine) -> None:
-        """挂上池的回调：统计去抖广播（on_commit）与按会话的自动快照钩子（有注册表时）。"""
+        """挂上池的回调：统计去抖广播（on_commit）与按会话的自动快照钩子（有注册表时）。只读引擎不起摄入，
+        没有调用钩子的地方，不挂（spec §6.3：只读世界不起后台任务）。"""
         engine.on_commit = lambda: self._note_change(world)
-        if self._registry is not None:
+        if self._registry is not None and not getattr(engine, "read_only", False):
             self.attach_hooks(world, engine)
 
     def seed_engine(self, world: str, engine) -> None:
@@ -586,7 +608,7 @@ class WorldPool:
         self._require_registry()
         with self.lease(world, build=False):
             ctx = self.context(world)
-            return _core.world_stats(ctx.db_path, ctx.tenant)
+            return _core.world_stats(ctx.db_path, ctx.tenant, frozen=ctx.frozen)
 
     def live_stats(self, world: str) -> dict | None:
         """开着的世界：{"holders", "statements", "last_write_at"}（C++ world_stats，持一份不建引擎的
@@ -602,9 +624,41 @@ class WorldPool:
                 return None
             db_path, tenant = engine._db_path, engine.tenant
             engine = None
-            stats = _core.world_stats(db_path, tenant)
+            stats = _core.world_stats(db_path, tenant, frozen=self._frozen(world))
         return {"holders": stats["holders"], "statements": stats["statements"],
                 "last_write_at": stats["last_write_at"]}
+
+    def schema_behind(self, world: str, *, open_only: bool = False) -> bool | None:
+        """世界库的 schema 是否落后于本构建（spec §6.3，C++ SqliteAdapter::schema_behind）。开着的世界
+        取引擎打开时记下的值，不碰它的连接。关着的世界：open_only 时返回 None（列表不打开库，裁定 R17）；否则持
+        一份不建引擎的租约，短暂只读打开库（不迁移、不改日志模式）读一次。库不在或读不出时 None。"""
+        try:
+            lease = self.lease(world, build=False)
+        except WorldSwitchError as exc:
+            if exc.code == "world_busy":
+                return None
+            raise
+        with lease as engine:
+            if engine is not None:
+                behind = getattr(engine, "schema_behind", None)
+                engine = None
+                return behind
+            if open_only:
+                return None
+            ctx = self.context(world)
+            db_path = ctx.db_path
+            if not os.path.exists(db_path):
+                return None
+            try:
+                # 只持 build=False 租约，不持世界锁：可写世界随时可能被写，按记录选冻结（C++ 判，裁定 R36）。
+                adapter = _core.SqliteAdapter.open_read_only(db_path, frozen=ctx.frozen)
+                try:
+                    return adapter.schema_behind               # 判定在 C++（裁定 R31 M5）
+                finally:
+                    adapter.close()
+            except Exception:  # noqa: BLE001 — 坏库只是没有这个标记，详情照常给出
+                logger.warning("cannot read the schema version of world %s", world)
+                return None
 
     # ───────────────────────── 统计缓存与去抖广播 ─────────────────────────
 
@@ -661,12 +715,19 @@ class WorldPool:
         if deb is not None and deb.timer is not None:
             deb.timer.cancel()
 
+    def _frozen(self, world: str) -> bool:
+        """这个世界的只读连接能不能冻结（C++ world_read_only_frozen，裁定 R36）。读不到记录时 False（普通 mode=ro）。"""
+        try:
+            return _core.world_read_only_frozen(self._record(world))
+        except Exception:  # noqa: BLE001 — 拿不准就不冻结
+            return False
+
     def _write_stats_cache(self, world: str, db_path: str, tenant: str) -> None:
         """把库里的当前计数写进注册表缓存列。失败只记日志（缓存过期无害，下次刷新再写）。"""
         if self._registry is None:
             return
         try:
-            stats = _core.world_stats(db_path, tenant)
+            stats = _core.world_stats(db_path, tenant, frozen=self._frozen(world))
             self._registry.update_stats(world, stats["holders"], stats["statements"],
                                         stats["last_write_at"], self._clock())
         except Exception:  # noqa: BLE001 — 统计缓存是尽力而为
@@ -961,6 +1022,56 @@ class WorldPool:
         return reg.create(name, label, dict(labels or {}), merged or None, self._clock(),
                           provider_endpoints=self._provider_endpoints() if merged else None)
 
+    def fork_world(self, source: str, new_name: str, *, snapshot_id: str | None = None,
+                   labels: dict | None = None, retention_group: str | None = None,
+                   reclaimable: bool = False, seed: bool = False,
+                   settings: dict | None = None) -> dict:
+        """分叉（spec §6.1，C++ world_fork / world_fork_from_connection）：复制、校验、摘要比较、登记全在 C++，
+        返回 {"world": 新世界的注册表记录, "digest"}。settings 是部分设置，经 C++ 与建世界同一套合并
+        （merge_settings）叠在来源的设置上；继承来的 endpoint 照旧在调用时核对（spec §8.3）。不打开新世界。
+
+        这里只按来源的状态选路、持对的锁（裁定 R5）：
+          - 快照为来源：快照文件建好之后不再写，直接 world_fork。
+          - 来源开着（有引擎）：world_fork_from_connection 用引擎自己的连接复制（读到它最近一次提交），全程持
+            引擎锁，没有在途的写入。
+          - 来源关着：全程持来源的世界锁（这期间不会有引擎在它上面建起来），world_fork 只读打开来源库。
+        两种世界来源都在世界锁内判断开没开着：建引擎也持世界锁，判断之后状态不会变。世界锁 → 引擎锁是模块
+        文档里的锁顺序；这里不持租约（持租约的代码不得阻塞地等世界锁）。之前的关闭留下的 Runtime 还开着来源
+        库时 world_busy（关着的来源只读打开可能走 immutable，看不见它的写入）。"""
+        reg = self._require_registry()
+        # 裁定 R31 M3：与 create_world 同一种传法。客户端给了设置时 provider 地址表交给 C++，在登记的那次持注册表锁内
+        # 核对合并后设置里继承来的 endpoint；地址变了就 endpoint_changed，不留文件、不登记。没给设置时不核对。
+        opts = {"labels": dict(labels or {}), "retention_group": retention_group or "",
+                "reclaimable": bool(reclaimable), "seed": bool(seed), "settings": settings,
+                "now": self._clock(),
+                "provider_endpoints": self._provider_endpoints() if settings else None,
+                # 裁定 R31 M4：来源的向量后端（与快照路由同一取法），是否支持由 C++ 判。
+                "vector_backend": self._vector_backend(source)}
+        if snapshot_id:
+            return _core.world_fork(reg, source, new_name, {**opts, "snapshot_id": snapshot_id})
+        rec = self._record(source)                    # world_not_found：未知世界名不建世界锁
+        with self._world_lock(source):
+            with self._lock:
+                engine = self._engines.get(source)
+            if engine is None:
+                self._refuse_leaked(rec["db_path"])
+                return _core.world_fork(reg, source, new_name, opts)
+            try:
+                with engine._lock:
+                    return _core.world_fork_from_connection(
+                        reg, engine._rt.adapter.connection(), source, new_name, opts)
+            finally:
+                engine = None
+
+    def upgrade_seed(self, source: str, new_name: str) -> dict:
+        """升级种子（spec §6.2，C++ world_upgrade_seed）：复制旧种子、在副本上跑迁移、登记成新种子，旧种子不动。
+        返回 {"world", "digest"}。来源不是种子 world_not_seed（C++ 判）。持来源的世界锁：种子只会被只读打开，
+        持锁挡住的是同一世界上的恢复、删除与快照修剪。"""
+        reg = self._require_registry()
+        self._record(source)                          # world_not_found
+        with self._world_lock(source):
+            return _core.world_upgrade_seed(reg, source, new_name, self._clock())
+
     def _provider_endpoints(self) -> dict[str, dict]:
         """{provider 名: {"provider": 种类, "base_url": 地址}}（starling.json 的 provider 注册表），交给 C++ 核对客户端
         写的设置里继承来的 endpoint（裁定 R40、R51）。只给当前值，比较在 C++；不含密钥。遍历前先拍快照（见
@@ -1097,7 +1208,8 @@ class WorldPool:
                     f"the default world's {section!r} settings come from the dashboard config")
 
     def set_auto_snapshot(self, world: str, on_session: bool, interval_hours: int) -> dict:
-        """改一个世界的自动快照配置（C++ 在注册表锁内合并），返回新配置 {"on_session", "interval_hours"}。
+        """改一个世界的自动快照配置（C++ 在注册表锁内合并），返回生效的配置 {"on_session", "interval_hours"}（按看板的
+        打开方式算，与列表行、详情同一口径，裁定 R38：只读打开的世界恒为全关，存着的值照写）。
         world_not_found / invalid_auto_snapshot 由 C++ 抛。开着的引擎换上新的设置引用。"""
         reg = self._require_registry()
         self._record(world)                           # world_not_found：未知世界名不建世界锁
@@ -1106,7 +1218,8 @@ class WorldPool:
         # 适配器。路由在工作线程里调，不持租约，按锁顺序可以等世界锁。
         with self._world_lock(world):
             _core.world_set_auto_snapshot(reg, world, on_session, interval_hours)
-            settings = _core.world_effective_settings(reg.get(world)["settings"])
+            rec = reg.get(world)
+            settings = _core.world_effective_settings(rec["settings"], record=rec)
             with self._lock:
                 engine = self._engines.get(world)
             if engine is not None:
@@ -1130,14 +1243,20 @@ class WorldPool:
     def rollback(self, world: str, snapshot_id: str) -> dict:
         """把 world 恢复到快照 snapshot_id（丢掉快照之后的一切）。替换、校验、归档都在 C++
         （world_rollback）；被替换的库留在 <世界目录>/archive/。返回 {"world", "snapshot_id", "archived",
-        "reopened"}（reopened：恢复前开着、恢复后已重新打开）。
+        "reopened", "digest"}（reopened：恢复前开着、恢复后已重新打开；digest：C++ 在恢复后的库上算的摘要，裁定 R26，
+        缺表的库为 None）。
 
         只停被恢复的世界：持它的世界锁、置它的关闭标志、等它的租约（含只读检视）归零、停它的线程、丢它
         的引擎并确认 Runtime 已回收，然后才调 C++；别的世界的租约与写入照常（需求 §7 第 1b 条）。
 
-        抛错：C++ 的码（snapshot_not_found / snapshot_corrupt / world_tenant_mismatch / insufficient_disk /
-        snapshot_failed / snapshot_unsupported_backend / world_in_use）是 _core.WorldStoreError，库原样不动；
-        world_busy（在途请求 _LEASE_DRAIN_TIMEOUT_S 内不结束、线程停不下、Runtime 回收不了或之前的关闭
+        抛错：C++ 的码是 _core.WorldStoreError，按库有没有被替换分两类（C++ rollback_world 第 12 步）：
+          - 库原样不动：snapshot_not_found / snapshot_corrupt / world_tenant_mismatch / insufficient_disk /
+            snapshot_unsupported_backend / world_in_use，以及替换之前的 snapshot_failed；
+          - 库已替换（C++ 的 WorldStoreError.replaced 为 True，裁定 R31 M5）：快照文件登记之后被改过
+            （restore_digest_mismatch），或第 12 步「库已替换、算不出摘要」的 snapshot_failed。照替换成功的出口刷
+            统计缓存、重开引擎，再原样抛出（异常上另挂 pool_replaced=True，路由据此广播）；重开失败报
+            rollback_reopen_failed（链到 C++ 的错误，同样挂 pool_replaced=True）。
+        另有 world_busy（在途请求 _LEASE_DRAIN_TIMEOUT_S 内不结束、线程停不下、Runtime 回收不了或之前的关闭
         留下的 Runtime 还开着这个库，库未动）；world_open_failed（库未动，但重开引擎失败）；
         rollback_reopen_failed（库已替换，重开失败）。后两种引擎不在表上，下一次 lease 重新建。
         动引擎之前先跑 C++ 的只读预检（world_check_rollback）：不改输入重试也过不了的错误直接抛出，引擎、
@@ -1157,23 +1276,39 @@ class WorldPool:
                 # 直到它被回收）。
                 raise busy
             try:
-                result = _core.world_rollback(reg, world, snapshot_id, vector_backend=backend)
+                result = self._rollback_in_cpp(reg, world, snapshot_id, backend)
             except Exception as exc:
-                self._reopen_after_rollback(world, was_open, exc)   # C++ 保证库未动；原样抛出
+                if not _replaced_by_rollback(exc):
+                    self._reopen_after_rollback(world, was_open, exc)   # 库未动；原样抛出
+                    raise
+                # 库已换成快照文件此刻的内容（摘要对不上或算不出）：与成功出口一样刷缓存、在新库上重开，再
+                # 把 C++ 的错误原样抛出（硬错误，spec §7.2）。重开失败时 rollback_reopen_failed 链到它。两种出口都
+                # 在异常上挂 pool_replaced=True：路由按它广播 world_rolled_back（裁定 R32），不按错误码列表。
+                exc.pool_replaced = True
+                self._write_stats_cache(world, rec["db_path"], rec["tenant"])
+                self._reopen_after_rollback(world, was_open, None, replaced_by=exc)
                 raise
             # 审查 T5-1：库已换成快照，注册表里的统计缓存还是回滚前（关闭时写的）的计数。照关闭的写法刷一次，
             # 关着的世界在列表上立刻显示回滚后的计数。失败只记日志（缓存是尽力而为）。
             self._write_stats_cache(world, rec["db_path"], rec["tenant"])
             reopened = self._reopen_after_rollback(world, was_open, None)
         return {"world": world, "snapshot_id": snapshot_id,
-                "archived": bool(result["archive_path"]), "reopened": reopened}
+                "archived": bool(result["archive_path"]), "reopened": reopened,
+                "digest": result["digest"]}
 
-    def _reopen_after_rollback(self, world: str, was_open: bool, cause: Exception | None) -> bool:
+    @staticmethod
+    def _rollback_in_cpp(reg, world: str, snapshot_id: str, backend: str) -> dict:
+        """调 C++ world_rollback 的唯一一处（测试替换它来注入 C++ 的失败）。"""
+        return _core.world_rollback(reg, world, snapshot_id, vector_backend=backend)
+
+    def _reopen_after_rollback(self, world: str, was_open: bool, cause: Exception | None, *,
+                               replaced_by: Exception | None = None) -> bool:
         """恢复的每个出口（持世界锁、在关闭窗口内）：恢复前开着就按注册表重建引擎、起线程（打开时会跑
         迁移，旧 schema 的快照会补齐）。返回世界此刻是否开着（按实际结果，不按恢复前的状态）：恢复前关着、
         或恢复途中池关停了（建好的引擎不发布、关掉），都是 False。重建失败：引擎不在表上，下一次 lease
-        重新建。码按库有没有被替换来分：cause 为 None（替换成功之后）→ rollback_reopen_failed；其余出口 →
-        world_open_failed（链到 cause）。重建成功则返回，由调用方抛 cause 或返回结果。"""
+        重新建。码按库有没有被替换来分：cause 为 None（库已替换：成功，或 replaced_by 给出的「替换之后才
+        失败」）→ rollback_reopen_failed（有 replaced_by 时链到它）；其余出口 → world_open_failed（链到 cause）。
+        重建成功则返回，由调用方抛 cause / replaced_by 或返回结果。"""
         if not was_open:
             return False
         try:
@@ -1182,7 +1317,9 @@ class WorldPool:
             if cause is None:
                 detail = f"rollback applied, but the world cannot be reopened: {exc}"
                 logger.error("world rollback (%s): %s", world, detail)
-                raise WorldSwitchError("rollback_reopen_failed", detail) from exc
+                reopen_failed = WorldSwitchError("rollback_reopen_failed", detail)
+                reopen_failed.pool_replaced = True          # 库已替换（裁定 R32）
+                raise reopen_failed from (replaced_by or exc)
             detail = f"{cause}; reopening the world also failed: {exc}"
             logger.error("world rollback (%s): %s", world, detail)
             raise WorldSwitchError("world_open_failed", detail) from cause

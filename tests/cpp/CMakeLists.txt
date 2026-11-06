@@ -41,6 +41,7 @@ add_executable(starling_tests
     test_outbox_dispatcher.cpp
     test_pipeline_ledger.cpp
     test_sqlite_adapter.cpp
+    test_sqlite_adapter_read_only.cpp
     test_engram_content_hash.cpp
     test_ingest_policy_resolver.cpp
     test_evidence_validator.cpp
@@ -209,6 +210,7 @@ add_executable(starling_tests
     test_registry_db.cpp
     test_registry_import.cpp
     test_world_settings.cpp
+    test_world_fork.cpp
 )
 target_include_directories(starling_tests BEFORE PRIVATE
     "${gtest_SOURCE_DIR}/include"

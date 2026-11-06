@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -82,9 +83,23 @@ CREATE TABLE IF NOT EXISTS snapshots (
     session_id TEXT NOT NULL DEFAULT '',
     content_mark TEXT NOT NULL DEFAULT '',
     seq INTEGER NOT NULL,
+    digest TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (world, id)
 );
 )sql";
+
+// 第 3 期给 snapshots 加了 digest 列，schema_version 仍是 1：之前建的注册表（含用户 8787 的
+// ~/.starling/registry.db）在 CREATE TABLE IF NOT EXISTS 之后还是旧形状，打开时就地补列。只加一列、
+// 带默认值，旧条目读出空串（rollback_world 对空 digest 不比较）。列已在时什么都不做，所以幂等。
+// 调用方已在 BEGIN IMMEDIATE 之内（RegistryDb::open）：查与补之间别的连接插不进来。
+void add_snapshot_digest_column(pst::Connection& conn) {
+    bool present = false;
+    {
+        pst::Stmt cols(conn.raw(), "SELECT 1 FROM pragma_table_info('snapshots') WHERE name = 'digest'");
+        present = cols.step_row();
+    }
+    if (!present) { conn.exec("ALTER TABLE snapshots ADD COLUMN digest TEXT NOT NULL DEFAULT ''"); }
+}
 
 // 裁定 R40、R51：合并结果里每个继承来的 endpoint（provider_name 非空）对 provider 此刻的种类与地址核对
 // （require_endpoint_unchanged，spec §8.3）。表里没有这个 provider（已被删掉）同样拒绝。
@@ -149,8 +164,8 @@ WorldRecord read_world(sqlite3_stmt* stmt) {
 void insert_snapshot(sqlite3* dbh, const std::string& world, const SnapshotEntry& entry) {
     pst::Stmt stmt(dbh,
                    "INSERT INTO snapshots (world, id, path, kind, reason, note, created_at, "
-                   "world_time, size_bytes, sessions_complete, session_id, content_mark, seq) "
-                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                   "world_time, size_bytes, sessions_complete, session_id, content_mark, digest, seq) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                    "(SELECT COALESCE(MAX(seq), 0) + 1 FROM snapshots))");
     stmt.bind(world, entry.id, entry.path, entry.kind, entry.reason, entry.note, entry.created_at,
               entry.world_time, entry.size_bytes);
@@ -161,6 +176,7 @@ void insert_snapshot(sqlite3* dbh, const std::string& world, const SnapshotEntry
     }
     pst::detail::bind_sv(stmt.raw(), 11, entry.session_id);
     pst::detail::bind_sv(stmt.raw(), 12, entry.content_mark);
+    pst::detail::bind_sv(stmt.raw(), 13, entry.digest);
     stmt.step_done();
 }
 
@@ -173,6 +189,18 @@ void insert_meta(sqlite3* dbh, const char* key, const std::string& value) {
 }  // namespace
 
 namespace {
+// seed 蕴含 read_only（spec §6.2）。
+WorldFlags normalized_flags(WorldFlags flags) {
+    if (flags.seed) { flags.read_only = true; }
+    return flags;
+}
+
+// 只读世界的后台恒关（merge_settings 的 read_only）。不是只读时原样返回（create 的设置是不透明文本）。
+std::string settings_for(const std::string& settings_json, const WorldFlags& flags) {
+    if (!flags.read_only) { return settings_json; }
+    return settings_to_json(merge_settings(settings_from_json(settings_json), "{}", true));
+}
+
 void require_valid_name(const std::string& name) {
     if (!is_valid_world_name(name)) {
         throw WorldStoreError("invalid_world_name",
@@ -238,45 +266,63 @@ struct RegistryDb::Impl {
         guard.commit();
     }
 
-    // 调用方已持锁，且 name 已过 is_valid_world_name。init_db 为真时（create_world，裁定 R34）先在新
-    // 世界目录里经持久层打开一次库文件（迁移建表）再关掉，然后才写注册项：注册项一出现，库与 schema
-    // 就已经在，检视新世界读到的是空表，不是「还没有库」。不建引擎（裁定 R21）。任何一步失败都删掉
-    // 整个世界目录，注册项不写。
-    WorldRecord create_row(const std::string& name, const std::string& label,
-                           const std::map<std::string, std::string>& labels,
-                           const std::string& settings_json, std::string_view now_iso,
-                           bool init_db) const {
-    if (find(name)) { throw WorldStoreError("world_exists", "world '" + name + "' exists"); }
-    const fs::path worlds_root = data_dir / "worlds";
-    internal::require_worlds_root_inside(data_dir, worlds_root);
-    std::string dir_id = internal::random_hex();
-    while (dir_id_taken(dir_id) || fs::exists(worlds_root / dir_id)) {
-        dir_id = internal::random_hex();
+    // 调用方已持锁，且 name 已过 is_valid_world_name。名字已被占用抛 world_exists；否则选一个注册表与
+    // 磁盘上都没有的 dir_id，建 worlds/<dir_id>/ 与 snapshots/，返回世界目录（还没有注册项）。
+    [[nodiscard]] fs::path reserve_home(const std::string& name) const {
+        if (find(name)) { throw WorldStoreError("world_exists", "world '" + name + "' exists"); }
+        const fs::path worlds_root = data_dir / "worlds";
+        internal::require_worlds_root_inside(data_dir, worlds_root);
+        std::string dir_id = internal::random_hex();
+        while (dir_id_taken(dir_id) || fs::exists(worlds_root / dir_id)) {
+            dir_id = internal::random_hex();
+        }
+        const fs::path home = worlds_root / dir_id;
+        std::error_code mkdir_err;
+        fs::create_directories(home / "snapshots", mkdir_err);
+        if (mkdir_err) {
+            throw WorldStoreError("snapshot_failed",
+                                  "cannot create " + home.string() + ": " + mkdir_err.message());
+        }
+        return home;
     }
-    const fs::path home = worlds_root / dir_id;
-    std::error_code mkdir_err;
-    fs::create_directories(home / "snapshots", mkdir_err);
-    if (mkdir_err) {
-        throw WorldStoreError("snapshot_failed",
-                              "cannot create " + home.string() + ": " + mkdir_err.message());
-    }
-    try {
-        if (init_db) { initialise_world_db(home / "world.db"); }
+
+    // 调用方已持锁。在一个事务里写 worlds 行与标签；home 是 reserve_home 建的世界目录。
+    void insert_world(const NewWorld& spec, const fs::path& home) const {
+        const WorldFlags flags = normalized_flags(spec.flags);
+        const std::string settings = settings_for(spec.settings_json, flags);
         pst::TransactionGuard guard(*conn);
         pst::Stmt stmt(db(),
                        "INSERT INTO worlds (name, dir_id, tenant, db_path, snapshot_dir, label, "
-                       "created_at, settings_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-        stmt.bind(name, dir_id, name, (home / "world.db").string(),
-                  (home / "snapshots").string(), label, now_iso, settings_json);
+                       "created_at, settings_json, seed, read_only, reclaimable, retention_group, "
+                       "fork_of_world, fork_of_snapshot, holders, statements, last_write_at, stats_at) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        // 统计缓存（裁定 R22 M6）：spec 带着就随登记写入，stats_at 记登记时刻；没带时与表的默认值相同。
+        stmt.bind(spec.name, home.filename().string(), spec.tenant, (home / "world.db").string(),
+                  (home / "snapshots").string(), spec.label, spec.now_iso, settings,
+                  static_cast<int>(flags.seed), static_cast<int>(flags.read_only),
+                  static_cast<int>(flags.reclaimable), flags.retention_group, flags.fork_of_world,
+                  flags.fork_of_snapshot, spec.holders, spec.statements, spec.last_write_at,
+                  spec.has_stats ? spec.now_iso : std::string());
         stmt.step_done();
-        insert_labels(name, labels);
+        insert_labels(spec.name, spec.labels);
         guard.commit();
-    } catch (...) {
-        std::error_code rm_err;
-        fs::remove_all(home, rm_err);
-        throw;
     }
-    return require(name);
+
+    // 调用方已持锁，且 name 已过 is_valid_world_name。init_db 为真时（create_world，裁定 R34）先在新
+    // 世界目录里经持久层打开一次库文件（迁移建表）再关掉，然后才写注册项：注册项一出现，库与 schema
+    // 就已经在，检视新世界读到的是空表，不是「还没有库」。不建引擎（裁定 R21）。任何一步失败都删掉
+    // 整个世界目录，注册项不写。租户就是世界名。
+    WorldRecord create_row(const NewWorld& spec, bool init_db) const {
+        const fs::path home = reserve_home(spec.name);
+        try {
+            if (init_db) { initialise_world_db(home / "world.db"); }
+            insert_world(spec, home);
+        } catch (...) {
+            std::error_code rm_err;
+            fs::remove_all(home, rm_err);
+            throw;
+        }
+        return require(spec.name);
     }
 
     // 经持久层打开 db_file（SqliteAdapter::open 跑迁移到最新），随即关闭（并回 WAL）。失败抛
@@ -304,6 +350,22 @@ struct RegistryDb::Impl {
     }
 };
 
+OpenMode decide_open_mode(const WorldRecord& rec, bool for_client_write) {
+    if (rec.read_only || rec.seed) { return OpenMode::ReadOnly; }   // seed 蕴含 read_only
+    if (rec.reclaimable && !for_client_write) { return OpenMode::ReadOnly; }
+    return OpenMode::ReadWrite;
+}
+
+pst::ReadOnlyFreeze read_only_freeze_for(const WorldRecord& rec) {
+    return decide_open_mode(rec, false) == OpenMode::ReadOnly ? pst::ReadOnlyFreeze::Frozen
+                                                              : pst::ReadOnlyFreeze::Shared;
+}
+
+WorldSettings effective_world_settings(const WorldRecord& rec) {
+    const bool read_only_open = decide_open_mode(rec, false) == OpenMode::ReadOnly;
+    return merge_settings(settings_from_json(rec.settings_json), "{}", read_only_open);
+}
+
 RegistryDb::RegistryDb(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 RegistryDb::RegistryDb(RegistryDb&&) noexcept = default;
 RegistryDb& RegistryDb::operator=(RegistryDb&&) noexcept = default;
@@ -320,6 +382,9 @@ RegistryDb RegistryDb::open(const fs::path& data_dir, const fs::path& default_db
         impl->conn = std::make_unique<pst::Connection>(pst::Connection::open(file));
         impl->conn->exec(kSchemaSql);
         pst::TransactionGuard guard(*impl->conn);
+        // 在 BEGIN IMMEDIATE 之内查列、补列：两个进程同时第一次打开旧注册表时，后到的一个等前一个提交，
+        // 再查就看得见新列，不会第二次 ALTER（duplicate column → registry_corrupt）。
+        add_snapshot_digest_column(*impl->conn);
         std::optional<std::string> version;
         {
             pst::Stmt stmt(impl->db(), "SELECT value FROM meta WHERE key = 'schema_version'");
@@ -428,26 +493,85 @@ WorldPage RegistryDb::list(const WorldQuery& query) const {
     return page;
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 WorldRecord RegistryDb::create(const std::string& name, const std::string& label,
                                const std::map<std::string, std::string>& labels,
-                               const std::string& settings_json, std::string_view now_iso) {
+                               const std::string& settings_json, std::string_view now_iso,
+                               const WorldFlags& flags) {
     require_valid_name(name);
     const std::scoped_lock lock(impl_->mutex);
-    return impl_->create_row(name, label, labels, settings_json, now_iso, false);
+    return impl_->create_row(NewWorld{.name = name, .tenant = name, .label = label, .labels = labels,
+                                      .settings_json = settings_json,
+                                      .now_iso = std::string(now_iso), .flags = flags,},
+                             false);
 }
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 WorldRecord RegistryDb::create_world(const std::string& name, const std::string& label,
                                      const std::map<std::string, std::string>& labels,
                                      const std::string& overrides_json, std::string_view now_iso,
-                                     const std::optional<ProviderEndpoints>& provider_endpoints) {
+                                     const std::optional<ProviderEndpoints>& provider_endpoints,
+                                     const WorldFlags& flags) {
     require_valid_name(name);
+    const WorldFlags normal = normalized_flags(flags);
     const std::scoped_lock lock(impl_->mutex);
     const auto base = settings_from_json(impl_->require(impl_->default_name()).settings_json);
     const auto merged =
-        merge_settings(base, overrides_json.empty() ? "{}" : overrides_json, false);
+        merge_settings(base, overrides_json.empty() ? "{}" : overrides_json, normal.read_only);
     if (provider_endpoints) { require_inherited_endpoints(merged, *provider_endpoints); }
-    return impl_->create_row(name, label, labels, settings_to_json(merged), now_iso, true);
+    return impl_->create_row(NewWorld{.name = name, .tenant = name, .label = label, .labels = labels,
+                                      .settings_json = settings_to_json(merged),
+                                      .now_iso = std::string(now_iso), .flags = normal,},
+                             true);
+}
+
+WorldRecord RegistryDb::create_populated(
+    const NewWorld& spec_in, const std::function<void(const fs::path& db_file)>& populate) {
+    require_valid_name(spec_in.name);
+    NewWorld spec = spec_in;
+    fs::path home;
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        home = impl_->reserve_home(spec.name);
+    }
+    const auto discard = [&home] {
+        std::error_code rm_err;
+        fs::remove_all(home, rm_err);
+    };
+    try {
+        populate(home / "world.db");   // 不持锁：复制可能要几百毫秒
+        // 统计缓存在写好的库上算（裁定 R22 M6）：与关闭时 update_stats 写的同一组值，同样不持锁。登记之前的新世界目录
+        // 只有这次操作知道（裁定 R36）：冻结打开，不在旁边留旁车。尽力而为（裁定 R38，与 Python _write_stats_cache
+        // 一致）：算不出时照常登记，统计列取默认值（0 / 空串）、stats_at 留空，下次关闭或刷新再写。
+        try {
+            if (spec.stats_for_test) { spec.stats_for_test(); }
+            const WorldStats stats = world_stats((home / "world.db").string(), spec.tenant,
+                                                 pst::ReadOnlyFreeze::Frozen);
+            spec.holders = stats.holders;
+            spec.statements = stats.statements;
+            spec.last_write_at = stats.last_write_at;
+            spec.has_stats = true;
+        } catch (const std::exception&) {
+            spec.holders = 0;
+            spec.statements = 0;
+            spec.last_write_at.clear();
+            spec.has_stats = false;
+        }
+        const std::scoped_lock lock(impl_->mutex);
+        // 第 1 步之后名字可能被别的调用抢先登记（dir_id 不会撞：目录已经在，reserve_home 跳过它）。
+        if (impl_->find(spec.name)) {
+            throw WorldStoreError("world_exists", "world '" + spec.name + "' exists");
+        }
+        // 裁定 R31 M3：与 create_world 同一条规则，在登记的这次持锁内、写之前核对继承来的 endpoint。
+        if (spec.provider_endpoints) {
+            require_inherited_endpoints(settings_from_json(spec.settings_json), *spec.provider_endpoints);
+        }
+        impl_->insert_world(spec, home);
+        return impl_->require(spec.name);
+    } catch (...) {
+        discard();
+        throw;
+    }
 }
 
 std::string RegistryDb::update_world_settings(
@@ -582,8 +706,8 @@ std::vector<SnapshotEntry> RegistryDb::snapshots(const std::string& world) const
     (void)impl_->require(world);
     pst::Stmt stmt(impl_->db(),
                    "SELECT id, path, kind, reason, note, created_at, world_time, size_bytes, "
-                   "sessions_complete, session_id, content_mark FROM snapshots WHERE world = ? "
-                   "ORDER BY seq DESC");
+                   "sessions_complete, session_id, content_mark, digest FROM snapshots "
+                   "WHERE world = ? ORDER BY seq DESC");
     stmt.bind(world);
     std::vector<SnapshotEntry> out;
     while (stmt.step_row()) {
@@ -602,6 +726,7 @@ std::vector<SnapshotEntry> RegistryDb::snapshots(const std::string& world) const
         }
         entry.session_id = text_col(raw, 9);
         entry.content_mark = text_col(raw, 10);
+        entry.digest = text_col(raw, 11);
         out.push_back(std::move(entry));
     }
     return out;

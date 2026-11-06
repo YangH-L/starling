@@ -285,6 +285,100 @@ TEST(RegistryDb, StatsAndSnapshotsRoundTrip) {
     EXPECT_EQ(code_of([&] { reg.drop_snapshot("w", first.id); }), "snapshot_not_found");
 }
 
+// 快照条目的 digest 列往返；第 3 期之前建的注册表（snapshots 没有 digest 列，schema_version 仍是 1）
+// 打开时就地加列，旧条目读出空串，重复打开不出错。
+TEST(RegistryDb, SnapshotDigestColumnRoundTripsAndOldRegistryGainsIt) {
+    const TempDir tmp;
+    {
+        auto reg = open_db(tmp);
+        reg.create("w", "", {}, "{}", kNow);
+        SnapshotEntry snap;
+        snap.id = "20261103T000000Z-aaaa";
+        snap.path = (tmp.path() / "s1").string();
+        snap.kind = "held";
+        snap.reason = "held";
+        snap.created_at = kNow;
+        snap.digest = std::string(64, 'd');
+        reg.put_snapshot("w", snap);
+        EXPECT_EQ(reg.snapshots("w").front().digest, std::string(64, 'd'));
+    }
+    // 模拟旧注册表：把 snapshots 改回没有 digest 列的形状（保留一条旧条目）。
+    sql_exec(tmp.path() / "registry.db",
+             "CREATE TABLE snap_old AS SELECT world, id, path, kind, reason, note, created_at, "
+             "world_time, size_bytes, sessions_complete, session_id, content_mark, seq FROM snapshots;"
+             "DROP TABLE snapshots;"
+             "CREATE TABLE snapshots (world TEXT NOT NULL, id TEXT NOT NULL, path TEXT NOT NULL, "
+             "kind TEXT NOT NULL, reason TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', "
+             "created_at TEXT NOT NULL, world_time TEXT NOT NULL DEFAULT '', "
+             "size_bytes INTEGER NOT NULL DEFAULT 0, sessions_complete INTEGER, "
+             "session_id TEXT NOT NULL DEFAULT '', content_mark TEXT NOT NULL DEFAULT '', "
+             "seq INTEGER NOT NULL, PRIMARY KEY (world, id));"
+             "INSERT INTO snapshots SELECT * FROM snap_old; DROP TABLE snap_old;");
+    for (int round = 0; round < 2; ++round) {   // 第二次打开时列已在：幂等
+        auto reg = open_db(tmp);
+        const auto snaps = reg.snapshots("w");
+        ASSERT_EQ(snaps.size(), 1U);
+        EXPECT_EQ(snaps.front().digest, "");
+        EXPECT_EQ(snaps.front().kind, "held");
+    }
+    auto reg = open_db(tmp);
+    SnapshotEntry fresh;
+    fresh.id = "20261103T000001Z-bbbb";
+    fresh.path = (tmp.path() / "s2").string();
+    fresh.kind = "manual";
+    fresh.reason = "manual";
+    fresh.created_at = kNow;
+    fresh.digest = "abc";
+    reg.put_snapshot("w", fresh);
+    EXPECT_EQ(reg.snapshots("w").front().digest, "abc");
+}
+
+// create / create_world 写入 WorldFlags；seed 蕴含 read_only，只读世界的后台强制关。
+TEST(RegistryDb, CreateRecordsWorldFlags) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    const auto plain = reg.create("plain", "", {}, "{}", kNow);
+    EXPECT_FALSE(plain.seed);
+    EXPECT_FALSE(plain.read_only);
+    EXPECT_FALSE(plain.reclaimable);
+    EXPECT_EQ(plain.retention_group, "");
+    const auto rollout = reg.create("rollout", "", {}, "{}", kNow,
+                                    WorldFlags{.reclaimable = true, .retention_group = "g1",
+                                               .fork_of_world = "plain"});
+    EXPECT_TRUE(rollout.reclaimable);
+    EXPECT_FALSE(rollout.read_only);
+    EXPECT_EQ(rollout.retention_group, "g1");
+    EXPECT_EQ(rollout.fork_of_world, "plain");
+    const auto seed = reg.create_world("seed", "", {}, "{}", kNow, std::nullopt,
+                                       WorldFlags{.seed = true});
+    EXPECT_TRUE(seed.seed);
+    EXPECT_TRUE(seed.read_only);
+    EXPECT_FALSE(settings_from_json(seed.settings_json).background.ingest);
+    EXPECT_EQ(reg.get("seed").read_only, true);
+}
+
+// 打开方式（spec §6.4）：只读或可回收的世界看板一律只读打开；客户端写入（第 4 期）只对只读世界只读。
+TEST(RegistryDb, OpenModeRule) {
+    const TempDir tmp;
+    auto reg = open_db(tmp);
+    const auto plain = reg.create("plain", "", {}, "{}", kNow);
+    const auto seed = reg.create("seed", "", {}, "{}", kNow, WorldFlags{.seed = true});
+    const auto frozen = reg.create("frozen", "", {}, "{}", kNow, WorldFlags{.read_only = true});
+    const auto rollout = reg.create("rollout", "", {}, "{}", kNow, WorldFlags{.reclaimable = true});
+
+    EXPECT_EQ(decide_open_mode(plain, false), OpenMode::ReadWrite);
+    EXPECT_EQ(decide_open_mode(seed, false), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(frozen, false), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(rollout, false), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(reg.get("default"), false), OpenMode::ReadWrite);
+
+    // 客户端写入：可回收世界（rollout）可写，种子与只读世界仍只读。
+    EXPECT_EQ(decide_open_mode(plain, true), OpenMode::ReadWrite);
+    EXPECT_EQ(decide_open_mode(seed, true), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(frozen, true), OpenMode::ReadOnly);
+    EXPECT_EQ(decide_open_mode(rollout, true), OpenMode::ReadWrite);
+}
+
 TEST(RegistryDb, CorruptRegistryFileIsReported) {
     const TempDir tmp;
     {

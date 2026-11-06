@@ -24,6 +24,7 @@
 #include "starling/governance/registry_db.hpp"
 #include "starling/governance/world_settings.hpp"
 #include "starling/governance/world_store.hpp"
+#include "starling/persistence/connection.hpp"
 
 namespace starling::bindings {
 
@@ -47,7 +48,8 @@ py::object text_or_none(const std::string& text) {
 
 // 单份快照的 dict（注册表 snapshots / world_take_snapshot / world_take_auto_snapshot 返回的那份）。
 // W4 的三个字段总是在，缺省为 None：sessions_complete（int | None）、session_id（str | None）、
-// content_mark（str | None，只给内部与测试用，HTTP 白名单不外露）。
+// content_mark（str | None，只给内部与测试用，HTTP 白名单不外露）。digest（第 3 期）：快照里的 library
+// 摘要，旧条目或缺表的库为 None。
 py::dict snap_out(const gov::SnapshotEntry& snap) {
     py::dict out("id"_a = snap.id, "path"_a = snap.path, "kind"_a = snap.kind,
                  "reason"_a = snap.reason, "note"_a = snap.note, "created_at"_a = snap.created_at,
@@ -57,7 +59,8 @@ py::dict snap_out(const gov::SnapshotEntry& snap) {
                                     ? py::object(py::int_(*snap.sessions_complete))
                                     : py::object(py::none()),
         "session_id"_a = text_or_none(snap.session_id),
-        "content_mark"_a = text_or_none(snap.content_mark)));
+        "content_mark"_a = text_or_none(snap.content_mark),
+        "digest"_a = text_or_none(snap.digest)));
     return out;
 }
 
@@ -110,6 +113,46 @@ std::string overrides_in(const py::object& overrides) {
     throw gov::WorldStoreError("invalid_auto_snapshot", detail);
 }
 
+// 分叉的 opts dict → ForkOptions（只做类型归一）。键：snapshot_id、labels、retention_group、reclaimable、
+// seed、settings（None 或部分设置 dict，json.dumps 成 overrides）、now（调用方的时刻）、provider_endpoints
+// （None 或 {provider 名: {"provider", "base_url"}}，同 WorldRegistry.create；核对在 C++）、vector_backend（来源的
+// 向量后端，是否支持由 C++ 判）。未知键抛
+// invalid_settings；缺的键取 ForkOptions 的默认值。持 GIL 调用。
+gov::ForkOptions fork_options_in(const py::dict& opts) {
+    gov::ForkOptions out;
+    for (const auto& [raw_key, value] : opts) {
+        const auto key = raw_key.cast<std::string>();
+        if (key == "snapshot_id") {
+            out.snapshot_id = value.is_none() ? std::string() : value.cast<std::string>();
+        } else if (key == "labels") {
+            if (!value.is_none()) { out.labels = value.cast<std::map<std::string, std::string>>(); }
+        } else if (key == "retention_group") {
+            out.retention_group = value.is_none() ? std::string() : value.cast<std::string>();
+        } else if (key == "reclaimable") {
+            out.reclaimable = value.cast<bool>();
+        } else if (key == "seed") {
+            out.seed = value.cast<bool>();
+        } else if (key == "settings") {
+            out.settings_overrides_json =
+                value.is_none() ? std::string() : from_py(py::reinterpret_borrow<py::object>(value));
+        } else if (key == "now") {
+            out.now_iso = value.cast<std::string>();
+        } else if (key == "vector_backend") {
+            out.vector_backend = value.cast<std::string>();
+        } else if (key == "provider_endpoints") {
+            out.provider_endpoints =
+                provider_endpoints_in(py::reinterpret_borrow<py::object>(value));
+        } else {
+            throw gov::WorldStoreError("invalid_settings", "unknown fork option '" + key + "'");
+        }
+    }
+    return out;
+}
+
+py::dict fork_out(const gov::ForkResult& result) {
+    return py::dict("world"_a = record_out(result.world), "digest"_a = result.digest);
+}
+
 // 绑定层只做类型归一：Python 的 int（bool 不算）→ int64，放不下 int64 的按越界报。
 // 取值范围（interval_hours 0–8760、limit 1–1000）由 C++ 校验。类型不对与越界同一个码
 // invalid_auto_snapshot，路由只映射一个 400。
@@ -137,8 +180,25 @@ gov::AutoSnapshotConfig auto_config_in(const py::handle& on_session, const py::h
 void bind_15_world(pybind11::module_& m) {
     using namespace pybind11::literals;
 
-    // 与 bind_07/bind_14 同一写法；what() 形如 "world_exists: sim-1"。
-    py::register_exception<gov::WorldStoreError>(m, "WorldStoreError", PyExc_RuntimeError);
+    // Python 类型 WorldStoreError（基类 RuntimeError），str(exc) 即 what()，形如 "world_exists: sim-1"。自定义翻译器
+    // 只多做一件事：把 C++ 的 replaced()（rollback_world 替换库之后才失败，裁定 R31 M5、R32）放到异常对象的属性
+    // replaced 上。Python 侧自己构造的 WorldStoreError（引擎的 world_read_only）没有这个属性，读时按 False。
+    PYBIND11_CONSTINIT static py::gil_safe_call_once_and_store<py::object> world_store_error;
+    world_store_error.call_once_and_store_result([&m] {
+        return py::object(py::exception<gov::WorldStoreError>(m, "WorldStoreError", PyExc_RuntimeError));
+    });
+    // 签名由 pybind11 定死（ExceptionTranslator = void (*)(std::exception_ptr)），不能改成 const 引用。
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    py::register_exception_translator([](std::exception_ptr thrown) {
+        try {
+            if (thrown) { std::rethrow_exception(thrown); }
+        } catch (const gov::WorldStoreError& err) {
+            const py::object& type = world_store_error.get_stored();
+            const py::object instance = type(py::str(err.what()));
+            instance.attr("replaced") = py::bool_(err.replaced());
+            py::set_error(type, instance);
+        }
+    });
 
     // 取异常文本冒号前的部分，即 WorldStoreError 的 code。
     m.def("world_store_error_code", [](const py::object& exc) {
@@ -192,21 +252,24 @@ void bind_15_world(pybind11::module_& m) {
         // 新世界设置 = 默认世界当前设置 + overrides 的值拷贝（C++ create_world，一次持锁）。
         // provider_endpoints（裁定 R40、R51）：{provider 名: {"provider": 种类, "base_url": 地址}}。给出时 C++
         // 在同一次持锁内合并、核对继承来的 endpoint、再写；endpoint_changed 时什么都不写。None：不核对。
+        // seed=True（spec §6.2）：建空种子，蕴含只读、后台强制关（C++ create_world 的 WorldFlags）。
         .def("create",
              // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
              [](gov::RegistryDb& reg, const std::string& name, const std::string& label,
                 const std::map<std::string, std::string>& labels, const py::object& overrides,
-                const std::string& now_iso, const py::object& provider_endpoints) {
+                const std::string& now_iso, const py::object& provider_endpoints, bool seed) {
                  const auto overrides_text = overrides_in(overrides);
                  const auto endpoints = provider_endpoints_in(provider_endpoints);
                  gov::WorldRecord rec;
                  {
                      const py::gil_scoped_release release;
-                     rec = reg.create_world(name, label, labels, overrides_text, now_iso, endpoints);
+                     rec = reg.create_world(name, label, labels, overrides_text, now_iso, endpoints,
+                                            gov::WorldFlags{.seed = seed});
                  }
                  return record_out(rec);
              }, py::arg("name"), py::arg("label"), py::arg("labels"), py::arg("overrides"),
-             py::arg("now_iso"), py::arg("provider_endpoints") = py::none())
+             py::arg("now_iso"), py::arg("provider_endpoints") = py::none(), py::kw_only(),
+             py::arg("seed") = false)
         // 递归删世界目录可能很大，释放 GIL。
         .def("remove", [](gov::RegistryDb& reg, const std::string& name) {
             const py::gil_scoped_release release;
@@ -322,42 +385,62 @@ void bind_15_world(pybind11::module_& m) {
 
     // 一份（可能不完整的）设置 dict → C++ 补齐默认值后的完整设置 dict（settings_from_json →
     // settings_to_json）。默认值只在 C++：引擎池建引擎前用它得到实际生效的设置。非法输入同 settings_from_json。
-    m.def("world_effective_settings", [](const py::dict& settings) {
-        const auto text = from_py(settings);
+    // record（注册表记录 dict，只读 seed、read_only、reclaimable 三个键）给出时按看板的打开方式算（C++
+    // effective_world_settings，裁定 R33）：只读打开的世界后台全关。
+    m.def("world_effective_settings", [](const py::dict& settings, const py::object& record) {
+        gov::WorldRecord rec;
+        rec.settings_json = from_py(settings);
+        const bool by_open_mode = !record.is_none();
+        if (by_open_mode) {
+            const auto flags = py::reinterpret_borrow<py::dict>(record);
+            const auto flag = [&flags](const char* key) {
+                return flags.attr("get")(key, false).cast<bool>();
+            };
+            rec.seed = flag("seed");
+            rec.read_only = flag("read_only");
+            rec.reclaimable = flag("reclaimable");
+        }
         std::string normalized;
         {
             const py::gil_scoped_release release;
-            normalized = gov::settings_to_json(gov::settings_from_json(text));
+            normalized = gov::settings_to_json(by_open_mode
+                                                   ? gov::effective_world_settings(rec)
+                                                   : gov::settings_from_json(rec.settings_json));
         }
         return to_py(normalized);
-    }, py::arg("settings"));
+    }, py::arg("settings"), py::kw_only(), py::arg("record") = py::none());
 
     m.def("world_ingest_partition", &gov::ingest_partition, py::arg("is_default"),
           py::arg("tenant"), py::arg("dir_id"));
 
     // 只读打开，busy_timeout 最长 5 秒，所以释放 GIL。键名见 WorldStats（holders / last_write_at 是
     // 引擎池写统计缓存用的两项）。库文件存在但读不出时抛 snapshot_failed；只有文件不存在才是全 0。
+    // frozen 默认 False（Shared）；已登记世界传 world_read_only_frozen(record)（裁定 R36）。
     m.def("world_stats",
-          [](const std::string& db_path, const std::string& tenant) {
+          [](const std::string& db_path, const std::string& tenant, bool frozen) {
               gov::WorldStats stats;
               {
                   const py::gil_scoped_release release;
-                  stats = gov::world_stats(db_path, tenant);
+                  stats = gov::world_stats(db_path, tenant,
+                                           frozen ? starling::persistence::ReadOnlyFreeze::Frozen
+                                                  : starling::persistence::ReadOnlyFreeze::Shared);
               }
               return py::dict("db_bytes"_a = stats.db_bytes, "live_bytes"_a = stats.live_bytes,
                               "statements"_a = stats.statements, "engrams"_a = stats.engrams,
                               "world_time"_a = stats.world_time, "holders"_a = stats.holders,
                               "last_write_at"_a = stats.last_write_at);
-          }, py::arg("db_path"), py::arg("tenant"));
+          }, py::arg("db_path"), py::arg("tenant"), py::kw_only(), py::arg("frozen") = false);
 
     // 租户不变式（spec §2.1）：只读扫一遍库，有别的租户的行抛 world_tenant_mismatch。
     // 2.6GB 的生产库约 90ms，释放 GIL。库文件不存在时直接通过。
     m.def("world_verify_tenant",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const std::string& db_path, const std::string& tenant) {
+          [](const std::string& db_path, const std::string& tenant, bool frozen) {
               const py::gil_scoped_release release;
-              gov::verify_world_tenant(db_path, tenant);
-          }, py::arg("db_path"), py::arg("tenant"));
+              gov::verify_world_tenant(db_path, tenant,
+                                       frozen ? starling::persistence::ReadOnlyFreeze::Frozen
+                                              : starling::persistence::ReadOnlyFreeze::Shared);
+          }, py::arg("db_path"), py::arg("tenant"), py::kw_only(), py::arg("frozen") = false);
 
     // 快照会 VACUUM 整库，可能要几秒，期间释放 GIL。
     // take_snapshot 先清扫上次崩溃的残留、写快照文件、登记条目（失败时 C++ 自己删掉新文件），最后才
@@ -474,7 +557,8 @@ void bind_15_world(pybind11::module_& m) {
     // ---- 回滚与归档（W3） ----
     // 回滚不改注册表。世界 home 与归档目录由 C++ 从 RegistryDb 推出（不再传 registry_dir）。
     // C++ 的连接探测（world_in_use）只是纵深防御；进程内的安全由调用方保证。复制快照 +
-    // integrity_check 可能要几秒，释放 GIL。C++ 的测试钩子（free_space、before_replace）不暴露。
+    // integrity_check 可能要几秒，释放 GIL。C++ 的测试钩子 free_space、before_replace 不暴露；after_replace_for_test
+    // 经 world_rollback 的 _test_fail_after_replace 暴露（只能注入一次固定的失败）。
     // 回滚预检：world_rollback 第 1–4 步的只读检查（同顺序、同错误码），什么都不动。
     m.def("world_check_rollback",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
@@ -487,21 +571,30 @@ void bind_15_world(pybind11::module_& m) {
           }, py::arg("registry"), py::arg("world"), py::arg("snapshot_id"), py::kw_only(),
           py::arg("vector_backend") = "sqlite");
 
+    // 抛出的 WorldStoreError 带属性 replaced（bool）：True = 库已经换成快照的内容之后才失败（restore_digest_mismatch
+    // 恒为 True），调用方按「库已替换」处理；码不变。_test_fail_after_replace（仅测试用）：rename 之后、算摘要之前
+    // 抛 snapshot_failed，模拟「替换之后才失败」。
     m.def("world_rollback",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
           [](const gov::RegistryDb& reg, const std::string& world, const std::string& snapshot_id,
-             const std::string& vector_backend) {
+             const std::string& vector_backend, bool test_fail_after_replace) {
               gov::RollbackOptions opts;
               opts.vector_backend = vector_backend;
+              if (test_fail_after_replace) {
+                  opts.after_replace_for_test = [] {
+                      throw std::runtime_error("injected failure after the replace (test only)");
+                  };
+              }
               gov::RollbackResult result;
               {
                   const py::gil_scoped_release release;
                   result = gov::rollback_world(reg, world, snapshot_id, opts);
               }
               return py::dict("archive_path"_a = result.archive_path,
-                              "restored_bytes"_a = result.restored_bytes);
+                              "restored_bytes"_a = result.restored_bytes,
+                              "digest"_a = text_or_none(result.digest));
           }, py::arg("registry"), py::arg("world"), py::arg("snapshot_id"), py::kw_only(),
-          py::arg("vector_backend") = "sqlite");
+          py::arg("vector_backend") = "sqlite", py::arg("_test_fail_after_replace") = false);
 
     m.def("world_list_archives", [](const gov::RegistryDb& reg, const std::string& world) {
         std::vector<gov::ArchiveEntry> listed;
@@ -521,6 +614,91 @@ void bind_15_world(pybind11::module_& m) {
         const py::gil_scoped_release release;
         return gov::purge_rollback_archives(reg, world);
     }, py::arg("registry"), py::arg("world"));
+
+    // 打开方式（spec §6.4）：record 是注册表记录 dict（WorldRegistry.get / list 的一行），只读 seed、read_only、
+    // reclaimable 三个键（缺的键按 False）。规则在 C++ decide_open_mode。返回 "rw" | "ro"。
+    m.def("world_decide_open_mode",
+          [](const py::dict& record, bool for_client_write) {
+              const auto flag = [&record](const char* key) {
+                  const py::object val = record.attr("get")(key, false);
+                  return val.cast<bool>();
+              };
+              gov::WorldRecord rec;
+              rec.seed = flag("seed");
+              rec.read_only = flag("read_only");
+              rec.reclaimable = flag("reclaimable");
+              return gov::decide_open_mode(rec, for_client_write) == gov::OpenMode::ReadOnly ? "ro"
+                                                                                           : "rw";
+          }, py::arg("record"), py::arg("for_client_write") = false);
+
+    // 已登记世界的只读连接能不能冻结（裁定 R36，C++ read_only_freeze_for）：record 同 world_decide_open_mode。
+    // True 只在只读打开的世界（只读、种子、可回收）上；Python 把它传给 read_only_uri / open_read_only / world_stats 等的
+    // frozen，自己不判。
+    m.def("world_read_only_frozen",
+          [](const py::dict& record) {
+              const auto flag = [&record](const char* key) {
+                  return record.attr("get")(key, false).cast<bool>();
+              };
+              gov::WorldRecord rec;
+              rec.seed = flag("seed");
+              rec.read_only = flag("read_only");
+              rec.reclaimable = flag("reclaimable");
+              return gov::read_only_freeze_for(rec) == starling::persistence::ReadOnlyFreeze::Frozen;
+          }, py::arg("record"));
+
+    // ---- 分叉、种子与升级种子（spec §6.1、§6.2） ----
+    // 规则、校验与错误码全在 C++（world_store.hpp fork_world / upgrade_seed）。opts 见 fork_options_in。
+    // 复制、算摘要可能要几百毫秒，释放 GIL。返回 {"world": <记录 dict>, "digest": str}。
+    // 关着的世界或快照为来源。前提（裁定 R5）：调用方持着来源世界（WorldPool 的世界锁），分叉期间没有
+    // 写连接打开它。
+    m.def("world_fork",
+          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+          [](gov::RegistryDb& reg, const std::string& source, const std::string& new_name,
+             const py::dict& opts, int test_after_copy_sleep_ms) {
+              auto options = fork_options_in(opts);
+              if (test_after_copy_sleep_ms > 0) {
+                  // 仅测试用：复制完之后睡一会儿（GIL 已释放），造出确定的阻塞窗口。
+                  options.after_copy_for_test = [test_after_copy_sleep_ms](const std::filesystem::path&) {
+                      std::this_thread::sleep_for(std::chrono::milliseconds(test_after_copy_sleep_ms));
+                  };
+              }
+              gov::ForkResult result;
+              {
+                  const py::gil_scoped_release release;
+                  result = gov::fork_world(reg, source, new_name, options);
+              }
+              return fork_out(result);
+          }, py::arg("registry"), py::arg("source"), py::arg("new_name"), py::arg("opts"),
+          py::kw_only(), py::arg("_test_after_copy_sleep_ms") = 0);
+
+    // 开着的世界为来源：从它的引擎连接复制（读到最近一次提交）。opts 里不能有 snapshot_id（快照为来源用
+    // world_fork），否则 ValueError。复制途中来源有写入抛 world_busy（瞬态，重试）。
+    m.def("world_fork_from_connection",
+          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+          [](gov::RegistryDb& reg, starling::persistence::Connection& conn,
+             const std::string& source, const std::string& new_name, const py::dict& opts) {
+              const auto options = fork_options_in(opts);
+              gov::ForkResult result;
+              {
+                  const py::gil_scoped_release release;
+                  result = gov::fork_world_from_connection(reg, conn, source, new_name, options);
+              }
+              return fork_out(result);
+          }, py::arg("registry"), py::arg("connection"), py::arg("source"), py::arg("new_name"),
+          py::arg("opts"));
+
+    // 复制旧种子 → 副本上跑迁移 → 登记为新种子；旧种子原样保留。来源不是种子抛 world_not_seed。
+    m.def("world_upgrade_seed",
+          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+          [](gov::RegistryDb& reg, const std::string& source, const std::string& new_name,
+             const std::string& now_iso) {
+              gov::ForkResult result;
+              {
+                  const py::gil_scoped_release release;
+                  result = gov::upgrade_seed(reg, source, new_name, now_iso);
+              }
+              return fork_out(result);
+          }, py::arg("registry"), py::arg("source"), py::arg("new_name"), py::arg("now"));
 }
 
 }  // namespace starling::bindings

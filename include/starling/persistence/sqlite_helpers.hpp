@@ -11,15 +11,16 @@
 
 namespace starling::persistence::detail {
 
-// Build a SqliteError tagged with the connection's last extended error code
+// Throw a SqliteError tagged with the connection's last extended error code
 // + a context-specific prefix. Use after a sqlite3_prepare_v2 returns non-OK
-// or a sqlite3_step returns an unexpected code.
-[[nodiscard]] inline starling::persistence::SqliteError make_sqlite_error(
+// or a sqlite3_step returns an unexpected code. 每个调用点都写成 `throw make_sqlite_error(...)`：
+// 函数自己抛，所以 SQLITE_READONLY 抛出的是 ReadOnlyWriteRejected（裁定 R33），不会被 throw 表达式切成
+// SqliteError；声明的返回类型只为让这种写法照常编译，永远不会真的返回。
+[[noreturn]] inline starling::persistence::SqliteError make_sqlite_error(
     sqlite3* db, const char* what)
 {
-    return starling::persistence::SqliteError(
-        std::string(what) + ": " + sqlite3_errmsg(db),
-        sqlite3_extended_errcode(db));
+    starling::persistence::throw_sqlite_error(std::string(what) + ": " + sqlite3_errmsg(db),
+                                              sqlite3_extended_errcode(db));
 }
 
 // Bind a std::string_view as TEXT with explicit length. SQLITE_TRANSIENT
