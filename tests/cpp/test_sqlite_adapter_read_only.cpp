@@ -111,7 +111,101 @@ memoryops::RememberParams params(std::string_view text) {
     return out;
 }
 
+// 读撕裂场景（裁定 R36）：WAL 头的库，表 t 有 rows 行（每行带 200 字节填充，跨很多页），写连接关闭之后
+// 旁边没有 -wal / -shm（每个关着的可写世界都是这样）。
+constexpr int kTornRows = 5000;
+constexpr int kTornPrefix = 10;
+
+void make_torn_library(const fs::path& db) {
+    auto conn = Connection::open(db);   // WAL 模式
+    conn.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, pad TEXT NOT NULL)");
+    conn.exec("BEGIN");
+    {
+        Stmt ins(conn.raw(), "INSERT INTO t(id, pad) VALUES (?1, ?2)");
+        for (int row = 1; row <= kTornRows; ++row) {
+            ins.bind(row, std::string(200, 'x'));
+            ins.step_done();
+            sqlite3_reset(ins.raw());
+        }
+    }
+    conn.exec("COMMIT");
+    conn.close();
+}
+
+// 只读连接开着一条扫描（已经读了 kTornPrefix 行）时，另一条写连接删掉大部分行、提交、checkpoint(TRUNCATE)。
+// 返回扫描最终读到的总行数。写连接的 busy_timeout 设 0：只读连接持着读事务时 checkpoint 立刻回 busy，不等 5 秒。
+int scan_while_a_writer_deletes(Connection& reader, const fs::path& db) {
+    Stmt scan(reader.raw(), "SELECT id FROM t ORDER BY id");
+    int seen = 0;
+    while (seen < kTornPrefix && scan.step_row()) { ++seen; }
+    {
+        auto writer = Connection::open(db);
+        writer.exec("PRAGMA busy_timeout = 0");
+        writer.exec("DELETE FROM t WHERE id > " + std::to_string(kTornPrefix));
+        writer.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        writer.close();
+    }
+    while (scan.step_row()) { ++seen; }
+    return seen;
+}
+
 }  // namespace
+
+// 裁定 R36：默认（Shared）的只读连接是普通 mode=ro，持读事务，扫描途中别的连接删行、checkpoint 也撕不了它：
+// 读到的是开始扫描那一刻的全部 kTornRows 行。这是关着的可写世界在只持 build=False 租约的检视路径上的情形。
+TEST(SqliteAdapterReadOnly, SharedReaderIsNotTornByAWriterCheckpoint) {
+    const TempDir dir;
+    const fs::path db = dir.path() / "world.db";
+    make_torn_library(db);
+    ASSERT_TRUE(sidecars(db).empty());
+    auto reader = SqliteAdapter::open_read_only(db);
+    EXPECT_FALSE(reader->immutable());
+    EXPECT_EQ(scan_while_a_writer_deletes(reader->connection(), db), kTornRows);
+    reader->close();
+}
+
+// 同一场景用 Frozen 打开：URI 带 immutable=1（不断言扫描的结果：immutable 连接不加锁，结果取决于写入落在哪些页，
+// 不确定，可能报 malformed，也可能读到少于 kTornRows 行）。
+TEST(SqliteAdapterReadOnly, FrozenReaderOfAClosedWalLibraryIsImmutable) {
+    const TempDir dir;
+    const fs::path db = dir.path() / "world.db";
+    make_torn_library(db);
+    ASSERT_TRUE(sidecars(db).empty());
+    const auto uri = Connection::read_only_uri(db, ReadOnlyFreeze::Frozen);
+    EXPECT_TRUE(uri.immutable);
+    EXPECT_NE(uri.uri.find("immutable=1"), std::string::npos) << uri.uri;
+    auto reader = SqliteAdapter::open_read_only(db, ReadOnlyFreeze::Frozen);
+    EXPECT_TRUE(reader->immutable());
+    try {
+        (void)scan_while_a_writer_deletes(reader->connection(), db);
+    } catch (const SqliteError&) {   // 撕裂可能报成 malformed；这里不关心结果
+    }
+    reader->close();
+}
+
+// read_only_uri：默认（Shared）在 WAL 头、无旁车时也不带 immutable；Frozen 在同样条件下带上；旁车在时两者都不带。
+TEST(SqliteAdapterReadOnly, ReadOnlyUriFreezesOnlyWhenAsked) {
+    const TempDir dir;
+    const fs::path db = dir.path() / "world.db";
+    (void)make_library(db, /*schema_behind=*/false);
+    ASSERT_TRUE(sidecars(db).empty());
+    const auto shared = Connection::read_only_uri(db);
+    EXPECT_FALSE(shared.immutable);
+    EXPECT_EQ(shared.uri.find("immutable"), std::string::npos) << shared.uri;
+    EXPECT_NE(shared.uri.find("?mode=ro"), std::string::npos) << shared.uri;
+    EXPECT_EQ(Connection::read_only_uri(db, ReadOnlyFreeze::Shared).uri, shared.uri);
+    const auto frozen = Connection::read_only_uri(db, ReadOnlyFreeze::Frozen);
+    EXPECT_TRUE(frozen.immutable);
+    EXPECT_NE(frozen.uri.find("?mode=ro&immutable=1"), std::string::npos) << frozen.uri;
+    {
+        auto plain = SqliteAdapter::open_read_only(db);   // 默认 Shared
+        EXPECT_FALSE(plain->immutable());
+        plain->close();
+    }
+    auto writer = SqliteAdapter::open(db);   // 旁车在
+    EXPECT_FALSE(Connection::read_only_uri(db, ReadOnlyFreeze::Frozen).immutable);
+    writer->close();
+}
 
 TEST(SqliteAdapterReadOnly, OpenDoesNotMigrateOrChangeBytes) {
     const TempDir dir;
@@ -121,9 +215,10 @@ TEST(SqliteAdapterReadOnly, OpenDoesNotMigrateOrChangeBytes) {
     const auto sidecars_before = sidecars(db);
     const std::string sha_before = file_sha256(db);
 
-    auto reader = SqliteAdapter::open_read_only(db);
+    // Frozen（裁定 R36）：WAL 库头、无旁车 → immutable 分支，不在旁边建文件。
+    auto reader = SqliteAdapter::open_read_only(db, ReadOnlyFreeze::Frozen);
     EXPECT_TRUE(reader->read_only());
-    EXPECT_TRUE(reader->immutable());   // WAL 库头、无旁车 → immutable 分支
+    EXPECT_TRUE(reader->immutable());
     EXPECT_EQ(reader->schema_version(), behind);   // 打开没有补跑迁移
     EXPECT_LT(reader->schema_version(), MigrationRunner::latest_embedded_version());
     reader->close();
@@ -159,7 +254,7 @@ TEST(SqliteAdapterReadOnly, WritesAreRejected) {
     const auto sidecars_before = sidecars(db);
     const std::string sha_before = file_sha256(db);
 
-    auto reader = SqliteAdapter::open_read_only(db);
+    auto reader = SqliteAdapter::open_read_only(db, ReadOnlyFreeze::Frozen);   // 不建旁车，下面才能比
     EXPECT_FALSE(reader->write_admitted());
     // 装上一个放行的写门钩子(supervisor READY)也不能打开只读适配器的写入。
     reader->set_write_admit([] { return true; });

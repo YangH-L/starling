@@ -267,9 +267,9 @@ def test_routes_list_rows_do_not_open_any_database(tmp_path, monkeypatch):
     opened: list = []
     real_stats = _core.world_stats
 
-    def _spy(db_path, tenant):
+    def _spy(db_path, tenant, *, frozen=False):
         opened.append(tenant)
-        return real_stats(db_path, tenant)
+        return real_stats(db_path, tenant, frozen=frozen)
     monkeypatch.setattr(_core, "world_stats", _spy)
     rows = {w["name"]: w for w in client.get("/api/worlds").json()["worlds"]}
     assert opened == ["default"]                 # 只现读开着的默认世界；关着的世界一个库都没打开
@@ -923,14 +923,14 @@ def test_rollback_waits_for_an_in_flight_inspect_query(tmp_path, monkeypatch):
     real = queries.overview
     opened, release = threading.Event(), threading.Event()
 
-    def _blocked(db_path, tenant):
+    def _blocked(db_path, tenant, *, frozen=False):
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)   # 打开了，还没读
         try:
             opened.set()
             assert release.wait(10)
         finally:
             con.close()
-        return real(db_path, tenant)
+        return real(db_path, tenant, frozen=frozen)
     monkeypatch.setattr(queries, "overview", _blocked)
     results = []
     req = threading.Thread(target=lambda: results.append(client.get("/api/overview")),

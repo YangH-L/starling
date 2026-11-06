@@ -15,6 +15,7 @@
 
 #include "starling/governance/world_settings.hpp"
 #include "starling/governance/world_store.hpp"
+#include "starling/persistence/connection.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -50,6 +51,11 @@ enum class OpenMode : std::uint8_t { ReadWrite, ReadOnly };
 // 客户端为写入而打开（for_client_write=true，第 4 期的会话句柄用）：可回收世界正是 rise 写入的地方，
 // 只有 read_only → ReadOnly。第 4 期在这里加「被别的会话占用写入」一维。
 [[nodiscard]] OpenMode decide_open_mode(const WorldRecord& rec, bool for_client_write);
+
+// 已登记世界的只读连接能不能冻结（裁定 R36）：decide_open_mode(rec, false) 为 ReadOnly（只读世界、种子、可回收
+// 世界）时 Frozen，因为看板从不对它开写连接；其余（可写世界，不论此刻开没开着、持没持世界锁）一律 Shared。
+// Python 经 _core.world_read_only_frozen(record) 取这个判定，自己不算。
+[[nodiscard]] persistence::ReadOnlyFreeze read_only_freeze_for(const WorldRecord& rec);
 
 // 一个世界看板打开时实际生效的设置（裁定 R33，R22 M4）：settings_from_json(rec.settings_json) 补齐默认值；
 // decide_open_mode(rec, false) 为 ReadOnly（只读世界、种子、可回收世界）时 background 全关（与 merge_settings 的只读

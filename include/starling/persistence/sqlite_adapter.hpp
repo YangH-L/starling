@@ -21,12 +21,15 @@ class SqliteAdapter : public starling::Adapter {
 public:
     static std::unique_ptr<SqliteAdapter> open(const std::filesystem::path& db_path);
 
-    // 只读打开(spec §6.3):Connection::open_read_only,不跑迁移。write_admitted() 恒为
+    // 只读打开(spec §6.3):Connection::open_read_only(db_path, freeze),不跑迁移。write_admitted() 恒为
     // false,经 governance::require_write_admission 把守的写函数因此抛 WriteGateRejected;
-    // 绕过写门的 SQL 写由 mode=ro 连接拒绝(SqliteError)。close() 不做 checkpoint。
-    static std::unique_ptr<SqliteAdapter> open_read_only(const std::filesystem::path& db_path);
+    // 绕过写门的 SQL 写由 mode=ro 连接拒绝(ReadOnlyWriteRejected)。close() 不做 checkpoint。
+    // freeze 默认 Shared(裁定 R36):只有调用方能保证连接活着期间没有写连接时才传 Frozen。
+    static std::unique_ptr<SqliteAdapter> open_read_only(
+        const std::filesystem::path& db_path,
+        ReadOnlyFreeze freeze = ReadOnlyFreeze::Shared);
     [[nodiscard]] bool read_only() const noexcept { return read_only_; }
-    // 只读连接是否以 immutable=1 打开(Connection::open_read_only):true 时看不到之后
+    // 只读连接是否以 immutable=1 打开(只有 Frozen 才会,Connection::open_read_only):true 时看不到之后
     // 别的连接写入的内容。可写适配器恒为 false。
     [[nodiscard]] bool immutable() const noexcept { return conn_.immutable(); }
 

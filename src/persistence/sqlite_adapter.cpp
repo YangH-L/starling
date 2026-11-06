@@ -18,8 +18,8 @@ std::unique_ptr<SqliteAdapter> SqliteAdapter::open(
 }
 
 std::unique_ptr<SqliteAdapter> SqliteAdapter::open_read_only(
-        const std::filesystem::path& db_path) {
-    auto conn = Connection::open_read_only(db_path);
+        const std::filesystem::path& db_path, ReadOnlyFreeze freeze) {
+    auto conn = Connection::open_read_only(db_path, freeze);
     return std::unique_ptr<SqliteAdapter>(
         new SqliteAdapter(std::move(conn), db_path, /*read_only=*/true));
 }

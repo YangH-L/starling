@@ -46,11 +46,12 @@ bool sidecar_present(const std::filesystem::path& db_path, const char* suffix) {
 
 }  // namespace
 
-Connection::ReadOnlyUri Connection::read_only_uri(const std::filesystem::path& db_path) {
+Connection::ReadOnlyUri Connection::read_only_uri(const std::filesystem::path& db_path,
+                                                  ReadOnlyFreeze freeze) {
     // 旁车跟着真实文件走:符号链接旁边没有 -wal 不等于真实文件旁边没有。
     std::error_code resolve_err;
     const std::filesystem::path resolved = std::filesystem::canonical(db_path, resolve_err);
-    const bool frozen_wal = !resolve_err && header_is_wal(resolved) &&
+    const bool frozen_wal = freeze == ReadOnlyFreeze::Frozen && !resolve_err && header_is_wal(resolved) &&
                             !sidecar_present(resolved, "-wal") &&
                             !sidecar_present(resolved, "-shm");
     const std::filesystem::path& target = resolve_err ? db_path : resolved;
@@ -59,8 +60,8 @@ Connection::ReadOnlyUri Connection::read_only_uri(const std::filesystem::path& d
                        .immutable = frozen_wal,};
 }
 
-Connection Connection::open_read_only(const std::filesystem::path& db_path) {
-    const ReadOnlyUri target = read_only_uri(db_path);
+Connection Connection::open_read_only(const std::filesystem::path& db_path, ReadOnlyFreeze freeze) {
+    const ReadOnlyUri target = read_only_uri(db_path, freeze);
     sqlite3* raw = nullptr;
     const int code = sqlite3_open_v2(
         target.uri.c_str(), &raw, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_FULLMUTEX,

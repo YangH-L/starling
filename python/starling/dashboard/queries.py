@@ -1,6 +1,8 @@
 """Read-only SQLite inspection queries for the dashboard.
 
 Opens a fresh read-only connection per call (the C++ read-only URI + PRAGMA query_only).
+Every public query takes a keyword-only ``frozen`` flag (default False) that is passed to
+``_core.read_only_uri``; the inspect routes pass ``_core.world_read_only_frozen(record)`` (R36).
 List endpoints return rows as dicts keyed by cursor column names, so they are
 robust to schema column additions. The engine remains the single writer.
 """
@@ -16,10 +18,11 @@ from starling import _core
 
 
 @contextmanager
-def open_ro(db_path: str):
-    # 裁定 R28：URI 取自 C++（_core.read_only_uri，与 Connection::open_read_only 同一条规则）。WAL 头、旁边
-    # 没有 -wal/-shm 的库（种子、升级种子的产物）走 immutable=1，不在库旁边新建 -wal/-shm。
-    uri = _core.read_only_uri(str(db_path))
+def open_ro(db_path: str, frozen: bool = False):
+    # 裁定 R36：URI 取自 C++（_core.read_only_uri）。frozen 默认 False（普通 mode=ro，别的连接可以照常写，读事务
+    # 一致）。只读打开的世界（种子、只读、可回收）由调用方传 _core.world_read_only_frozen(record)=True：WAL 头、
+    # 旁边没有 -wal/-shm 时走 immutable=1，不在库旁边新建文件。
+    uri = _core.read_only_uri(str(db_path), frozen=frozen)
     conn = sqlite3.connect(uri, uri=True)
     try:
         conn.execute("PRAGMA query_only = ON")
@@ -45,8 +48,8 @@ def _count(conn, table: str, tenant: str | None) -> int:
         return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
-def overview(db_path: str, tenant: str) -> dict:
-    with open_ro(db_path) as conn:
+def overview(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
+    with open_ro(db_path, frozen) as conn:
         commit_states = _rows(
             conn,
             "SELECT state, COUNT(*) AS n FROM commitments WHERE tenant_id=? GROUP BY state",
@@ -74,7 +77,7 @@ def overview(db_path: str, tenant: str) -> dict:
 def statements(db_path: str, tenant: str, *, holder: str = "", perspective: str = "",
                predicate: str = "", review_status: str = "", consolidation_state: str = "",
                modality: str = "", belief_order: str = "", subject_kind: str = "",
-               limit: int = 100, offset: int = 0) -> dict:
+               limit: int = 100, offset: int = 0, frozen: bool = False) -> dict:
     where = ["tenant_id = ?"]
     params: list = [tenant]
     # review_status 过滤(片 6 审批队列复用本查询:筛 review_requested)。
@@ -115,7 +118,7 @@ def statements(db_path: str, tenant: str, *, holder: str = "", perspective: str 
         where.append("subject_kind = ?")
         params.append(subject_kind)
     clause = " AND ".join(where)
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         rows = _rows(
             conn,
             f"SELECT id, holder_id, holder_perspective, subject_id, predicate, "
@@ -134,9 +137,9 @@ def statements(db_path: str, tenant: str, *, holder: str = "", perspective: str 
         return {"rows": rows, "edges": edges}
 
 
-def statement_by_id(db_path: str, tenant: str, statement_id: str) -> dict | None:
+def statement_by_id(db_path: str, tenant: str, statement_id: str, *, frozen: bool = False) -> dict | None:
     """Single statement by id, tenant-scoped. None when absent or cross-tenant."""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         rows = _rows(
             conn,
             "SELECT id, holder_id, holder_perspective, subject_id, predicate, "
@@ -149,8 +152,8 @@ def statement_by_id(db_path: str, tenant: str, statement_id: str) -> dict | None
         return rows[0] if rows else None
 
 
-def cognizers(db_path: str, tenant: str) -> dict:
-    with open_ro(db_path) as conn:
+def cognizers(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
+    with open_ro(db_path, frozen) as conn:
         nodes = _rows(
             conn,
             "SELECT id, kind, canonical_name, last_seen_at FROM cognizers "
@@ -174,8 +177,8 @@ def cognizers(db_path: str, tenant: str) -> dict:
         return {"nodes": nodes, "relations": rels, "presence": presence}
 
 
-def commitments(db_path: str, tenant: str) -> dict:
-    with open_ro(db_path) as conn:
+def commitments(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
+    with open_ro(db_path, frozen) as conn:
         rows = _rows(
             conn,
             "SELECT c.stmt_id, c.state, c.broken_count, c.deadline, c.created_at, "
@@ -194,8 +197,8 @@ def commitments(db_path: str, tenant: str) -> dict:
         return {"rows": rows, "triggers": triggers}
 
 
-def replay(db_path: str, tenant: str) -> dict:
-    with open_ro(db_path) as conn:
+def replay(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
+    with open_ro(db_path, frozen) as conn:
         state = _rows(conn, "SELECT * FROM replay_scheduler_state WHERE id=1")
         ledger = _rows(
             conn,
@@ -214,8 +217,8 @@ def replay(db_path: str, tenant: str) -> dict:
         return {"scheduler": state[0] if state else {}, "ledger": ledger, "windows": windows}
 
 
-def conflicts(db_path: str, tenant: str) -> dict:
-    with open_ro(db_path) as conn:
+def conflicts(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
+    with open_ro(db_path, frozen) as conn:
         by_kind = _rows(
             conn,
             "SELECT edge_kind, COUNT(*) AS n FROM statement_edges WHERE tenant_id=? "
@@ -239,13 +242,13 @@ def conflicts(db_path: str, tenant: str) -> dict:
         return {"by_kind": {r["edge_kind"]: r["n"] for r in by_kind}, "conflicts": edges}
 
 
-def gists(db_path: str, tenant: str) -> dict:
+def gists(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
     """#38-C v2 observability: consolidation NORM gists (provenance=
     consolidation_abstract) — the LLM-judged, gated, consolidated norms — with
     their summary/confidence, derived_from lineage, and lifecycle state. Read-only
     检视; tenant-scoped. by_state counts every state (volatile = ungated/inert,
     consolidated = verified+promoted, archived = conflict/decayed, forgotten)."""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         by_state = _rows(
             conn,
             "SELECT consolidation_state, COUNT(*) AS n FROM statements "
@@ -269,11 +272,11 @@ def gists(db_path: str, tenant: str) -> dict:
                 "gists": rows}
 
 
-def gist_members(db_path: str, tenant: str, gist_id: str) -> dict:
+def gist_members(db_path: str, tenant: str, gist_id: str, *, frozen: bool = False) -> dict:
     """#38-C v2 obs: the source-cluster members a gist generalizes — the specific
     statements in its derived_from (lineage drill-down for /gists). Read-only,
     tenant-scoped; the gist's own derived_from ids are the trusted, internal keys."""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         row = conn.execute(
             "SELECT derived_from_json FROM statements "
             "WHERE id=? AND tenant_id=? AND provenance='consolidation_abstract'",
@@ -295,8 +298,8 @@ def gist_members(db_path: str, tenant: str, gist_id: str) -> dict:
         return {"gist_id": gist_id, "members": members}
 
 
-def queues(db_path: str, tenant: str) -> dict:
-    with open_ro(db_path) as conn:
+def queues(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
+    with open_ro(db_path, frozen) as conn:
         dispatch = _rows(
             conn,
             "SELECT dispatch_status, COUNT(*) AS n FROM bus_events WHERE tenant_id=? "
@@ -365,14 +368,14 @@ def _count_or_zero(conn, sql: str, params: tuple = ()) -> int:
         return 0
 
 
-def brain_map(db_path: str, tenant: str) -> dict:
+def brain_map(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
     """Phase 3 片 1 — 类脑 IA 落地页:9 脑区活体计数(经 plan-design-review 定稿)。
     每区一个只读计数(tenant-scoped,逐区 _count_or_zero 独立降级,缺表→0);
     dormant=True 标记尚未落地的区(片 3 落地后全 9 区皆 active);落地页静默显、
     导航空组不渲染。对话/配置/透视镜无「容量」语义 → count=None(不显计数徽标)。脑区句式与排序
     与 nav 一致:功能名 + 脑区 gloss,按记忆流(输入→快存→慢存→他者→意图→固化→
     内省→体征→配置)。consolidation_state 在 DB 存小写串。"""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         def n(sql: str, params: tuple = ()) -> int:
             return _count_or_zero(conn, sql, params)
         regions = [
@@ -544,13 +547,13 @@ def _engrams_for(conn, tenant: str, evidence) -> list[dict]:
     return out
 
 
-def provenance(db_path: str, tenant: str, statement_id: str, *, max_depth: int = 6) -> dict | None:
+def provenance(db_path: str, tenant: str, statement_id: str, *, max_depth: int = 6, frozen: bool = False) -> dict | None:
     """片 3 透视镜:某语句的来源取证树(只读检视)。open_ro = 物理只读(query_only),
     故保证不写 statement.recalled、不沉淀(片 3 验收的「不 emit / 不写」由构造满足)。
     递归解析 statements 的 JSON 列 derived_from / supersedes(**非 SQL join**),逐节点
     回溯 extraction_attempt + 证据 engram。返回 None 当根语句缺失/跨租户(路由→404)。
     有界:max_depth 截断 + seen 去重(共享父 / supersedes 环 → 标 repeat,不展开,不爆栈)。"""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         seen: set[str] = set()
 
         def build(sid: str, depth: int) -> dict:
@@ -600,7 +603,7 @@ def provenance(db_path: str, tenant: str, statement_id: str, *, max_depth: int =
 
 
 def cascade_preview(db_path: str, tenant: str, statement_id: str,
-                    *, max_depth: int = 6, max_nodes: int = 200) -> dict | None:
+                    *, max_depth: int = 6, max_nodes: int = 200, frozen: bool = False) -> dict | None:
     """片 6 级联预览:遗忘某语句前,预览会级联波及哪些「派生自它」的语句(只读检视)。
 
     与 provenance 反向——provenance 上溯祖先(我从何而来);这里下溯后代(谁派生自我):
@@ -612,7 +615,7 @@ def cascade_preview(db_path: str, tenant: str, statement_id: str,
     后代不会被自动级联删除;预览只是让用户看清「遗忘它,这 N 条派生记忆将成为孤儿派生
     (其 derived_from 指向一条已 forgotten 的源)」后再决定。级联删除是另一回事(核心写,
     另议),不在此。"""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         root, _ = _rows_or_empty(
             conn, "SELECT id FROM statements WHERE tenant_id=? AND id=?",
             (tenant, statement_id))
@@ -699,7 +702,7 @@ _ENGRAM_DETAIL_COLS = (
 
 def engrams_list(db_path: str, tenant: str, *, source_kind: str = "",
                  privacy_class: str = "", erased: str = "", q: str = "",
-                 limit: int = 100, offset: int = 0) -> dict:
+                 limit: int = 100, offset: int = 0, frozen: bool = False) -> dict:
     """T0a — 原始数据·证据浏览:engram(不可变原文证据)列表(只读派生查询,
     tenant-scoped)。engram 是记忆流最上游源头(先于海马/新皮层),此前无专属
     端点/页面,只能从某条 statement 反向溯源(provenance._engrams_for)时顺带
@@ -722,7 +725,7 @@ def engrams_list(db_path: str, tenant: str, *, source_kind: str = "",
         like = f"%{q}%"
         params.extend([like, like])
     clause = " AND ".join(where)
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         rows = _rows(
             conn,
             f"SELECT {_ENGRAM_LIST_COLS} FROM engrams WHERE {clause} "
@@ -735,7 +738,7 @@ def engrams_list(db_path: str, tenant: str, *, source_kind: str = "",
         return {"rows": rows, "total": total}
 
 
-def engram_detail(db_path: str, tenant: str, engram_id: str) -> dict | None:
+def engram_detail(db_path: str, tenant: str, engram_id: str, *, frozen: bool = False) -> dict | None:
     """T0a — 单条 engram 详情(只读派生查询,tenant-scoped)。payload 预览**复用
     _engrams_for/provenance 的同款隐私抑制规则**(_PROV_PREVIEW_CHARS +
     _PREVIEW_SUPPRESS_PRIVACY):只对 inline、未抹除、非受限 privacy_class 的
@@ -743,7 +746,7 @@ def engram_detail(db_path: str, tenant: str, engram_id: str) -> dict | None:
     空白)。同时反查引用它的 statements(evidence_json LIKE 该 id,best-effort、
     有界 limit 50)——让 refcount 可展开成「哪些 statement 引用了它」。
     跨租户/不存在 → None(路由转 404)。"""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         rows = _rows(
             conn,
             f"SELECT {_ENGRAM_DETAIL_COLS}, payload_inline FROM engrams "
@@ -782,12 +785,12 @@ def engram_detail(db_path: str, tenant: str, engram_id: str) -> dict | None:
                 "referencing_statements": referencing}
 
 
-def personae(db_path: str, tenant: str) -> dict:
+def personae(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
     """T0d-2 — 新皮层·画像(Persona):某租户的 persona 容器(只读派生查询,
     tenant-scoped)。数据源 containers WHERE kind='persona'(migrations/0001)。
     scope_descriptor 是 canonical JSON(此处原样带出,前端只读展示,绝不复算)。
     容器的内容/合并语义在 C++ 内核,dashboard 只列元数据快照。"""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         rows = _rows(
             conn,
             "SELECT id, holder_id, scope_descriptor, created_at, updated_at, version "
@@ -798,13 +801,13 @@ def personae(db_path: str, tenant: str) -> dict:
         return {"rows": rows}
 
 
-def common_ground(db_path: str, tenant: str) -> dict:
+def common_ground(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
     """T0d-2 — 新皮层·共识(CommonGround):某租户的 common_ground 行(只读派生查询,
     tenant-scoped)。数据源 common_ground 表(migrations/0010),五态 status。LEFT JOIN
     statements 带出被共识语句的 subject/predicate/object(JOIN 也带 tenant_id 约束,
     跨租户语句永不泄露;语句被遗忘/缺失 → 三列为 NULL,不崩)。by_status 给五态计数,
     供前端按状态分组概览。共识的推进/状态机在 C++,dashboard 只读快照。"""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         rows = _rows(
             conn,
             "SELECT cg.id, cg.statement_id, cg.status, cg.parties_json, "
@@ -824,7 +827,7 @@ def common_ground(db_path: str, tenant: str) -> dict:
         return {"rows": rows, "by_status": {r["status"]: r["n"] for r in by_status}}
 
 
-def search_statements(db_path: str, tenant: str, q: str, *, limit: int = 20) -> dict:
+def search_statements(db_path: str, tenant: str, q: str, *, limit: int = 20, frozen: bool = False) -> dict:
     """透视镜取镜:按文本找语句(只读 LIKE over subject/predicate/object_value,
     tenant-scoped,有界 LIMIT)。副作用自由(open_ro)——故意不用语义召回,绕开
     recalled 旁路争议(片 3 验收:不 emit statement.recalled)。空 query → 空结果。"""
@@ -832,7 +835,7 @@ def search_statements(db_path: str, tenant: str, q: str, *, limit: int = 20) -> 
     if not text:
         return {"rows": [], "query": ""}
     like = f"%{text}%"
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         rows = _rows(
             conn,
             "SELECT id, holder_id, subject_id, predicate, object_value, "
@@ -844,7 +847,7 @@ def search_statements(db_path: str, tenant: str, q: str, *, limit: int = 20) -> 
         return {"rows": rows, "query": text}
 
 
-def lifecycle(db_path: str, tenant: str) -> dict:
+def lifecycle(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
     """Phase 3 片 4 — 生命周期:记忆从 VOLATILE 经固化到 CONSOLIDATED,再 ARCHIVED/FORGOTTEN。
     两层只读派生(决策 F4=A,零 migration,不新增状态转移审计表):
       ① 当前占用 occupancy = statements 按 consolidation_state 分组(**精确快照**)。
@@ -852,7 +855,7 @@ def lifecycle(db_path: str, tenant: str) -> dict:
     遗忘无 typed 事件(forget 直接 UPDATE→forgotten),故 FORGOTTEN 量由占用快照给出
     (forgotten 是终态,快照即累计)。tenant-scoped。run_sleep/idle 未驱动 → consolidated
     事件偏少,前端据 events 诚实标注(非静默空白)。缺表逐项降级。"""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         occ_rows, _ = _rows_or_empty(
             conn,
             "SELECT consolidation_state AS state, COUNT(*) AS n FROM statements "
@@ -885,7 +888,7 @@ def _project_iso(last_accessed_iso: str, seconds: float):
 
 
 def forecast(db_path: str, tenant: str, *, now: str, limit: int = 200,
-             threshold: float = 0.05) -> dict:
+             threshold: float = 0.05, frozen: bool = False) -> dict:
     """Phase 3 片 5 — 衰减预报:把 C++ forgetting_curve 投影到候选语句,排「最快被遗忘」。
     **公式与其逆全在 C++**(compute_s_t / seconds_until_retrievability);这里只做只读
     候选装载 + 调绑定 + 排序(换绑定语言不需重写=守边界,绝不在 Python 复算公式)。
@@ -895,7 +898,7 @@ def forecast(db_path: str, tenant: str, *, now: str, limit: int = 200,
     不全表算。只取 VOLATILE/CONSOLIDATED(archived/forgotten 已终态)。threshold=0.05
     与 op_decay 归档阈值一致。tenant-scoped。"""
     from starling import _core
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         prot_rows, _ = _rows_or_empty(
             conn,
             "SELECT DISTINCT cp.protected_stmt_id AS sid FROM commitment_protection cp "
@@ -931,10 +934,10 @@ def forecast(db_path: str, tenant: str, *, now: str, limit: int = 200,
     return {"rows": out, "threshold": threshold, "now": now, "candidate_limit": limit}
 
 
-def vitals(db_path: str, tenant: str, *, now: str, list_limit: int = 50) -> dict:
+def vitals(db_path: str, tenant: str, *, now: str, list_limit: int = 50, frozen: bool = False) -> dict:
     """Phase 0 observability: per-subscriber outbox lag (global) + VOLATILE-stuck
     / extraction failures / overdue reconsolidation windows (tenant-scoped)."""
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         head_row = conn.execute(
             "SELECT MAX(outbox_sequence) AS head FROM bus_events").fetchone()
         head = head_row["head"] if head_row and head_row["head"] is not None else 0
@@ -1118,7 +1121,7 @@ def _pct(sorted_vals: list, q: float) -> int:
 _SUMMARY_LEN_BUCKETS = ("0-50", "50-100", "100-200", "200+")
 
 
-def metrics_gist_quality(db_path: str, tenant: str, since_iso: str, bucket_s: int) -> dict:
+def metrics_gist_quality(db_path: str, tenant: str, since_iso: str, bucket_s: int, *, frozen: bool = False) -> dict:
     """dogfood 子项 B(Task 3):gist 质量代理——funnel(candidates→abstracted)+
     confidence/member/summary 分布。
 
@@ -1142,7 +1145,7 @@ def metrics_gist_quality(db_path: str, tenant: str, since_iso: str, bucket_s: in
     迁移前的旧行为 NULL、无法归属——读取时「本租户 或 NULL」都算,与迁移前的口径一致。
     """
     since_dt = _parse_iso(since_iso)
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         led = _rows(conn, "SELECT ops_applied_json, started_at FROM replay_ledger "
                           "WHERE tenant_id=? OR tenant_id IS NULL ORDER BY started_at",
                     (tenant,))
@@ -1195,13 +1198,13 @@ def metrics_gist_quality(db_path: str, tenant: str, since_iso: str, bucket_s: in
                                 for k in _SUMMARY_LEN_BUCKETS if k in summ]}
 
 
-def metrics_latency(db_path: str, tenant: str, since_iso: str, bucket_s: int) -> dict:
+def metrics_latency(db_path: str, tenant: str, since_iso: str, bucket_s: int, *, frozen: bool = False) -> dict:
     """租户级抽取时延时间序列，通过所属 pipeline_run 解析 tenant。since 过滤按解析后的
     时间值比较(_parse_iso),不做字典序 SQL WHERE——created_at 由 C++ iso8601_utc()
     写入、恒整秒,本表暂不触发字典序边界 bug,但与 metrics_embed_depth 统一走同一条
     健壮路径,避免写入格式未来变化时静默重犯(见 _parse_iso docstring)。"""
     since_dt = _parse_iso(since_iso)
-    with open_ro(db_path) as conn:
+    with open_ro(db_path, frozen) as conn:
         rows = _rows(
             conn,
             "SELECT a.created_at, a.latency_ms, a.total_tokens "

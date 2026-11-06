@@ -331,7 +331,8 @@ class WorldPool:
             settings=_core.world_effective_settings(rec["settings"]),
             ingest_spool_dir=str(self._config.ingest_spool_root() / partition),
             is_default=is_default, vector_backend=backend, vector_store_path=store_path,
-            read_only=_core.world_decide_open_mode(rec) == "ro")
+            read_only=_core.world_decide_open_mode(rec) == "ro",
+            frozen=_core.world_read_only_frozen(rec))
 
     def _vector_store(self, world: str, is_default: bool | None = None) -> tuple[str, str]:
         """(向量后端, 路径)：默认世界取 config（裁定 R26），其余世界 ("sqlite", "")。快照、恢复、自动快照
@@ -446,7 +447,7 @@ class WorldPool:
         world_open_failed。默认世界（原地的 dashboard.db）早于世界管理，既有部署可按租户过滤地存多个租户，
         不核对（与旧的启动校验一致）。"""
         try:
-            _core.world_verify_tenant(ctx.db_path, ctx.tenant)
+            _core.world_verify_tenant(ctx.db_path, ctx.tenant, frozen=ctx.frozen)
         except _core.WorldStoreError as exc:
             code = "world_tenant_mismatch" if _store_code(exc) == "world_tenant_mismatch" \
                 else "world_open_failed"
@@ -607,7 +608,7 @@ class WorldPool:
         self._require_registry()
         with self.lease(world, build=False):
             ctx = self.context(world)
-            return _core.world_stats(ctx.db_path, ctx.tenant)
+            return _core.world_stats(ctx.db_path, ctx.tenant, frozen=ctx.frozen)
 
     def live_stats(self, world: str) -> dict | None:
         """开着的世界：{"holders", "statements", "last_write_at"}（C++ world_stats，持一份不建引擎的
@@ -623,7 +624,7 @@ class WorldPool:
                 return None
             db_path, tenant = engine._db_path, engine.tenant
             engine = None
-            stats = _core.world_stats(db_path, tenant)
+            stats = _core.world_stats(db_path, tenant, frozen=self._frozen(world))
         return {"holders": stats["holders"], "statements": stats["statements"],
                 "last_write_at": stats["last_write_at"]}
 
@@ -644,11 +645,13 @@ class WorldPool:
                 return behind
             if open_only:
                 return None
-            db_path = self.context(world).db_path
+            ctx = self.context(world)
+            db_path = ctx.db_path
             if not os.path.exists(db_path):
                 return None
             try:
-                adapter = _core.SqliteAdapter.open_read_only(db_path)
+                # 只持 build=False 租约，不持世界锁：可写世界随时可能被写，按记录选冻结（C++ 判，裁定 R36）。
+                adapter = _core.SqliteAdapter.open_read_only(db_path, frozen=ctx.frozen)
                 try:
                     return adapter.schema_behind               # 判定在 C++（裁定 R31 M5）
                 finally:
@@ -712,12 +715,19 @@ class WorldPool:
         if deb is not None and deb.timer is not None:
             deb.timer.cancel()
 
+    def _frozen(self, world: str) -> bool:
+        """这个世界的只读连接能不能冻结（C++ world_read_only_frozen，裁定 R36）。读不到记录时 False（普通 mode=ro）。"""
+        try:
+            return _core.world_read_only_frozen(self._record(world))
+        except Exception:  # noqa: BLE001 — 拿不准就不冻结
+            return False
+
     def _write_stats_cache(self, world: str, db_path: str, tenant: str) -> None:
         """把库里的当前计数写进注册表缓存列。失败只记日志（缓存过期无害，下次刷新再写）。"""
         if self._registry is None:
             return
         try:
-            stats = _core.world_stats(db_path, tenant)
+            stats = _core.world_stats(db_path, tenant, frozen=self._frozen(world))
             self._registry.update_stats(world, stats["holders"], stats["statements"],
                                         stats["last_write_at"], self._clock())
         except Exception:  # noqa: BLE001 — 统计缓存是尽力而为

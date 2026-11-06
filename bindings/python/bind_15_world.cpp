@@ -415,27 +415,32 @@ void bind_15_world(pybind11::module_& m) {
 
     // 只读打开，busy_timeout 最长 5 秒，所以释放 GIL。键名见 WorldStats（holders / last_write_at 是
     // 引擎池写统计缓存用的两项）。库文件存在但读不出时抛 snapshot_failed；只有文件不存在才是全 0。
+    // frozen 默认 False（Shared）；已登记世界传 world_read_only_frozen(record)（裁定 R36）。
     m.def("world_stats",
-          [](const std::string& db_path, const std::string& tenant) {
+          [](const std::string& db_path, const std::string& tenant, bool frozen) {
               gov::WorldStats stats;
               {
                   const py::gil_scoped_release release;
-                  stats = gov::world_stats(db_path, tenant);
+                  stats = gov::world_stats(db_path, tenant,
+                                           frozen ? starling::persistence::ReadOnlyFreeze::Frozen
+                                                  : starling::persistence::ReadOnlyFreeze::Shared);
               }
               return py::dict("db_bytes"_a = stats.db_bytes, "live_bytes"_a = stats.live_bytes,
                               "statements"_a = stats.statements, "engrams"_a = stats.engrams,
                               "world_time"_a = stats.world_time, "holders"_a = stats.holders,
                               "last_write_at"_a = stats.last_write_at);
-          }, py::arg("db_path"), py::arg("tenant"));
+          }, py::arg("db_path"), py::arg("tenant"), py::kw_only(), py::arg("frozen") = false);
 
     // 租户不变式（spec §2.1）：只读扫一遍库，有别的租户的行抛 world_tenant_mismatch。
     // 2.6GB 的生产库约 90ms，释放 GIL。库文件不存在时直接通过。
     m.def("world_verify_tenant",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [](const std::string& db_path, const std::string& tenant) {
+          [](const std::string& db_path, const std::string& tenant, bool frozen) {
               const py::gil_scoped_release release;
-              gov::verify_world_tenant(db_path, tenant);
-          }, py::arg("db_path"), py::arg("tenant"));
+              gov::verify_world_tenant(db_path, tenant,
+                                       frozen ? starling::persistence::ReadOnlyFreeze::Frozen
+                                              : starling::persistence::ReadOnlyFreeze::Shared);
+          }, py::arg("db_path"), py::arg("tenant"), py::kw_only(), py::arg("frozen") = false);
 
     // 快照会 VACUUM 整库，可能要几秒，期间释放 GIL。
     // take_snapshot 先清扫上次崩溃的残留、写快照文件、登记条目（失败时 C++ 自己删掉新文件），最后才
@@ -625,6 +630,21 @@ void bind_15_world(pybind11::module_& m) {
               return gov::decide_open_mode(rec, for_client_write) == gov::OpenMode::ReadOnly ? "ro"
                                                                                            : "rw";
           }, py::arg("record"), py::arg("for_client_write") = false);
+
+    // 已登记世界的只读连接能不能冻结（裁定 R36，C++ read_only_freeze_for）：record 同 world_decide_open_mode。
+    // True 只在只读打开的世界（只读、种子、可回收）上；Python 把它传给 read_only_uri / open_read_only / world_stats 等的
+    // frozen，自己不判。
+    m.def("world_read_only_frozen",
+          [](const py::dict& record) {
+              const auto flag = [&record](const char* key) {
+                  return record.attr("get")(key, false).cast<bool>();
+              };
+              gov::WorldRecord rec;
+              rec.seed = flag("seed");
+              rec.read_only = flag("read_only");
+              rec.reclaimable = flag("reclaimable");
+              return gov::read_only_freeze_for(rec) == starling::persistence::ReadOnlyFreeze::Frozen;
+          }, py::arg("record"));
 
     // ---- 分叉、种子与升级种子（spec §6.1、§6.2） ----
     // 规则、校验与错误码全在 C++（world_store.hpp fork_world / upgrade_seed）。opts 见 fork_options_in。

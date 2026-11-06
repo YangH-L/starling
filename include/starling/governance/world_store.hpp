@@ -26,7 +26,10 @@
 #include <string_view>
 #include <vector>
 
-namespace starling::persistence { class Connection; }
+namespace starling::persistence {
+class Connection;
+enum class ReadOnlyFreeze : std::uint8_t;
+}
 
 namespace starling::governance {
 
@@ -221,16 +224,21 @@ struct WorldStats {
     std::int64_t holders = 0;         // statements 里该租户的 COUNT(DISTINCT holder_id)
     std::string last_write_at;        // statements 里该租户的 MAX(created_at)；没有行时为空串
 };
-// 只读打开 db_path（mode=ro）。库文件不存在时返回全 0 的统计，不抛异常。
+// 只读打开 db_path（mode=ro；freeze 见 persistence::ReadOnlyFreeze，裁定 R36：调用方手里有记录时传
+// read_only_freeze_for(rec)，登记前的新目录传 Frozen，其余默认 Shared）。库文件不存在时返回全 0 的统计，不抛异常。
 // 表不存在时（库是空的、未迁移），对应计数为 0、last_write_at 为空串。
 // holders / last_write_at 是注册表统计缓存（registry_db.hpp update_stats）的来源，引擎池按世界调用。
 [[nodiscard]] WorldStats world_stats(const std::string& db_path, const std::string& tenant);
+[[nodiscard]] WorldStats world_stats(const std::string& db_path, const std::string& tenant,
+                                     persistence::ReadOnlyFreeze freeze);
 
 // 租户不变式（spec §2.1）：一个世界库里只允许有该世界自己的租户。只读打开 db_path，
 // 逐个检查带 tenant_id 列的表，发现 tenant_id 非空且不等于 tenant 的行就抛
 // world_tenant_mismatch（detail 点名第一张违规的表）。库文件不存在（新世界，首次激活）
-// 时直接通过。库读不出时抛 snapshot_failed（与 world_stats 同一约定）。
+// 时直接通过。库读不出时抛 snapshot_failed（与 world_stats 同一约定）。freeze 同 world_stats（裁定 R36）。
 void verify_world_tenant(const std::string& db_path, const std::string& tenant);
+void verify_world_tenant(const std::string& db_path, const std::string& tenant,
+                         persistence::ReadOnlyFreeze freeze);
 
 // 世界时刻水位：source_unit_meta 存在且有非空 observed_at 时取 MAX(observed_at)，
 // 否则取 engrams 的 MAX(created_at)，都没有则为空字符串。只读，按 tenant 过滤。

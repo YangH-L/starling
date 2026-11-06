@@ -30,6 +30,9 @@ async def _world_db(request: Request, world: str = Depends(world_name)):
     """所有 SQL 检视路由的依赖项：持 world 的一份不建引擎的租约覆盖整个请求，产出该世界的 WorldContext
     （路由只用它的 db_path 与 tenant）。上下文在拿到租约之后才读。
 
+    检视连接要不要冻结由 C++ 按记录判（ctx.frozen，裁定 R36）：只读打开的世界（种子、只读、可回收）才冻结；可写世界
+    只持这份 build=False 租约，同一世界上的写请求可以随时建引擎、写入、checkpoint，所以一律普通 mode=ro。
+
     建世界时 C++ 已建好库文件与 schema（裁定 R34），新世界检视起来是空的。库文件不在（登记之后被删掉等）
     的世界回 409 world_not_initialized，而不是让只读打开报 500；检视不替它建引擎、不建库（裁定 R21）。
 
@@ -89,11 +92,11 @@ def build_inspect_router(require_token) -> APIRouter:
 
     @router.get("/overview")
     async def overview(c=Depends(_world_db)):
-        return queries.overview(c.db_path, c.tenant)
+        return queries.overview(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/brain_map")
     async def brain_map(c=Depends(_world_db)):   # Phase 3 片 1 — 类脑 IA 落地页 9 脑区计数
-        return queries.brain_map(c.db_path, c.tenant)
+        return queries.brain_map(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/statements")
     async def statements(holder: str = "", perspective: str = "",
@@ -108,7 +111,7 @@ def build_inspect_router(require_token) -> APIRouter:
                                   modality=modality,
                                   belief_order=belief_order,
                                   subject_kind=subject_kind,
-                                  limit=limit, offset=offset)
+                                  limit=limit, offset=offset, frozen=c.frozen)
 
     @router.get("/engrams")
     async def engrams(source_kind: str = "", privacy_class: str = "",
@@ -117,13 +120,13 @@ def build_inspect_router(require_token) -> APIRouter:
         # T0a — 原始数据·证据浏览:engram(不可变原文证据)列表(只读派生查询)。
         return queries.engrams_list(c.db_path, c.tenant, source_kind=source_kind,
                                     privacy_class=privacy_class, erased=erased, q=q,
-                                    limit=limit, offset=offset)
+                                    limit=limit, offset=offset, frozen=c.frozen)
 
     @router.get("/engram/{engram_id}")
     async def engram(engram_id: str, c=Depends(_world_db)):
         # T0a — 单条 engram 详情:privacy-gated 预览(复用 provenance 同款抑制规则)+
         # 引用它的 statements 反查。
-        r = queries.engram_detail(c.db_path, c.tenant, engram_id)
+        r = queries.engram_detail(c.db_path, c.tenant, engram_id, frozen=c.frozen)
         if r is None:
             raise HTTPException(status_code=404, detail="engram not found")
         return r
@@ -131,52 +134,52 @@ def build_inspect_router(require_token) -> APIRouter:
     @router.get("/personae")
     async def personae(c=Depends(_world_db)):
         # T0d-2 — 新皮层·画像(Persona):containers WHERE kind='persona'(只读派生查询)。
-        return queries.personae(c.db_path, c.tenant)
+        return queries.personae(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/common_ground")
     async def common_ground(c=Depends(_world_db)):
         # T0d-2 — 新皮层·共识(CommonGround):common_ground 五态,LEFT JOIN 带语句文本
         #(只读派生查询)。
-        return queries.common_ground(c.db_path, c.tenant)
+        return queries.common_ground(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/cognizers")
     async def cognizers(c=Depends(_world_db)):
-        return queries.cognizers(c.db_path, c.tenant)
+        return queries.cognizers(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/commitments")
     async def commitments(c=Depends(_world_db)):
-        return queries.commitments(c.db_path, c.tenant)
+        return queries.commitments(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/replay")
     async def replay(c=Depends(_world_db)):
-        return queries.replay(c.db_path, c.tenant)
+        return queries.replay(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/lifecycle")
     async def lifecycle(c=Depends(_world_db)):   # Phase 3 片 4 — 生命周期(只读事件派生)
-        return queries.lifecycle(c.db_path, c.tenant)
+        return queries.lifecycle(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/forecast")
     async def forecast(limit: int = 200, c=Depends(_world_db)):
         # Phase 3 片 5 — 衰减预报:C++ forgetting_curve 只读投影(server now)。
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         return queries.forecast(c.db_path, c.tenant, now=now,
-                                limit=max(1, min(limit, 1000)))
+                                limit=max(1, min(limit, 1000)), frozen=c.frozen)
 
     @router.get("/conflicts")
     async def conflicts(c=Depends(_world_db)):
-        return queries.conflicts(c.db_path, c.tenant)
+        return queries.conflicts(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/gists")
     async def gists(c=Depends(_world_db)):   # #38-C v2 — consolidation NORM gists (read-only)
-        return queries.gists(c.db_path, c.tenant)
+        return queries.gists(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/gist_members/{gist_id}")
     async def gist_members(gist_id: str, c=Depends(_world_db)):   # #38-C v2 — gist lineage
-        return queries.gist_members(c.db_path, c.tenant, gist_id)
+        return queries.gist_members(c.db_path, c.tenant, gist_id, frozen=c.frozen)
 
     @router.get("/queues")
     async def queues(c=Depends(_world_db)):
-        return queries.queues(c.db_path, c.tenant)
+        return queries.queues(c.db_path, c.tenant, frozen=c.frozen)
 
     @router.get("/metrics/embed_depth")
     async def metrics_embed_depth(since: str = "", bucket: int = 3600, c=Depends(_world_db)):
@@ -190,7 +193,7 @@ def build_inspect_router(require_token) -> APIRouter:
     async def metrics_latency(since: str = "", bucket: int = 3600, c=Depends(_world_db)):
         # dogfood 子项 B(Task 2):抽取时延时间序列(p50/p95),派生 extraction_attempt。
         # bucket 钳制到 >=1,理由同 metrics_embed_depth。
-        return queries.metrics_latency(c.db_path, c.tenant, since or _default_since(), max(1, bucket))
+        return queries.metrics_latency(c.db_path, c.tenant, since or _default_since(), max(1, bucket), frozen=c.frozen)
 
     @router.get("/metrics/gist_quality")
     async def metrics_gist_quality(since: str = "", bucket: int = 3600, c=Depends(_world_db)):
@@ -198,7 +201,7 @@ def build_inspect_router(require_token) -> APIRouter:
         # gated/failed 未持久化不派生)+ confidence/member/summary 分布。bucket 钳制到
         # >=1,理由同 metrics_embed_depth(否则 _bucket 对 bucket_s 取模会除零 500)。
         return queries.metrics_gist_quality(c.db_path, c.tenant, since or _default_since(),
-                                            max(1, bucket))
+                                            max(1, bucket), frozen=c.frozen)
 
     @router.get("/vitals")
     async def vitals(limit: int = 50, c=Depends(_world_db)):
@@ -208,11 +211,11 @@ def build_inspect_router(require_token) -> APIRouter:
         # would be a latent boundary bug.
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         return queries.vitals(c.db_path, c.tenant, now=now,
-                              list_limit=max(1, min(limit, 500)))   # clamp(同 forecast/search 一致)
+                              list_limit=max(1, min(limit, 500)), frozen=c.frozen)   # clamp(同 forecast/search 一致)
 
     @router.get("/statement/{statement_id}")
     async def statement(statement_id: str, c=Depends(_world_db)):
-        row = queries.statement_by_id(c.db_path, c.tenant, statement_id)
+        row = queries.statement_by_id(c.db_path, c.tenant, statement_id, frozen=c.frozen)
         if row is None:
             raise HTTPException(status_code=404, detail="not_found")
         return row
@@ -221,13 +224,13 @@ def build_inspect_router(require_token) -> APIRouter:
     async def statement_search(q: str = "", limit: int = 20, c=Depends(_world_db)):
         # Phase 3 片 3 — 透视镜取镜:只读文本查找(副作用自由,不走语义召回)。
         return queries.search_statements(c.db_path, c.tenant, q,
-                                         limit=max(1, min(limit, 100)))
+                                         limit=max(1, min(limit, 100)), frozen=c.frozen)
 
     @router.get("/provenance/{statement_id}")
     async def provenance(statement_id: str, max_depth: int = 6, c=Depends(_world_db)):
         # Phase 3 片 3 — 透视镜:来源取证树(只读)。max_depth 钳制防递归滥用。
         tree = queries.provenance(c.db_path, c.tenant, statement_id,
-                                  max_depth=max(1, min(max_depth, 12)))
+                                  max_depth=max(1, min(max_depth, 12)), frozen=c.frozen)
         if tree is None:
             raise HTTPException(status_code=404, detail="not_found")
         return tree
@@ -238,7 +241,7 @@ def build_inspect_router(require_token) -> APIRouter:
         # 唯一会全表扫(反向派生边无索引)的检视路由 → 丢线程,避免大租户下阻塞事件循环。
         preview = await to_thread.run_sync(partial(
             queries.cascade_preview, c.db_path, c.tenant, statement_id,
-            max_depth=max(1, min(max_depth, 12))))
+            max_depth=max(1, min(max_depth, 12)), frozen=c.frozen))
         if preview is None:
             raise HTTPException(status_code=404, detail="not_found")
         return preview

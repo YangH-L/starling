@@ -289,6 +289,11 @@ TEST(WorldFork, UpgradeSeedMigratesCopyAndKeepsOld) {
     const std::string old_sha = file_sha256(old_seed.db_path);
 
     const ForkResult upgraded = upgrade_seed(reg, "seed-v1", "seed-v2", kNow);
+    // 迁移后的副本是一份文件：没有挂着的 -wal / -shm，也没有 partial。在本测试自己的只读辅助函数（默认 Shared，
+    // 裁定 R36）打开它之前查。
+    EXPECT_FALSE(fs::exists(upgraded.world.db_path + "-wal"));
+    EXPECT_FALSE(fs::exists(upgraded.world.db_path + "-shm"));
+    EXPECT_FALSE(fs::exists(upgraded.world.db_path + ".partial"));
     EXPECT_EQ(schema_of(upgraded.world.db_path),
               persistence::MigrationRunner::latest_embedded_version());
     EXPECT_EQ(upgraded.digest, digest_of(upgraded.world.db_path, upgraded.world.tenant));
@@ -313,10 +318,6 @@ TEST(WorldFork, UpgradeSeedMigratesCopyAndKeepsOld) {
         EXPECT_EQ(found, (std::map<std::string, std::string>{
                              {"st-0", "object-0"}, {"st-1", "object-1"}, {"st-2", "object-2"}}));
     }
-    // 迁移后的副本是一份文件：没有挂着的 -wal / -shm，也没有 partial。
-    EXPECT_FALSE(fs::exists(upgraded.world.db_path + "-wal"));
-    EXPECT_FALSE(fs::exists(upgraded.world.db_path + "-shm"));
-    EXPECT_FALSE(fs::exists(upgraded.world.db_path + ".partial"));
     // 旧种子原样保留。
     EXPECT_EQ(file_sha256(old_seed.db_path), old_sha);
     EXPECT_TRUE(reg.get("seed-v1").seed);
@@ -456,30 +457,71 @@ int read_version_byte(const fs::path& db_file) {
 
 }  // namespace
 
-// 裁定 R28（审查 I1）：create_world 建的库是 WAL 头，写连接正常关闭后旁边没有 -wal / -shm。world_store 里
-// 每条只读打开都走 Connection::open_read_only 的同一条规则（这种库用 immutable=1），不在库旁边新建文件。
-TEST(WorldReadOnlyOpen, WalHeaderLibraryWithoutSidecarsGrowsNoFiles) {
+// 裁定 R36（取代 R28 的「唯一规则」）：只读连接要不要冻结由调用方显式选。C++ 里按记录选的路径（list_sessions、
+// take_snapshot、fork_world 的来源）对种子（decide_open_mode 为 ReadOnly）用 Frozen：WAL 头、旁边没有 -wal/-shm 的
+// 库不长出旁车；world_stats / verify_world_tenant 由调用方传 read_only_freeze_for(rec)。
+TEST(WorldReadOnlyOpen, SeedWithoutSidecarsGrowsNoFiles) {
+    const TempDir tmp;
+    auto reg = open_registry(tmp);
+    (void)world_with_statements(reg, "deploy-1", 2);
+    ForkOptions as_seed = fork_opts();
+    as_seed.seed = true;
+    (void)fork_world(reg, "deploy-1", "seed-1", as_seed);
+    const WorldRecord seed = reg.get("seed-1");
+    {   // fork 的 partial 是 VACUUM INTO 的产物（rollback 日志头）；经写路径打开一次，库头变成 WAL、旁车随关闭删掉。
+        auto writer = persistence::SqliteAdapter::open(seed.db_path);
+        writer->close();
+    }
+    ASSERT_EQ(read_version_byte(seed.db_path), 2);
+    ASSERT_FALSE(fs::exists(seed.db_path + "-wal"));
+    ASSERT_FALSE(fs::exists(seed.db_path + "-shm"));
+    ASSERT_EQ(read_only_freeze_for(seed), persistence::ReadOnlyFreeze::Frozen);
+    const auto before = home_entries(seed.db_path);
+    const std::string sha = file_sha256(seed.db_path);
+
+    EXPECT_EQ(world_stats(seed.db_path, seed.tenant, read_only_freeze_for(seed)).statements, 2);
+    EXPECT_EQ(home_entries(seed.db_path), before) << "world_stats";
+    verify_world_tenant(seed.db_path, seed.tenant, read_only_freeze_for(seed));
+    EXPECT_EQ(home_entries(seed.db_path), before) << "verify_world_tenant";
+    (void)list_sessions(reg, "seed-1", 10);
+    EXPECT_EQ(home_entries(seed.db_path), before) << "list_sessions";
+    (void)take_snapshot(reg, "seed-1", SnapshotOptions{});
+    EXPECT_EQ(home_entries(seed.db_path), before) << "take_snapshot";
+    (void)fork_world(reg, "seed-1", "rollout-1", fork_opts());
+    EXPECT_EQ(home_entries(seed.db_path), before) << "fork_world";
+    EXPECT_EQ(file_sha256(seed.db_path), sha);
+}
+
+// 裁定 R36：可写世界（关着、WAL 头、没有旁车，每个关着的用户世界都是这样）的只读连接一律 Shared：普通 mode=ro 会
+// 在旁边建 -wal / -shm，可观察到没有冻结。按记录选的 C++ 路径（list_sessions）与默认的 world_stats 都是这样。
+TEST(WorldReadOnlyOpen, WritableWorldIsNeverFrozen) {
     const TempDir tmp;
     auto reg = open_registry(tmp);
     const WorldRecord src = world_with_statements(reg, "deploy-1", 2);
     ASSERT_EQ(read_version_byte(src.db_path), 2);
-    ASSERT_FALSE(fs::exists(src.db_path + "-wal"));
     ASSERT_FALSE(fs::exists(src.db_path + "-shm"));
-    const auto before = home_entries(src.db_path);
-    const std::string sha = file_sha256(src.db_path);
-
-    EXPECT_EQ(world_stats(src.db_path, src.tenant).statements, 2);
-    EXPECT_EQ(home_entries(src.db_path), before) << "world_stats";
-    verify_world_tenant(src.db_path, src.tenant);
-    EXPECT_EQ(home_entries(src.db_path), before) << "verify_world_tenant";
-    (void)snapshot_world_time(src.db_path, src.tenant);
+    EXPECT_EQ(read_only_freeze_for(src), persistence::ReadOnlyFreeze::Shared);
     (void)list_sessions(reg, "deploy-1", 10);
-    EXPECT_EQ(home_entries(src.db_path), before) << "snapshot_world_time / list_sessions";
-    (void)take_snapshot(reg, "deploy-1", SnapshotOptions{});
-    EXPECT_EQ(home_entries(src.db_path), before) << "take_snapshot";
-    (void)fork_world(reg, "deploy-1", "rollout-1", fork_opts());
-    EXPECT_EQ(home_entries(src.db_path), before) << "fork_world";
-    EXPECT_EQ(file_sha256(src.db_path), sha);
+    EXPECT_TRUE(fs::exists(src.db_path + "-shm")) << "list_sessions opened a writable world frozen";
+    fs::remove(src.db_path + "-shm");
+    fs::remove(src.db_path + "-wal");
+    EXPECT_EQ(world_stats(src.db_path, src.tenant).statements, 2);
+    EXPECT_TRUE(fs::exists(src.db_path + "-shm")) << "world_stats defaulted to frozen";
+}
+
+// read_only_freeze_for：decide_open_mode(rec, false) 为 ReadOnly 才 Frozen。
+TEST(WorldReadOnlyOpen, FreezeForRecordFollowsTheOpenMode) {
+    WorldRecord plain;
+    EXPECT_EQ(read_only_freeze_for(plain), persistence::ReadOnlyFreeze::Shared);
+    WorldRecord read_only;
+    read_only.read_only = true;
+    EXPECT_EQ(read_only_freeze_for(read_only), persistence::ReadOnlyFreeze::Frozen);
+    WorldRecord seed;
+    seed.seed = true;
+    EXPECT_EQ(read_only_freeze_for(seed), persistence::ReadOnlyFreeze::Frozen);
+    WorldRecord reclaimable;
+    reclaimable.reclaimable = true;
+    EXPECT_EQ(read_only_freeze_for(reclaimable), persistence::ReadOnlyFreeze::Frozen);
 }
 
 // 裁定 R29（审查 I2）：分叉用 VACUUM INTO 复制整个文件，摘要只比来源租户。来源库里有别的租户的行时，

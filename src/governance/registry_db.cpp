@@ -356,6 +356,11 @@ OpenMode decide_open_mode(const WorldRecord& rec, bool for_client_write) {
     return OpenMode::ReadWrite;
 }
 
+pst::ReadOnlyFreeze read_only_freeze_for(const WorldRecord& rec) {
+    return decide_open_mode(rec, false) == OpenMode::ReadOnly ? pst::ReadOnlyFreeze::Frozen
+                                                              : pst::ReadOnlyFreeze::Shared;
+}
+
 WorldSettings effective_world_settings(const WorldRecord& rec) {
     const bool read_only_open = decide_open_mode(rec, false) == OpenMode::ReadOnly;
     return merge_settings(settings_from_json(rec.settings_json), "{}", read_only_open);
@@ -536,7 +541,9 @@ WorldRecord RegistryDb::create_populated(
     try {
         populate(home / "world.db");   // 不持锁：复制可能要几百毫秒
         // 统计缓存在写好的库上算（裁定 R22 M6）：与关闭时 update_stats 写的同一组值，同样不持锁。
-        const WorldStats stats = world_stats((home / "world.db").string(), spec.tenant);
+        // 登记之前的新世界目录只有这次操作知道（裁定 R36）：冻结打开，不在旁边留旁车。
+        const WorldStats stats = world_stats((home / "world.db").string(), spec.tenant,
+                                             pst::ReadOnlyFreeze::Frozen);
         spec.holders = stats.holders;
         spec.statements = stats.statements;
         spec.last_write_at = stats.last_write_at;

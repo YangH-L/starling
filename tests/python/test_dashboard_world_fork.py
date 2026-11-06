@@ -332,6 +332,46 @@ def test_empty_seed_from_registry_create_inspect_leaves_no_sidecars(client):
     assert rows == [] and results == []
 
 
+def test_closed_writable_world_inspect_is_not_frozen(client, monkeypatch):
+    """裁定 R36（N1）：关着的可写世界（create_world 建的，WAL 头、旁边没有 -wal/-shm）只持 build=False 租约检视时，
+    同一世界上的写请求可以随时出现，所以检视连接一律普通 mode=ro：C++ 收到的 frozen 是 False，URI 不带 immutable，
+    检视之后旁边出现 -shm（普通只读连接打开 WAL 头库的正常行为）。"""
+    pool = _pool(client)
+    pool.create_world("w1", "")
+    db = pool.record("w1")["db_path"]
+    assert _wal_header(db) and not os.path.exists(db + "-shm")
+    assert "w1" not in pool.open_worlds()
+    seen: list = []
+    real_uri = _core.read_only_uri
+
+    def _spy(path, frozen=False):
+        seen.append(frozen)
+        return real_uri(path, frozen=frozen)
+    monkeypatch.setattr(_core, "read_only_uri", _spy)
+    resp = client.get("/api/w/w1/statements")
+    assert resp.status_code == 200, resp.text
+    assert seen == [False]
+    assert "immutable" not in real_uri(db, frozen=False)
+    assert os.path.exists(db + "-shm")
+    # 对照：种子（只读打开）的检视冻结。
+    _source_with_content(client)
+    _fork(client, "src", "seed-1", seed=True)
+    seen.clear()
+    assert client.get("/api/w/seed-1/statements").status_code == 200
+    assert seen == [True]
+
+
+@pytest.mark.parametrize("flags,frozen", [
+    ({}, False), ({"read_only": True}, True), ({"seed": True}, True),
+    ({"reclaimable": True}, True)])
+def test_world_read_only_frozen_follows_the_cpp_open_mode(flags, frozen):
+    """裁定 R36：冻结判定在 C++（read_only_freeze_for），与 world_decide_open_mode 一致；缺的键按 False。"""
+    record = {"seed": False, "read_only": False, "reclaimable": False, **flags}
+    assert _core.world_read_only_frozen(record) is frozen
+    assert (_core.world_decide_open_mode(record) == "ro") is frozen
+    assert _core.world_read_only_frozen(flags) is frozen
+
+
 @pytest.mark.parametrize("kind", ["reclaimable", "seed"])
 def test_write_to_read_only_world_is_409_world_read_only(client, kind):
     _source_with_content(client)
@@ -480,9 +520,9 @@ def test_schema_behind_world_opens_and_is_flagged(client, monkeypatch):
     opened: list = []
     real_open = _core.SqliteAdapter.open_read_only
 
-    def _spy(path):
+    def _spy(path, frozen=False):
         opened.append(path)
-        return real_open(path)
+        return real_open(path, frozen=frozen)
     monkeypatch.setattr(_core.SqliteAdapter, "open_read_only", staticmethod(_spy))
     assert _rows(client)["old-1"]["schema_behind"] is None and opened == []
     assert client.get("/api/worlds/old-1").json()["schema_behind"] is True

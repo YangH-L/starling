@@ -58,17 +58,21 @@ void bind_02_persistence(pybind11::module_& m) {
         .def_static("open", [](const std::string& path) {
             return starling::persistence::SqliteAdapter::open(path);
         }, py::arg("db_path"))
-        .def_static("open_read_only", [](const std::string& path) {
-            return starling::persistence::SqliteAdapter::open_read_only(path);
-        }, py::arg("db_path"), py::call_guard<py::gil_scoped_release>(),
+        .def_static("open_read_only", [](const std::string& path, bool frozen) {
+            return starling::persistence::SqliteAdapter::open_read_only(
+                path, frozen ? starling::persistence::ReadOnlyFreeze::Frozen
+                             : starling::persistence::ReadOnlyFreeze::Shared);
+        }, py::arg("db_path"), py::arg("frozen") = false, py::call_guard<py::gil_scoped_release>(),
            "Open an existing database read-only (mode=ro): no migrations, no "
-           "journal_mode change, no directories. write_admitted() is always False.")
+           "journal_mode change, no directories. write_admitted() is always False. "
+           "frozen=True allows immutable=1 for a WAL-header file with no -wal/-shm (R36); "
+           "pass it only when no writer can open the file while this adapter lives.")
         .def_property_readonly("read_only",
              &starling::persistence::SqliteAdapter::read_only)
         .def_property_readonly("immutable",
              &starling::persistence::SqliteAdapter::immutable,
              "True when the read-only connection was opened with immutable=1 "
-             "(WAL-mode library with no -wal/-shm): it does not see later writes.")
+             "(frozen=True on a WAL-mode library with no -wal/-shm): it does not see later writes.")
         .def("schema_version",
              &starling::persistence::SqliteAdapter::schema_version,
              py::call_guard<py::gil_scoped_release>(),
@@ -119,16 +123,20 @@ void bind_02_persistence(pybind11::module_& m) {
              &starling::persistence::SqliteAdapter::connection,
              py::return_value_policy::reference_internal);
 
-    // 裁定 R28：只读打开世界库的唯一规则（Connection::read_only_uri）。看板的检视连接（queries.open_ro）用
-    // sqlite3.connect(uri, uri=True) 打开这个 URI，与 C++ 的只读打开同一条 immutable 判定。
+    // 裁定 R36：只读打开的 URI（Connection::read_only_uri）。看板的检视连接（queries.open_ro）用
+    // sqlite3.connect(uri, uri=True) 打开它，与 C++ 的只读打开同一个 URI。frozen 默认 False（Shared，普通 mode=ro）；
+    // 已登记世界传 world_read_only_frozen(record)，Python 不自己判。
     m.def("read_only_uri",
-          [](const std::string& path) {
-              return starling::persistence::Connection::read_only_uri(path).uri;
+          [](const std::string& path, bool frozen) {
+              return starling::persistence::Connection::read_only_uri(
+                         path, frozen ? starling::persistence::ReadOnlyFreeze::Frozen
+                                      : starling::persistence::ReadOnlyFreeze::Shared)
+                  .uri;
           },
-          py::arg("path"),
+          py::arg("path"), py::arg("frozen") = false,
           "The URI C++ passes to sqlite3_open_v2 for a read-only open of path: "
-          "file:<resolved path>?mode=ro, plus &immutable=1 for a WAL-header file "
-          "with no -wal/-shm beside it.");
+          "file:<resolved path>?mode=ro. With frozen=True, &immutable=1 is added for a "
+          "WAL-header file with no -wal/-shm beside it (R36).");
 
     // 只读连接上的写语句（裁定 R33）：Python 的 RuntimeError 子类，看板只读引擎按类型报 world_read_only。
     py::register_exception<starling::persistence::ReadOnlyWriteRejected>(m, "ReadOnlyWriteRejected",

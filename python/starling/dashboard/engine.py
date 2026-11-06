@@ -62,7 +62,10 @@ class WorldContext:
     一律 sqlite、没有路径。
 
     read_only（spec §6.3、§6.4）：C++ world_decide_open_mode 判为 "ro" 的世界（只读世界、种子、可回收世界）。
-    引擎只读打开库（不跑迁移、不改日志模式），不起后台线程，写入类方法一律 world_read_only。"""
+    引擎只读打开库（不跑迁移、不改日志模式），不起后台线程，写入类方法一律 world_read_only。
+
+    frozen（裁定 R36）：C++ world_read_only_frozen 的判定，这个世界的只读连接能不能冻结（immutable=1）。只在
+    只读打开的世界上为 True；检视连接（queries）、统计、租户核对、只读引擎都把它传给 C++，Python 不自己判。"""
     name: str
     dir_id: str
     db_path: str
@@ -74,6 +77,7 @@ class WorldContext:
     vector_backend: str = "sqlite"
     vector_store_path: str = ""
     read_only: bool = False
+    frozen: bool = False
 
     @classmethod
     def from_config(cls, config) -> "WorldContext":
@@ -343,9 +347,11 @@ class DashboardEngine:
         # schema_behind，不必再碰这条连接。
         self.read_only = bool(ctx.read_only)
         self.schema_behind = False
-        build = (_runtime._build_read_only_sqlite_runtime if self.read_only
-                 else _runtime._build_local_store_sqlite_runtime)
-        rt = build(Path(ctx.db_path))
+        if self.read_only:
+            # 冻结与否由调用方按记录给（WorldContext.frozen，C++ 判，裁定 R36）。
+            rt = _runtime._build_read_only_sqlite_runtime(Path(ctx.db_path), frozen=bool(ctx.frozen))
+        else:
+            rt = _runtime._build_local_store_sqlite_runtime(Path(ctx.db_path))
         try:
             self.schema_behind = rt.adapter.schema_behind     # 判定在 C++（裁定 R31 M5）
             rt.start()
