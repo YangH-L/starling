@@ -57,6 +57,13 @@ RememberOutcome source_missing_outcome(const RememberParams& params) {
 
 }  // namespace
 
+std::string engram_source_item_id(std::string_view source_prefix,
+                                  std::span<const std::uint8_t> payload) {
+    return std::string(source_prefix) + crypto::sha256_hex(std::string_view(
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        reinterpret_cast<const char*>(payload.data()), payload.size())).substr(0, 16);
+}
+
 RememberPrepared remember_prepare(persistence::SqliteAdapter& adapter,
                                   const RememberParams& params) {
     governance::require_write_admission(adapter);   // 门前抛 = 零 DB 写
@@ -66,9 +73,8 @@ RememberPrepared remember_prepare(persistence::SqliteAdapter& adapter,
     engram_input.source.adapter_version = "1";
     // 内容确定性幂等键:sha256(payload) 前 16 hex。绝不能用进程内随机化的
     // hash()(历史 bug:跨进程同文本不去重/碰撞静默丢记忆)。
-    engram_input.source.source_item_id = params.source_prefix + crypto::sha256_hex(std::string_view(
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        reinterpret_cast<const char*>(params.payload.data()), params.payload.size())).substr(0, 16);
+    engram_input.source.source_item_id =
+        engram_source_item_id(params.source_prefix, params.payload);
     engram_input.source.source_version = "1";
     engram_input.source.chunk_index    = 0;
     engram_input.source_kind     = schema::SourceKind::USER_INPUT;

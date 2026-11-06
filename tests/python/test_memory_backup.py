@@ -51,10 +51,11 @@ def test_backup_refuses_existing_destination(tmp_path):
 
 
 def _downgrade_to_0037(path):
-    # 造一份"0038 之前的 Starling 写下的库":去掉新表与它的迁移记录。
+    # 造一份"0038 之前的 Starling 写下的库":去掉 events 表与 0038 起的全部迁移记录
+    # (0039 重建的也是 events,只删 38 会让表形与迁移记录对不上)。
     with sqlite3.connect(str(path)) as c:
         c.execute("DROP TABLE events")
-        c.execute("DELETE FROM schema_migrations WHERE version = 38")
+        c.execute("DELETE FROM schema_migrations WHERE version >= 38")
 
 
 def test_old_schema_library_backup_opens_with_new_version(tmp_path):
@@ -64,7 +65,7 @@ def test_old_schema_library_backup_opens_with_new_version(tmp_path):
     _downgrade_to_0037(tmp_path / "old.db")
     with sqlite3.connect(str(tmp_path / "old.db")) as c:      # 旧版本自己做的副本
         c.execute(f"VACUUM INTO '{tmp_path / 'old-copy.db'}'")
-    reopened = _db(tmp_path, "old.db")                       # 新版本打开原库,自动迁到 0038
+    reopened = _db(tmp_path, "old.db")                       # 新版本打开原库,自动迁到最新(0039)
     reopened.backup_to(tmp_path / "new-copy.db")
     for name in ("old-copy.db", "new-copy.db"):
         m = _db(tmp_path, name)

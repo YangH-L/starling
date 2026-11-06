@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,6 +30,11 @@
 #include "starling/runtime_health.hpp"
 
 namespace starling::memoryops {
+
+/// engram 的来源身份(source_item_id):source_prefix + sha256(payload) 前 16 hex。
+/// remember_prepare 写 engram 与 memory_events 的补齐分支找回 engram 共用这一处公式。
+std::string engram_source_item_id(std::string_view source_prefix,
+                                  std::span<const std::uint8_t> payload);
 
 struct RememberParams {
     std::string tenant_id;

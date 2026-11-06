@@ -166,12 +166,14 @@ class TickStats:
 class PendingEvent:
     """One `events` row still in state 'pending': a keyed write that was recorded
     but not yet committed. `seq` is the per-tenant sequence number (starts at 0);
-    `failure_category` is '' until a failed attempt records one."""
+    `failure_category` is '' until a failed attempt records one. `holder` is the
+    holder the event belongs to ('' for a pre-0039 row no holder has claimed yet)."""
     key: str
     text: str
     interlocutor: str
     seq: int
     failure_category: str
+    holder: str = ""
 
 
 @dataclass
@@ -426,7 +428,13 @@ class Memory:
 
     @_guarded
     def pending_events(self) -> list[PendingEvent]:
-        """Events recorded in state 'pending', ordered by `seq` ascending."""
+        """Events recorded in state 'pending', ordered by `seq` ascending.
+
+        Lists the pending events of every holder in the world, not only this
+        facade's: each item carries its `holder`. `abandon_event(key)` acts only
+        on this facade's own holder's row (or claims an unowned legacy row), so
+        it raises `KeyError` for a key that belongs to another holder.
+        """
         return [PendingEvent(**row) for row in self._core.pending_events()]
 
     @_guarded
@@ -447,23 +455,35 @@ class Memory:
         when it was abandoned, or when a still-pending event is retried with a
         different `interlocutor` than the one it was first recorded with (the
         message says which). A committed event is returned as stored without
-        extracting, so its `interlocutor` is not compared.
+        extracting, so its `interlocutor` is not compared. Raises `ValueError`
+        when this facade's holder is empty, before anything is written.
         """
         return RememberResult(**self._core.remember_event(
             key, text, interlocutor=interlocutor, epoch=epoch))
 
     @_guarded
     def abandon_event(self, key: str) -> None:
-        """Abandon the event recorded under `key`: it will never be written.
+        """Abandon this holder's event recorded under `key`: it will never be written.
+
+        Abandon acts on the event of this facade's holder (its `agent`), or
+        claims an unowned legacy row (one migration 0039 could not attribute to
+        a holder) for this holder and abandons it. It never touches another
+        holder's event. To abandon an event, call this on the facade of the
+        holder that owns it: `pending_events()` lists every holder's pending
+        events, and each item's `.holder` names the owner.
 
         Only the receipt row changes (state 'pending' -> 'abandoned'); nothing
         else is touched, and the event's `seq` is not reused. Abandoning is
-        final: a later `remember_event` on this key raises `EventConflict`,
-        whatever the text. Abandoning an already abandoned key is a no-op.
+        final: a later `remember_event` on this key by this holder raises
+        `EventConflict`, whatever the text. Abandoning an already abandoned key
+        is a no-op.
 
         Raises `EventConflict` when the event is already committed (its
-        statements are stored and cannot be taken back), and `KeyError` when no
-        event was ever recorded under `key`.
+        statements are stored and cannot be taken back). Raises `KeyError` when
+        this holder has no event under `key`: if the key is recorded only under
+        other holders, the message names those holders; if no holder has it,
+        the message says there is no such key. Raises `ValueError` when this
+        facade's holder is empty.
         """
         self._core.abandon_event(key)
 

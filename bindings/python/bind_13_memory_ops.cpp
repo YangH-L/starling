@@ -686,21 +686,33 @@ void bind_13_memory_ops(pybind11::module_& m) {
           },
           py::arg("connection"), py::arg("tenant"), py::arg("theme"));
 
-    // 迁移 0038 events 表的读侧,纯本地 SQLite 读(无网络),不放 GIL,薄转发到
-    // memoryops::next_seq / pending_events。查询在 C++,这里只把行转成 dict。
+    // 迁移 0038 events 表的读侧,薄转发到 memoryops::next_seq / pending_events。
+    // 查询在 C++,这里只把行转成 dict。库大时这些读/写要持续一段时间,所以 C++ 调用
+    // 期间释放 GIL;释放期间只执行纯 C++,Python 对象(list/dict)在释放块结束后构造。
     m.def("memory_next_seq",
           [](starling::persistence::Connection& conn, const std::string& tenant) {
-              return starling::memoryops::next_seq(conn, tenant);
+              std::int64_t seq = 0;
+              {
+                  py::gil_scoped_release release;
+                  seq = starling::memoryops::next_seq(conn, tenant);
+              }
+              return seq;
           },
           py::arg("connection"), py::arg("tenant"));
 
     m.def("memory_pending_events",
           [](starling::persistence::Connection& conn, const std::string& tenant) {
+              std::vector<starling::memoryops::PendingEventRow> rows;
+              {
+                  py::gil_scoped_release release;
+                  rows = starling::memoryops::pending_events(conn, tenant);
+              }
               py::list out;
-              for (const auto& row : starling::memoryops::pending_events(conn, tenant)) {
+              for (const auto& row : rows) {
                   out.append(py::dict("key"_a = row.key, "text"_a = row.text,
                                       "interlocutor"_a = row.interlocutor, "seq"_a = row.seq,
-                                      "failure_category"_a = row.failure_category));
+                                      "failure_category"_a = row.failure_category,
+                                      "holder"_a = row.holder));
               }
               return out;
           },
@@ -762,29 +774,45 @@ void bind_13_memory_ops(pybind11::module_& m) {
           py::arg("text"), py::arg("epoch_iso"),
           py::arg("policy") = starling::extractor::ValidationPolicy{});
 
-    // 放弃一个 key(events 表,迁移 0038):一个短本地事务,无网络,不放 GIL。
+    // 放弃一个 key(events 表,迁移 0038):一个短本地事务,无网络;C++ 调用期间释放 GIL。
     // committed → starling.EventConflict(上面已注册);未知 key → C++ 抛
     // std::out_of_range。pybind11 对 out_of_range 的默认译法是 IndexError,不是
-    // KeyError,所以这里显式改译:调用方拼错 key 该得到 KeyError。
+    // KeyError,所以这里显式改译:调用方拼错 key 该得到 KeyError。空 holder → C++ 抛
+    // std::invalid_argument,照 pybind11 默认译法成 ValueError,不在这里改译。
     m.def("memory_abandon_event",
           [](starling::persistence::SqliteAdapter& adapter, const std::string& tenant,
-             const std::string& key) {
-              try {
-                  starling::memoryops::abandon_event(adapter, tenant, key);
-              } catch (const std::out_of_range& e) {
-                  throw py::key_error(e.what());
+             const std::string& holder, const std::string& key) {
+              std::optional<std::string> missing;
+              {
+                  py::gil_scoped_release release;
+                  try {
+                      starling::memoryops::abandon_event(adapter, tenant, holder, key);
+                  } catch (const std::out_of_range& e) {
+                      missing = e.what();
+                  }
+              }
+              // GIL 已回来:此时才可构造 Python 异常。其它异常(EventConflict 等)
+              // 照常穿出释放块,由 pybind11 默认译法处理。
+              if (missing) {
+                  throw py::key_error(*missing);
               }
           },
-          py::arg("adapter"), py::arg("tenant"), py::arg("key"));
+          py::arg("adapter"), py::arg("tenant"), py::arg("holder"), py::arg("key"));
 
     // library 的逻辑摘要与语句的内容 id(memoryops::digest / content_ids)。规范化与
-    // 哈希都在 C++,这里只转发。纯本地 SQLite 读,无网络,不放 GIL。
+    // 哈希都在 C++,这里只转发。纯本地 SQLite 读,无网络;digest 随库大小线性变长,
+    // 所以 C++ 调用期间释放 GIL。
     //
     // memory_content_ids 收一批 id 一次查完:召回命中补 content_id 走它,逐条查会把
     // 一次召回变成 k 次 SQL。
     m.def("memory_digest",
           [](starling::persistence::Connection& conn, const std::string& tenant) {
-              return starling::memoryops::digest(conn, tenant);
+              std::string out;
+              {
+                  py::gil_scoped_release release;
+                  out = starling::memoryops::digest(conn, tenant);
+              }
+              return out;
           },
           py::arg("connection"), py::arg("tenant"));
 

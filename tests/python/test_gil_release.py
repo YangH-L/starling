@@ -9,6 +9,8 @@
 GIL 已释放 ⇒ 计数推进;未释放 ⇒ 主线程第一条字节码就卡住,计数为 0。
 阈值给得很宽(700ms 窗口只要求 ≥5 次 5ms 步进),CI 抖动安全。
 """
+import sqlite3
+import sys
 import threading
 import time
 
@@ -102,3 +104,101 @@ def test_memory_recall_releases_gil_while_embedding_the_query(tmp_path, monkeypa
         silent.close()
     assert progress >= 5, (
         f"vector_recall 嵌入查询词期间主线程仅推进 {progress} 步——GIL 未释放")
+
+
+# --- 事件与摘要绑定(bind_13):读/写在大库上要持续一段时间,期间必须放 GIL ---
+
+def _sql(path, sql):
+    with sqlite3.connect(str(path)) as c:
+        c.execute(sql)
+
+
+def _seed_statements(path, total):
+    """把库里唯一一条语句按行克隆到 total 条(只换 id/object_value/canonical_object_hash),
+    直接走 SQL,比 total 次 remember 快几个数量级。"""
+    with sqlite3.connect(str(path)) as c:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(statements)")]
+        sel = ",".join(
+            {"id": "'s'||n", "object_value": "'o'||n", "canonical_object_hash": "'h'||n"}.get(col, col)
+            for col in cols)
+        c.execute(
+            f"WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n<{total}) "
+            f"INSERT INTO statements({','.join(cols)}) SELECT {sel} FROM statements, g")
+
+
+def _event_mem(tmp_path, name):
+    llm = starling.make_stub_llm(default_response=CANNED_JSON)
+    return starling.Memory.open(str(tmp_path / name), agent="alice", llm=llm)
+
+
+def test_memory_digest_releases_gil(tmp_path):
+    # 计划写「约 2000 条」,实测 2000 条 digest 只要 ~40ms,窗口太短;4 万条约 0.8s。
+    mem = _event_mem(tmp_path, "dg.db")
+    try:
+        mem.remember_event("e#0", "bob:我负责鉴权模块", interlocutor="bob")
+        _seed_statements(tmp_path / "dg.db", 40000)
+        t0 = time.monotonic()
+        progress = _progress_while(mem.digest)
+        elapsed = time.monotonic() - t0
+    finally:
+        mem.close()
+    assert elapsed > 0.3, f"digest 只跑了 {elapsed:.2f}s,窗口太短,测不出 GIL"
+    assert progress >= 5, (
+        f"memory_digest 阻塞 C++ 期间主线程仅推进 {progress} 步——GIL 未释放")
+
+
+def test_memory_pending_events_releases_gil(tmp_path):
+    # 30 万行 pending:C++ 取行与 Python 建 dict 各占一段,放 GIL 的是前一段。
+    llm = starling.make_stub_llm(default_response="")
+    mem = starling.Memory.open(str(tmp_path / "pe.db"), agent="alice", llm=llm)
+    try:
+        _sql(tmp_path / "pe.db",
+             "WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n<300000) "
+             "INSERT INTO events(tenant_id,holder_id,key,text,interlocutor,text_sha256,seq,state) "
+             "SELECT 'default','alice','k'||n,'t','bob','x',n,'pending' FROM g")
+        # 调大切换间隔:否则 Python 侧建 dict 时解释器每 5ms 也会让出 GIL,
+        # 绑定没放 GIL 照样"有进展",测不出差别。
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(30)
+        try:
+            t0 = time.monotonic()
+            progress = _progress_while(mem.pending_events)
+            elapsed = time.monotonic() - t0
+        finally:
+            sys.setswitchinterval(old_interval)
+    finally:
+        mem.close()
+    assert elapsed > 0.3, f"pending_events 只跑了 {elapsed:.2f}s,窗口太短,测不出 GIL"
+    assert progress >= 5, (
+        f"memory_pending_events 阻塞 C++ 期间主线程仅推进 {progress} 步——GIL 未释放")
+
+
+def test_memory_abandon_event_releases_gil(tmp_path):
+    # 另一条连接持有写锁,abandon 的写事务在 busy_timeout 里等,这段等待就是阻塞窗口。
+    mem = _event_mem(tmp_path, "ab.db")
+    mem.remember_event("e#0", "bob:hi", interlocutor="bob")
+    _sql(tmp_path / "ab.db", "UPDATE events SET state='pending'")
+    locker = sqlite3.connect(str(tmp_path / "ab.db"), isolation_level=None,
+                             check_same_thread=False)
+    try:
+        locker.execute("BEGIN IMMEDIATE")
+        release = threading.Timer(0.7, lambda: locker.execute("ROLLBACK"))
+        release.start()
+        progress = _progress_while(lambda: mem.abandon_event("e#0"))
+        release.join()
+    finally:
+        locker.close()
+        mem.close()
+    assert progress >= 5, (
+        f"memory_abandon_event 阻塞 C++ 期间主线程仅推进 {progress} 步——GIL 未释放")
+
+
+def test_memory_abandon_event_still_raises_keyerror_for_unknown_key(tmp_path):
+    # 释放 GIL 后异常要在 GIL 回来之后再构造:未知 key 仍是 KeyError(不是 IndexError)。
+    import pytest
+    mem = _event_mem(tmp_path, "ab2.db")
+    try:
+        with pytest.raises(KeyError):
+            mem.abandon_event("nope#0")
+    finally:
+        mem.close()
