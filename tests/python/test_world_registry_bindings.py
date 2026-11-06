@@ -160,7 +160,8 @@ def test_snapshot_and_rollback_on_registry(tmp_path):
 
     _core.world_check_rollback(reg, "sim-1", snap["id"])
     result = _core.world_rollback(reg, "sim-1", snap["id"])
-    assert set(result) == {"archive_path", "restored_bytes"}
+    assert set(result) == {"archive_path", "restored_bytes", "digest"}
+    assert result["digest"] == snap["digest"] and len(snap["digest"]) == 64
     assert len(_core.world_list_archives(reg, "sim-1")) == 1
     assert _core.world_purge_archives(reg, "sim-1") == 1
     assert _core.world_list_sessions(reg, "sim-1")["total"] == 0
@@ -210,3 +211,47 @@ def test_registry_calls_release_gil(tmp_path):
     progress = _progress_while(
         lambda: _core.world_take_snapshot(reg, "big", _test_before_vacuum_sleep_ms=300))
     assert progress >= 20, f"take_snapshot 期间主线程仅推进 {progress} 步——GIL 未释放"
+
+
+def test_fork_binding_releases_gil_and_returns_digest(tmp_path):
+    reg = _open(tmp_path)
+    src = reg.create("deploy-1", "", {}, None, NOW)
+    snap = _core.world_take_snapshot(reg, "deploy-1")["snapshot"]
+
+    forked = _core.world_fork(reg, "deploy-1", "rollout-1",
+                              {"labels": {"run": "r1"}, "retention_group": "g1",
+                               "reclaimable": True, "now": NOW})
+    assert set(forked) == {"world", "digest"}
+    assert forked["digest"] == snap["digest"]
+    world = forked["world"]
+    assert (world["fork_of_world"], world["fork_of_snapshot"]) == ("deploy-1", "")
+    assert world["tenant"] == src["tenant"] and world["labels"] == {"run": "r1"}
+    assert world["reclaimable"] and world["retention_group"] == "g1"
+    assert reg.get("rollout-1")["fork_of_world"] == "deploy-1"
+
+    seed = _core.world_fork(reg, "deploy-1", "seed-1",
+                            {"snapshot_id": snap["id"], "seed": True, "now": NOW})
+    assert seed["world"]["seed"] and seed["world"]["read_only"]
+    assert seed["world"]["fork_of_snapshot"] == snap["id"]
+    upgraded = _core.world_upgrade_seed(reg, "seed-1", "seed-2", NOW)
+    assert upgraded["world"]["seed"] and upgraded["world"]["fork_of_world"] == "seed-1"
+
+    adapter = _core.SqliteAdapter.open(src["db_path"])
+    live = _core.world_fork_from_connection(reg, adapter.connection(), "deploy-1", "rollout-2",
+                                            {"now": NOW})
+    assert live["digest"] == snap["digest"]
+    adapter.close()
+
+    for call, code in (
+            (lambda: _core.world_fork(reg, "deploy-1", "rollout-1", {}), "world_exists"),
+            (lambda: _core.world_fork(reg, "deploy-1", "x", {"bogus": 1}), "invalid_settings"),
+            (lambda: _core.world_upgrade_seed(reg, "deploy-1", "s9", NOW), "invalid_settings")):
+        with pytest.raises(_core.WorldStoreError) as ei:
+            call()
+        assert _code(ei.value) == code
+
+    # after_copy 钩子在 C++ 里睡 300ms（GIL 已释放）。
+    progress = _progress_while(
+        lambda: _core.world_fork(reg, "deploy-1", "rollout-3", {"now": NOW},
+                                 _test_after_copy_sleep_ms=300))
+    assert progress >= 20, f"world_fork 期间主线程仅推进 {progress} 步——GIL 未释放"

@@ -587,7 +587,7 @@ def test_binding_rollback_roundtrip_archives_and_error_codes(pool_reg):
     _insert_foreign_engram(db, "sim-1")           # 快照之后的写入（本租户）
     assert _count(db, "engrams") == 1
     result = _core.world_rollback(reg, "sim-1", snap["id"])
-    assert set(result) == {"archive_path", "restored_bytes"}
+    assert set(result) == {"archive_path", "restored_bytes", "digest"}
     assert result["restored_bytes"] == snap["size_bytes"]
     home = os.path.dirname(reg.get("sim-1")["snapshot_dir"])
     assert os.path.dirname(result["archive_path"]) == os.path.join(home, "archive")

@@ -10,6 +10,7 @@
 #include "starling/governance/registry_db.hpp"
 #include "starling/governance/world_settings.hpp"
 
+#include "starling/memory/memory_digest.hpp"
 #include "starling/memory/memory_ops.hpp"
 #include "starling/persistence/sqlite_adapter.hpp"
 #include "starling/persistence/stmt.hpp"
@@ -3899,7 +3900,7 @@ TEST(WorldAutoRetention, RefusalKeepsThePartialPruneForTheCallerToSave) {
                                              SnapshotOptions{}));
     EXPECT_FALSE(res.taken.has_value());
     EXPECT_TRUE(res.refused.starts_with("retention cannot prune")) << res.refused;
-    EXPECT_NE(res.refused.find("4 held"), std::string::npos) << res.refused;
+    EXPECT_NE(res.refused.find("4 kept"), std::string::npos) << res.refused;   // held 快照不计入
     // 正常 victim：文件删了，注册项也摘了（就在调用方拿到的 reg 里）。
     EXPECT_FALSE(fs::exists(dir / "a0.db"));
     EXPECT_EQ(ids_of(reg.snapshots("sim-1")),
@@ -4135,6 +4136,139 @@ TEST(WorldSessions, EmptyWhenDbOrTableIsMissingAndFailsOnUnreadableDb) {
     fs::remove(db_path);
     { std::ofstream out(db_path); out << "this is not a sqlite database at all, nope"; }
     EXPECT_EQ(code_of([&] { (void)list_sessions(reg, "sim-1", 200); }), "snapshot_failed");
+}
+
+// ---- 第 3 期：held 快照、快照与恢复的摘要（spec §7.1、§7.2） ----------------------
+
+std::string library_digest(const std::string& db_path, const std::string& tenant) {
+    auto conn = persistence::Connection::open_read_only(db_path);
+    return memoryops::digest(conn, tenant);
+}
+
+SnapshotOptions auto_interval() {
+    SnapshotOptions opts;
+    opts.kind = "auto";
+    opts.reason = "interval";
+    return opts;
+}
+
+SnapshotOptions held_opts() {
+    SnapshotOptions opts;
+    opts.kind = "held";
+    opts.reason = "held";
+    return opts;
+}
+
+// held 快照不计入保留份数，也从不被修剪；只能显式删除。
+TEST(WorldStoreHeld, HeldSnapshotsSurviveRetention) {
+    const TempDir tmp;
+    auto reg = registry_with_world(tmp, "sim-1");
+    set_retention(reg, 2);
+    seed_world_db(reg.get("sim-1").db_path, "sim-1", 2);
+    const auto held = take_snapshot(reg, "sim-1", held_opts());
+    EXPECT_EQ(held.kind, "held");
+    const auto first = take_snapshot(reg, "sim-1", auto_interval());
+    const auto second = take_snapshot(reg, "sim-1", auto_interval());
+    const auto third = take_snapshot(reg, "sim-1", auto_interval());
+    // held 不占份数：auto 留到 2 份（最旧的 auto 被删），held 还在。
+    EXPECT_EQ(ids_of(reg.snapshots("sim-1")),
+              (std::vector<std::string>{third.id, second.id, held.id}));
+    EXPECT_FALSE(fs::exists(first.path));
+    EXPECT_TRUE(fs::exists(held.path));
+
+    // manual 涨满时第二轮修剪删 manual，也不碰 held。
+    const auto man1 = take_snapshot(reg, "sim-1", SnapshotOptions{});
+    const auto man2 = take_snapshot(reg, "sim-1", SnapshotOptions{});
+    EXPECT_EQ(ids_of(reg.snapshots("sim-1")),
+              (std::vector<std::string>{man2.id, third.id, held.id}));
+    EXPECT_TRUE(apply_retention(reg, "sim-1").empty());
+    EXPECT_TRUE(fs::exists(held.path));
+    validate_world(reg, "sim-1");
+
+    delete_snapshot(reg, "sim-1", held.id);   // 只能显式删
+    EXPECT_FALSE(fs::exists(held.path));
+    EXPECT_EQ(ids_of(reg.snapshots("sim-1")), (std::vector<std::string>{man2.id, third.id}));
+    (void)man1;
+}
+
+TEST(WorldStoreHeld, HeldPairsOnlyWithHeldReason) {
+    const TempDir tmp;
+    auto reg = registry_with_world(tmp, "sim-1");
+    seed_world_db(reg.get("sim-1").db_path, "sim-1", 1);
+    SnapshotOptions bad = held_opts();
+    bad.reason = "manual";
+    EXPECT_EQ(code_of([&] { (void)take_snapshot(reg, "sim-1", bad); }), "invalid_snapshot_kind");
+    bad = SnapshotOptions{};
+    bad.reason = "held";
+    EXPECT_EQ(code_of([&] { (void)take_snapshot(reg, "sim-1", bad); }), "invalid_snapshot_kind");
+    EXPECT_TRUE(reg.snapshots("sim-1").empty());
+    // 注册表里 held 配错 reason 是注册表损坏。
+    SnapshotEntry wrong;
+    wrong.id = "20261106T000000Z-0001";
+    wrong.path = (fs::path(reg.get("sim-1").snapshot_dir) / (wrong.id + ".db")).string();
+    wrong.kind = "held";
+    wrong.reason = "manual";
+    reg.put_snapshot("sim-1", wrong);
+    EXPECT_EQ(code_of([&] { validate_world(reg, "sim-1"); }), "registry_corrupt");
+}
+
+// 快照条目记下快照文件里的 library 摘要，注册表读回来是同一个值。
+TEST(WorldStoreDigest, SnapshotRecordsTheLibraryDigest) {
+    const TempDir tmp;
+    auto reg = registry_with_world(tmp, "sim-1");
+    const auto world = reg.get("sim-1");
+    seed_world_db(world.db_path, "sim-1", 2);
+    insert_statement(world.db_path, "sim-1", "st-1");
+    const std::string expected = library_digest(world.db_path, "sim-1");
+    const auto snap = take_snapshot(reg, "sim-1", SnapshotOptions{});
+    EXPECT_EQ(snap.digest, expected);
+    EXPECT_EQ(library_digest(snap.path, "sim-1"), expected);
+    ASSERT_EQ(reg.snapshots("sim-1").size(), 1U);
+    EXPECT_EQ(reg.snapshots("sim-1").front().digest, expected);
+}
+
+// 裁定 R10：0038 之前的库（没有 events 等表）照常快照，digest 记空串；恢复到它也不比较。
+TEST(WorldStoreDigest, PreEventsLibrarySnapshotHasEmptyDigest) {
+    const TempDir tmp;
+    auto reg = registry_with_world(tmp, "sim-1");
+    const auto world = reg.get("sim-1");
+    exec_sql_unmigrated(world.db_path,
+                        "CREATE TABLE engrams(id TEXT, tenant_id TEXT, created_at TEXT);"
+                        "INSERT INTO engrams VALUES('a','sim-1','2026-01-01T00:00:00Z');");
+    const auto snap = take_snapshot(reg, "sim-1", SnapshotOptions{});
+    EXPECT_EQ(snap.digest, "");
+    EXPECT_EQ(reg.snapshots("sim-1").front().digest, "");
+    const auto result = rollback_world(reg, "sim-1", snap.id, RollbackOptions{});
+    EXPECT_EQ(result.digest, "");
+}
+
+TEST(WorldStoreDigest, RollbackDigestMustMatch) {
+    const TempDir tmp;
+    auto reg = registry_with_world(tmp, "sim-1");
+    const auto world = reg.get("sim-1");
+    seed_world_db(world.db_path, "sim-1", 2);
+    insert_statement(world.db_path, "sim-1", "st-1");
+    const auto snap = take_snapshot(reg, "sim-1", SnapshotOptions{});
+    ASSERT_FALSE(snap.digest.empty());
+    insert_statement(world.db_path, "sim-1", "st-2");
+
+    // 正常恢复：恢复后的摘要等于快照条目记的那个。
+    const auto restored = rollback_world(reg, "sim-1", snap.id, RollbackOptions{});
+    EXPECT_EQ(restored.digest, snap.digest);
+    EXPECT_EQ(library_digest(world.db_path, "sim-1"), snap.digest);
+
+    // 快照文件登记之后被改了一行：库照样替换（integrity_check 通过），摘要对不上 → 硬错误。
+    exec_sql_unmigrated(snap.path, "UPDATE statements SET object_value='tampered' WHERE id='st-1'");
+    EXPECT_EQ(code_of([&] { (void)rollback_world(reg, "sim-1", snap.id, RollbackOptions{}); }),
+              "restore_digest_mismatch");
+    EXPECT_NE(library_digest(world.db_path, "sim-1"), snap.digest);   // 库已替换
+    EXPECT_TRUE(rollback_partials(world).empty());
+
+    // 第 3 期之前登记的条目没有 digest：不比较，照常返回恢复后的摘要。
+    set_snapshot_column(reg, "sim-1", snap.id, "digest", "");
+    const auto legacy = rollback_world(reg, "sim-1", snap.id, RollbackOptions{});
+    EXPECT_EQ(legacy.digest, library_digest(world.db_path, "sim-1"));
+    EXPECT_FALSE(legacy.digest.empty());
 }
 
 }  // namespace

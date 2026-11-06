@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -31,15 +32,7 @@ namespace starling::governance {
 // 表里没有的名字 = provider 已被删掉。
 using ProviderEndpoints = std::map<std::string, ProviderEndpoint>;
 
-struct WorldRecord {
-    std::string name, dir_id, tenant, db_path, snapshot_dir, label, created_at;
-    bool seed = false, read_only = false, reclaimable = false;  // 第 3、6 期才写入，本期恒为 false
-    std::string retention_group, fork_of_world, fork_of_snapshot;  // 同上，本期为空
-    std::string settings_json;                                    // 不透明文本，Task 3 定模式
-    std::map<std::string, std::string> labels;
-    std::int64_t holders = 0, statements = 0;                     // 统计缓存
-    std::string last_write_at, stats_at;
-};
+// WorldRecord、WorldFlags 定义在 world_store.hpp（分叉的结果 ForkResult 按值带着 WorldRecord）。
 
 struct WorldPage {
     std::vector<WorldRecord> worlds;
@@ -57,6 +50,8 @@ public:
     //   name="default", tenant=default_tenant, db_path=default_db_path（原地，不受布局约束），
     //   dir_id="default", label="主世界", settings_json="{}"。
     // 文件打不开或不是合法的注册表：registry_corrupt。
+    // snapshots 表没有 digest 列（第 3 期之前建的注册表，schema_version 仍是 1）时就地
+    // ALTER TABLE ... ADD COLUMN digest TEXT NOT NULL DEFAULT ''：旧条目的 digest 为空串。幂等。
     static RegistryDb open(const std::filesystem::path& data_dir,
                            const std::filesystem::path& default_db_path,
                            const std::string& default_tenant);
@@ -78,9 +73,12 @@ public:
     [[nodiscard]] WorldRecord get(const std::string& name) const;   // world_not_found
     [[nodiscard]] WorldPage list(const WorldQuery& query) const;    // 顺序见 registry_db.cpp list
     // invalid_world_name / world_exists。建 worlds/<dir_id>/ 与 snapshots/，不建库文件。
+    // flags 写进记录（seed 蕴含 read_only）；read_only 时 settings_json 经 merge_settings 强制关后台
+    // （此时它必须能被 settings_from_json 解析，否则 invalid_settings，什么都不写）。
     WorldRecord create(const std::string& name, const std::string& label,
                        const std::map<std::string, std::string>& labels,
-                       const std::string& settings_json, std::string_view now_iso);
+                       const std::string& settings_json, std::string_view now_iso,
+                       const WorldFlags& flags = {});
     // 建世界并继承设置（裁定 R2），整个「读默认世界设置 → merge_settings(overrides) → 插入」在一次
     // 持锁内完成，并发的 update_world_settings("default", ...) 不会插进中间。新世界的设置是默认世界当时
     // 设置的值拷贝，之后改默认世界不影响它。overrides_json 空串当 "{}"，非法按 settings_from_json 的码抛
@@ -94,10 +92,23 @@ public:
     // require_endpoint_unchanged 对表里该 provider 的种类与地址核对（表里没有这个名字 = provider 已被删掉，
     // 同样拒绝），任何一个不同就抛 endpoint_changed、什么都不写。合并、核对、写在同一次持锁内：同步默认世界设置（replace_world_sections）取同一把锁，插不进
     // 中间。不给（nullopt）时不核对：内部调用方（自动快照配置等）用，它们不改 endpoint。
+    // flags 同 create（spec §6.2：建空世界时指定 seed=true，蕴含只读，合并时强制关后台）。
     WorldRecord create_world(const std::string& name, const std::string& label,
                              const std::map<std::string, std::string>& labels,
                              const std::string& overrides_json, std::string_view now_iso,
-                             const std::optional<ProviderEndpoints>& provider_endpoints = std::nullopt);
+                             const std::optional<ProviderEndpoints>& provider_endpoints = std::nullopt,
+                             const WorldFlags& flags = {});
+    // 分叉与升级种子用（world_store.hpp fork_world / upgrade_seed）：库文件由 populate 在注册表锁之外写好，
+    // 注册表只在前后各短暂持锁一次（spec §6.1「分叉不持全局锁，只在最后登记时短暂写注册表」）：
+    //   1. 持锁：spec.name 不合规则 invalid_world_name、已被占用 world_exists；与 create 同一套布局选
+    //      dir_id，建 worlds/<dir_id>/ 与 snapshots/。
+    //   2. 不持锁：populate(worlds/<dir_id>/world.db)，它负责把库写到这个路径上。
+    //   3. 持锁：登记（tenant、label、labels、settings_json、flags 照 spec 原样写入；seed 蕴含 read_only，
+    //      read_only 时设置强制关后台）。第 1、2 步之间名字被别的调用抢先登记 → world_exists。
+    // 任何一步抛错都删掉整个世界目录、不写注册项，原样抛出。
+    WorldRecord create_populated(const NewWorld& spec,
+                                 const std::function<void(const std::filesystem::path& db_file)>&
+                                     populate);
     // 把 overrides 合并到世界当前设置上（只读世界后台强制关）并写回，读—合并—写在一次持锁内，
     // 并发更新同一世界不会丢合并。返回合并后的 settings_json。world_not_found；overrides 非法时什么都不写。
     // provider_endpoints 同 create_world（裁定 R40、R51）：给出时在写之前于同一次持锁内核对，endpoint_changed 时
@@ -128,7 +139,7 @@ public:
     // 快照条目（与 SnapshotEntry 同字段），最新在前：按登记顺序，最后 put_snapshot 的在最前
     // （与 worlds.json 时代「插到列表开头」一致；不按 created_at，同一秒的几份才不会乱序）。
     [[nodiscard]] std::vector<SnapshotEntry> snapshots(const std::string& world) const;
-    // 登记一份快照，成为该世界最新的一份。撞 (world, id) 或其他 SQLite 错误抛 snapshot_failed。
+    // 登记一份快照，成为该世界最新的一份（含 digest 列）。撞 (world, id) 或其他 SQLite 错误抛 snapshot_failed。
     void put_snapshot(const std::string& world, const SnapshotEntry& entry);
     void drop_snapshot(const std::string& world, const std::string& snapshot_id);
     [[nodiscard]] int snapshot_retention() const;                   // 默认 5

@@ -4,6 +4,10 @@
 
 #include "starling/governance/registry_db.hpp"
 #include "starling/governance/world_settings.hpp"
+#include "starling/memory/memory_digest.hpp"
+#include "starling/persistence/connection.hpp"
+#include "starling/persistence/migration_runner.hpp"
+#include "starling/persistence/sqlite_adapter.hpp"
 #include "starling/persistence/sqlite_handles.hpp"
 #include "starling/persistence/stmt.hpp"
 
@@ -23,6 +27,7 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 
@@ -181,12 +186,23 @@ void require_valid_retention(int retention) {
     }
 }
 
-// kind 与 reason 配对：manual/manual，auto/session 或 auto/interval。注册表校验（validate_world、
-// 导入）与 take_snapshot 的入参校验共用。
+// kind 与 reason 配对：manual/manual，auto/session 或 auto/interval，held/held。注册表校验
+// （validate_world、导入）与 take_snapshot 的入参校验共用。
 bool kind_reason_paired(const std::string& kind, const std::string& reason) {
     if (kind == "manual") { return reason == "manual"; }
     if (kind == "auto") { return reason == "session" || reason == "interval"; }
+    if (kind == "held") { return reason == "held"; }
     return false;
+}
+
+bool is_snapshot_kind(const std::string& kind) {
+    return kind == "manual" || kind == "auto" || kind == "held";
+}
+
+// 参与保留份数修剪的快照（held 由调用方持有，不参与，spec §7.1）。顺序不变。
+std::vector<SnapshotEntry> prunable(std::vector<SnapshotEntry> listed) {
+    std::erase_if(listed, [](const SnapshotEntry& snap) { return snap.kind == "held"; });
+    return listed;
 }
 
 // 布局校验用的解析：跟随符号链接之后的绝对位置（已规范化）。末端是悬空的符号链接时也跟到底：
@@ -365,7 +381,7 @@ void check_world_layout(const fs::path& data_dir, const std::string& name,
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 void check_snapshot_entry(const std::string& owner, const std::string& snapshot_dir,
                           const SnapshotEntry& snap) {
-    if (snap.kind != "manual" && snap.kind != "auto") {
+    if (!is_snapshot_kind(snap.kind)) {
         corrupt("snapshot '" + snap.id + "' of '" + owner + "' has kind '" + snap.kind + "'");
     }
     if (!kind_reason_paired(snap.kind, snap.reason)) {
@@ -675,6 +691,21 @@ auto with_read_only(const std::string& db_path, const Body& body) {
     }
 }
 
+// 本租户的 library 摘要（memoryops::digest）。它读 statements、statement_vectors、events 三张表，
+// 缺任何一张（0038 之前的库）时返回空串（裁定 R10）。
+std::string digest_or_empty(persistence::Connection& conn, const std::string& tenant) {
+    for (const char* table : {"statements", "statement_vectors", "events"}) {
+        if (!table_exists(conn.raw(), table)) { return {}; }
+    }
+    return memoryops::digest(conn, tenant);
+}
+
+// 只读打开 db_file 算 digest_or_empty。SQLite 错误原样抛出（调用方定码）。
+std::string digest_of_file(const fs::path& db_file, const std::string& tenant) {
+    auto conn = persistence::Connection::open_read_only(db_file);
+    return digest_or_empty(conn, tenant);
+}
+
 void require_valid_auto_snapshot(const AutoSnapshotConfig& config) {
     if (!interval_in_range(config.interval_hours)) {
         throw WorldStoreError("invalid_auto_snapshot",
@@ -857,16 +888,16 @@ SnapshotEntry take_snapshot(RegistryDb& reg, const std::string& world,
     const WorldRecord entry = reg.get(world);   // world_not_found
     // 先校验入参与保留份数：否则快照写完才发现配置非法，留下无人登记的文件。
     // kind 拼错（"Auto"）不能静默当成 manual：保留策略只认 "auto"，会丢掉回滚锚点保护。
-    if (opts.kind != "manual" && opts.kind != "auto") {
+    if (!is_snapshot_kind(opts.kind)) {
         throw WorldStoreError("invalid_snapshot_kind",
-                              "kind must be 'manual' or 'auto', got '" + opts.kind + "'");
+                              "kind must be 'manual', 'auto' or 'held', got '" + opts.kind + "'");
     }
     // reason 不配对（manual/session、auto/manual……）同样在任何 I/O 之前拒：否则快照文件已经
     // 写出，登记时才发现条目不合注册表的规则。
     if (!kind_reason_paired(opts.kind, opts.reason)) {
         throw WorldStoreError("invalid_snapshot_kind",
                               "kind '" + opts.kind + "' cannot have reason '" + opts.reason +
-                                  "' (manual/manual, auto/session, auto/interval)");
+                                  "' (manual/manual, auto/session, auto/interval, held/held)");
     }
     // 注入的时钟：快照 id 的时间前缀与 created_at 都由它推出，形状不对在 I/O 之前拒。
     if (!opts.now_iso.empty() && !parse_utc_seconds(opts.now_iso)) {
@@ -965,18 +996,31 @@ SnapshotEntry take_snapshot(RegistryDb& reg, const std::string& world,
         throw WorldStoreError("snapshot_failed", ex.what());
     }
 
-    // 登记（成为最新的一份）。登记失败就删掉刚改好名的文件：没有登记的快照列不出来、也回滚不到，
+    // 改好名之后的失败（算摘要、登记）都删掉刚改好名的文件：没有登记的快照列不出来、也回滚不到，
     // 留着只是孤儿（原来由调用方存注册表失败后调 discard_snapshot_file 补偿）。删的时候经
-    // remove_within，不出 snapshot_dir。
+    // remove_within，不出 snapshot_dir。返回追加到错误信息里的说明。
+    const auto discard_final = [&dir, &snap] {
+        std::string why;
+        try {
+            if (!remove_within(dir, snap.path)) { why = "; " + snap.path + " resolves outside"; }
+        } catch (const WorldStoreError& remove_err) {
+            why = std::string("; cannot remove ") + snap.path + ": " + remove_err.what();
+        }
+        return why;
+    };
+    // 6a. 摘要在拍好的快照文件上算（与快照里的内容是同一份字节）。缺表时空串（裁定 R10）。
+    try {
+        snap.digest = digest_of_file(snap.path, entry.tenant);
+    } catch (const std::exception& digest_err) {
+        const std::string why = digest_err.what() + discard_final();
+        throw WorldStoreError("snapshot_failed", "cannot compute the digest of snapshot '" +
+                                                     snap.id + "' of '" + world + "': " + why);
+    }
+    // 7. 登记（成为最新的一份）。
     try {
         reg.put_snapshot(world, snap);
     } catch (const std::exception& record_err) {
-        std::string why = record_err.what();
-        try {
-            if (!remove_within(dir, snap.path)) { why += "; " + snap.path + " resolves outside"; }
-        } catch (const WorldStoreError& remove_err) {
-            why += std::string("; cannot remove ") + snap.path + ": " + remove_err.what();
-        }
+        const std::string why = record_err.what() + discard_final();
         throw WorldStoreError("snapshot_failed",
                               "cannot record snapshot '" + snap.id + "' of '" + world + "': " + why);
     }
@@ -1000,7 +1044,8 @@ std::vector<std::string> apply_retention(RegistryDb& reg, const std::string& wor
     require_valid_retention(retention);
     validate_world(reg, world);   // 裁定 R12：删文件之前先查布局
     std::vector<std::string> removed;
-    const std::vector<SnapshotEntry> list = reg.snapshots(world);   // 最新在前
+    // 最新在前；held 不参与（不计数、不删，spec §7.1）。
+    const std::vector<SnapshotEntry> list = prunable(reg.snapshots(world));
     const auto limit = static_cast<std::size_t>(retention);
     if (list.size() <= limit) { return removed; }
 
@@ -1525,6 +1570,24 @@ RollbackResult rollback_world(const RegistryDb& reg, const std::string& world,
         }
         result.archive_path = archived.string();
         result.restored_bytes = staged_bytes;
+
+        // 12. 库已替换。在恢复后的库上算摘要（缺表时空串，裁定 R10）；条目带 digest 时必须相等，
+        //     不等说明快照文件登记之后被改过（spec §7.2）。旧条目（digest 为空）不比较。
+        try {
+            result.digest = digest_of_file(db_file, entry.tenant);
+        } catch (const std::exception& digest_err) {
+            throw WorldStoreError("snapshot_failed", "restored " + db_file.string() +
+                                                         " from snapshot '" + snap.id +
+                                                         "', but cannot compute its digest: " +
+                                                         digest_err.what());
+        }
+        if (!snap.digest.empty() && result.digest != snap.digest) {
+            throw WorldStoreError("restore_digest_mismatch",
+                                  "restored " + db_file.string() + " from snapshot '" + snap.id +
+                                      "', but its digest " + result.digest +
+                                      " differs from the recorded " + snap.digest +
+                                      ": the snapshot file was changed after it was taken");
+        }
     } catch (const WorldStoreError&) {
         std::error_code ignore;
         if (!partial.empty()) { fs::remove(partial, ignore); }
@@ -1668,11 +1731,11 @@ std::string retention_refusal(RegistryDb& reg, const std::string& world) {
         prune_error = err.what();
     }
     if (prune_error.empty()) { return {}; }
-    const std::size_t held = reg.snapshots(world).size();
+    const std::size_t kept = prunable(reg.snapshots(world)).size();   // held 不占份数
     const int retention = reg.snapshot_retention();
-    if (!std::cmp_greater_equal(held, retention)) { return {}; }
-    return "retention cannot prune the snapshots of '" + world + "' (" + std::to_string(held) +
-           " held, retention " + std::to_string(retention) +
+    if (!std::cmp_greater_equal(kept, retention)) { return {}; }
+    return "retention cannot prune the snapshots of '" + world + "' (" + std::to_string(kept) +
+           " kept, retention " + std::to_string(retention) +
            "); refusing an auto snapshot: " + prune_error;
 }
 
@@ -1807,6 +1870,227 @@ SessionList list_sessions(const RegistryDb& reg, const std::string& world, std::
         }
     }
     return out;
+}
+
+// ---- 分叉、种子与升级种子（spec §6.1、§6.2） ------------------------------------
+
+namespace {
+
+// 来源库 schema_migrations 的最高版本；表不存在算 0（与 SqliteAdapter::schema_version 同一规则）。
+int schema_version_on(sqlite3* dbh) {
+    if (!table_exists(dbh, "schema_migrations")) { return 0; }
+    return static_cast<int>(single_int(dbh, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"));
+}
+
+// 来源这条连接看得见的「有没有新提交」：data_version 在别的连接提交后变，total_changes 在这条连接
+// 自己写了之后变（裁定 R11）。复制前后各读一次，不等就是复制途中有写入。
+struct WriteMark {
+    std::int64_t data_version = 0;
+    std::int64_t own_changes = 0;
+    bool operator==(const WriteMark&) const = default;
+};
+
+WriteMark write_mark(sqlite3* dbh) {
+    return WriteMark{.data_version = single_int(dbh, "PRAGMA data_version"),
+                     .own_changes = sqlite3_total_changes64(dbh)};
+}
+
+void require_current_schema(sqlite3* dbh, const std::string& source) {
+    const int have = schema_version_on(dbh);
+    const int want = persistence::MigrationRunner::latest_embedded_version();
+    if (have < want) {
+        throw WorldStoreError("world_schema_behind",
+                              "source '" + source + "' is at schema version " +
+                                  std::to_string(have) + ", this build needs " +
+                                  std::to_string(want));
+    }
+}
+
+void vacuum_into(sqlite3* dbh, const fs::path& target) {
+    persistence::Stmt vacuum(dbh, "VACUUM INTO ?1");
+    vacuum.bind(target.string());
+    vacuum.step_done();
+}
+
+void require_intact(const fs::path& copy) {
+    const auto handle = open_read_only(copy.string());
+    persistence::Stmt check(handle.get(), "PRAGMA integrity_check");
+    if (!(check.step_row() && column_text(check.raw(), 0) == "ok")) {
+        throw WorldStoreError("snapshot_failed", "integrity_check failed for " + copy.string());
+    }
+}
+
+// 非 WorldStoreError（SqliteError、filesystem_error 等）转成 snapshot_failed，消息带上 what。
+template <typename Body>
+auto as_world_store_error(const std::string& what, const Body& body) {
+    try {
+        return body();
+    } catch (const WorldStoreError&) {
+        throw;
+    } catch (const std::exception& err) {
+        throw WorldStoreError("snapshot_failed", what + ": " + err.what());
+    }
+}
+
+// 分叉第 1 步（任何文件 I/O 之前）：新名、来源、来源的布局、新世界的设置。返回来源的记录与设置。
+struct ForkPlan {
+    WorldRecord source;
+    std::string settings_json;
+    WorldFlags flags;
+};
+
+ForkPlan plan_fork(const RegistryDb& reg, const std::string& source, const std::string& new_name,
+                   const ForkOptions& opts) {
+    if (!is_valid_world_name(new_name)) {
+        throw WorldStoreError("invalid_world_name", "'" + new_name +
+                                                        "' does not match [A-Za-z0-9][A-Za-z0-9._-]{0,127}");
+    }
+    try {
+        (void)reg.get(new_name);
+        throw WorldStoreError("world_exists", "world '" + new_name + "' exists");
+    } catch (const WorldStoreError& err) {
+        if (err.code() != "world_not_found") { throw; }
+    }
+    ForkPlan plan;
+    plan.source = reg.get(source);   // world_not_found
+    validate_world(reg, source);
+    plan.flags = WorldFlags{.seed = opts.seed, .read_only = opts.seed,
+                            .reclaimable = opts.reclaimable,
+                            .retention_group = opts.retention_group, .fork_of_world = source,
+                            .fork_of_snapshot = opts.snapshot_id,};
+    const WorldSettings merged = merge_settings(
+        settings_from_json(plan.source.settings_json),
+        opts.settings_overrides_json.empty() ? "{}" : opts.settings_overrides_json,
+        plan.flags.read_only);
+    plan.settings_json = settings_to_json(merged);
+    return plan;
+}
+
+NewWorld new_world_of(const ForkPlan& plan, const std::string& new_name, const ForkOptions& opts) {
+    return NewWorld{.name = new_name, .tenant = plan.source.tenant, .label = "",
+                    .labels = opts.labels, .settings_json = plan.settings_json,
+                    .now_iso = opts.now_iso.empty() ? iso_now() : opts.now_iso,
+                    .flags = plan.flags,};
+}
+
+// 分叉第 3 步：从 source_conn 复制到 db_file，返回摘要。见 world_store.hpp fork_world_from_connection。
+// 调用方已查过 schema（第 2 步，require_current_schema）。
+std::string copy_verified(persistence::Connection& source_conn, const std::string& source,
+                          const std::string& tenant, const fs::path& db_file,
+                          const ForkOptions& opts) {
+    sqlite3* dbh = source_conn.raw();
+    const fs::path partial = db_file.string() + ".partial";
+    const WriteMark before = write_mark(dbh);
+    const std::string expected = memoryops::digest(source_conn, tenant);
+    vacuum_into(dbh, partial);
+    if (opts.after_copy_for_test) { opts.after_copy_for_test(partial); }
+    if (write_mark(dbh) != before) {
+        throw WorldStoreError("world_busy", "source '" + source +
+                                                "' was written while it was being copied; retry");
+    }
+    require_intact(partial);
+    const std::string copied = digest_of_file(partial, tenant);
+    if (copied != expected) {
+        throw WorldStoreError("fork_digest_mismatch",
+                              "the copy of '" + source + "' has digest " + copied +
+                                  ", the source has " + expected);
+    }
+    fs::rename(partial, db_file);
+    return copied;
+}
+
+}  // namespace
+
+ForkResult fork_world_from_connection(RegistryDb& reg, persistence::Connection& source_conn,
+                                      const std::string& source, const std::string& new_name,
+                                      const ForkOptions& opts) {
+    if (!opts.snapshot_id.empty()) {
+        throw std::invalid_argument(
+            "fork_world_from_connection forks the open world itself; use fork_world for a snapshot");
+    }
+    const ForkPlan plan = plan_fork(reg, source, new_name, opts);
+    if (source_conn.raw() == nullptr) {
+        throw std::invalid_argument("fork source connection is closed");
+    }
+    ForkResult result;
+    result.world = as_world_store_error("fork of '" + source + "'", [&] {
+        require_current_schema(source_conn.raw(), source);   // 第 2 步：建目录之前
+        return reg.create_populated(new_world_of(plan, new_name, opts), [&](const fs::path& db_file) {
+            result.digest = copy_verified(source_conn, source, plan.source.tenant, db_file, opts);
+        });
+    });
+    return result;
+}
+
+ForkResult fork_world(RegistryDb& reg, const std::string& source, const std::string& new_name,
+                      const ForkOptions& opts) {
+    const ForkPlan plan = plan_fork(reg, source, new_name, opts);
+    fs::path from = plan.source.db_path;
+    if (!opts.snapshot_id.empty()) {
+        // 快照为来源：路径只从注册表取，解析后必须在来源的 snapshot_dir 之下（与回滚同一边界）。
+        const SnapshotEntry snap = registered_snapshot(reg, source, opts.snapshot_id);
+        require_inside_registry(plan.source.snapshot_dir, snap.path);
+        require_snapshot_file(snap.path);
+        from = snap.path;
+    } else {
+        std::error_code exists_err;
+        if (!fs::exists(from, exists_err)) {
+            throw WorldStoreError("snapshot_failed",
+                                  "database file of '" + source + "' does not exist");
+        }
+    }
+    ForkResult result;
+    result.world = as_world_store_error("fork of '" + source + "'", [&] {
+        auto conn = persistence::Connection::open_read_only(from);
+        require_current_schema(conn.raw(), source);   // 第 2 步：建目录之前
+        return reg.create_populated(new_world_of(plan, new_name, opts), [&](const fs::path& db_file) {
+            result.digest = copy_verified(conn, source, plan.source.tenant, db_file, opts);
+        });
+    });
+    return result;
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+ForkResult upgrade_seed(RegistryDb& reg, const std::string& source, const std::string& new_name,
+                        const std::string& now_iso) {
+    if (!reg.get(source).seed) {   // world_not_found
+        throw WorldStoreError("invalid_settings", "world '" + source + "' is not a seed");
+    }
+    ForkOptions opts;
+    opts.seed = true;
+    opts.now_iso = now_iso;
+    ForkPlan plan = plan_fork(reg, source, new_name, opts);
+    opts.labels = plan.source.labels;
+    NewWorld spec = new_world_of(plan, new_name, opts);
+    spec.label = plan.source.label;
+    ForkResult result;
+    result.world = as_world_store_error("upgrade of seed '" + source + "'", [&] {
+        auto conn = persistence::Connection::open_read_only(plan.source.db_path);
+        return reg.create_populated(spec, [&](const fs::path& db_file) {
+            const fs::path partial = db_file.string() + ".partial";
+            vacuum_into(conn.raw(), partial);
+            require_intact(partial);
+            {
+                auto adapter = persistence::SqliteAdapter::open(partial);   // 跑迁移到最新
+                adapter->close();                                            // WAL 合并进主文件
+            }
+            for (const char* suffix : {"-wal", "-journal"}) {
+                std::error_code err;
+                if (fs::exists(partial.string() + suffix, err) || err) {
+                    throw WorldStoreError("snapshot_failed",
+                                          "migrated copy of seed '" + source + "' left " +
+                                              partial.filename().string() + suffix);
+                }
+            }
+            {
+                std::error_code shm_err;
+                fs::remove(partial.string() + "-shm", shm_err);   // 不带状态（wal-index）
+            }
+            fs::rename(partial, db_file);
+            result.digest = digest_of_file(db_file, plan.source.tenant);
+        });
+    });
+    return result;
 }
 
 namespace internal {

@@ -19,11 +19,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace starling::persistence { class Connection; }
 
 namespace starling::governance {
 
@@ -51,12 +54,20 @@ private:
 //             list_sessions 的 limit 越界）
 //           | invalid_settings（world_settings：设置 JSON 解析失败、未知键、类型错误）
 //           | endpoint_changed（require_endpoint_unchanged：继承来的 provider 的种类或 base_url 已被改动，或 provider 已被删掉）
+//           | world_schema_behind（fork_world：来源库 schema_migrations 的最高版本低于本构建内嵌的最高版本）
+//           | fork_digest_mismatch（fork_world：来源没变，复制出来的库的摘要却与来源不同）
+//           | restore_digest_mismatch（rollback_world：恢复后的摘要与快照条目记的不同；库已替换）
+//           | world_busy（fork_world_from_connection：复制途中来源有写入；瞬态，调用方重试）
+//           | world_read_only（只读世界上写入；由引擎层抛，见第 3 期 Task 3.3）
 
 struct SnapshotEntry {
     std::string id;           // 20261025T011200Z-a1b2
     std::string path;         // 绝对路径
-    std::string kind;         // "auto" | "manual"
-    std::string reason;       // manual → "manual"；auto → "session" | "interval"（注册表校验）
+    // "auto" | "manual" | "held"。held 由调用方持有（客户端拍的快照，spec §7.1）：不参与保留份数的
+    // 修剪，只能显式删除。
+    std::string kind;
+    // manual → "manual"；auto → "session" | "interval"；held → "held"（注册表校验）
+    std::string reason;
     std::string note;
     std::string created_at;   // ISO-8601 UTC 秒精度
     std::string world_time;   // 快照覆盖到的世界时刻水位，可为空
@@ -68,6 +79,9 @@ struct SnapshotEntry {
     std::string session_id;
     // 内容标记（格式见 take_snapshot 第 2a 步）。为空时 JSON 不写；空串也表示「库里没有内容」。
     std::string content_mark;
+    // 快照文件里该世界租户的 library 摘要（memoryops::digest，见 take_snapshot 第 6a 步）。空串：第 3 期
+    // 之前登记的条目，或者快照里缺 statements / statement_vectors / events 之一（0038 之前的库，裁定 R10）。
+    std::string digest;
 };
 
 // 每个世界的自动快照配置（W4）。存在世界设置 settings_json 的 background.auto_snapshot 里
@@ -81,6 +95,41 @@ struct AutoSnapshotConfig {
 };
 
 [[nodiscard]] bool is_valid_world_name(std::string_view name);
+
+// 注册表里的一个世界（RegistryDb，registry_db.hpp）。定义在这里是因为分叉的结果 ForkResult 按值带着它，
+// 而 registry_db.hpp 包含本文件。
+struct WorldRecord {
+    std::string name, dir_id, tenant, db_path, snapshot_dir, label, created_at;
+    bool seed = false, read_only = false, reclaimable = false;  // seed 蕴含 read_only（spec §6.2）
+    // retention_group：自动清理的分组（第 6 期）；fork_of_*：分叉来源（fork_world / upgrade_seed 写入）
+    std::string retention_group, fork_of_world, fork_of_snapshot;
+    std::string settings_json;                                    // 不透明文本，Task 3 定模式
+    std::map<std::string, std::string> labels;
+    std::int64_t holders = 0, statements = 0;                     // 统计缓存
+    std::string last_write_at, stats_at;
+};
+
+// 建世界时写进记录、之后不再改的几项（spec §5.2、§6）。seed=true 蕴含 read_only=true；read_only 的世界
+// 设置里后台强制全关（merge_settings 的 read_only）。
+struct WorldFlags {
+    bool seed = false;
+    bool read_only = false;
+    bool reclaimable = false;
+    std::string retention_group;
+    std::string fork_of_world;      // 分叉来源的世界名
+    std::string fork_of_snapshot;   // 以快照为来源时是快照 id，以世界为来源时为空
+};
+
+// RegistryDb::create_populated 的入参：一个库文件由调用方写好的新世界。
+struct NewWorld {
+    std::string name;
+    std::string tenant;
+    std::string label;
+    std::map<std::string, std::string> labels;
+    std::string settings_json;      // 完整的设置 JSON（settings_to_json 的输出）
+    std::string now_iso;
+    WorldFlags flags;
+};
 
 class RegistryDb;   // registry_db.hpp：世界注册表 registry.db（SQLite）
 
@@ -112,8 +161,9 @@ class RegistryDb;   // registry_db.hpp：世界注册表 registry.db（SQLite）
 //     别处可以）；路径解析出错（EACCES、ELOOP）同样按越界处理，消息带上原因。
 //     数据目录本身可以是符号链接（例如整个 ~/.starling 指到别处）：两侧都解析，比的是同一处。
 //     <data_dir>/worlds 解析后也必须在 data_dir 之下；世界目录尚不存在时照常通过。
-//   - 每份快照的 kind 是 manual / auto，path 在字面上位于所属世界的 snapshot_dir 之下；
-//     kind="manual" 时 reason 必须是 "manual"，kind="auto" 时 reason 必须是 "session" 或 "interval"。
+//   - 每份快照的 kind 是 manual / auto / held，path 在字面上位于所属世界的 snapshot_dir 之下；
+//     kind="manual" 时 reason 必须是 "manual"，kind="auto" 时 reason 必须是 "session" 或 "interval"，
+//     kind="held" 时 reason 必须是 "held"。
 // 布局规则 1–3 的消息写明字段、原路径与解析到的位置，末尾附补救提示（世界目录内的路径不能外链；
 // 换盘请整个移动数据目录）。规则与 import_worlds_json 导入前对 worlds.json 的检查是同一份代码。
 void validate_world(const RegistryDb& reg, const std::string& world);
@@ -154,7 +204,7 @@ void verify_world_tenant(const std::string& db_path, const std::string& tenant);
                                               const std::string& tenant);
 
 struct SnapshotOptions {
-    std::string kind = "manual";      // "manual" | "auto"
+    std::string kind = "manual";      // "manual" | "auto" | "held"
     std::string reason = "manual";
     std::string note;
     // 向量后端。只有 "sqlite" 的向量在库文件里，其余（zvec）快照会缺向量，拒绝。
@@ -174,7 +224,7 @@ struct SnapshotOptions {
 };
 
 // 1. 取世界；不存在抛 world_not_found。kind 与 reason 不是 manual/manual、auto/session、
-//    auto/interval 之一抛 invalid_snapshot_kind；opts.now_iso 非空且形状不对抛
+//    auto/interval、held/held 之一抛 invalid_snapshot_kind；opts.now_iso 非空且形状不对抛
 //    invalid_auto_snapshot；vector_backend 不是 "sqlite" 抛 snapshot_unsupported_backend；保留份数
 //    非法抛 invalid_retention；validate_world 不通过抛它的码（registry_corrupt 等，裁定 R12）。都在
 //    任何文件 I/O 之前：快照目录还没建，源库还没打开，残留没清扫。
@@ -205,6 +255,9 @@ struct SnapshotOptions {
 //    否则删掉 partial 并抛 snapshot_failed。在这条连接上算 world_time、sessions_complete、content_mark。
 // 6. fs::rename(partial, <id>.db)，填 size_bytes、created_at（opts.now_iso 非空时就是它，
 //    否则取当前时间），session_id 取 opts.session_id。
+// 6a. 只读打开改好名的 <id>.db，算该世界租户的 digest（memoryops::digest）。库里缺 statements、
+//    statement_vectors、events 之一（0038 之前的库）时 digest 记空串，快照照常（裁定 R10）。算不出来
+//    （SQLite 错误）时删掉 <id>.db 并抛 snapshot_failed，不登记。
 // 7. 登记到注册表（RegistryDb::put_snapshot，成为该世界最新的一份），然后调用 apply_retention。
 //    登记失败时删掉刚改好名的 <id>.db 并抛 snapshot_failed：不留没有登记的文件（原来由调用方存
 //    注册表失败后调 discard_snapshot_file 补偿，现在在这里做完）。改名之后、登记之前崩溃留下的
@@ -212,7 +265,7 @@ struct SnapshotOptions {
 //    成功的快照一定返回它的条目：修剪失败（旧快照路径无法解析或删不掉）在这里
 //    被吞掉，不外抛。注册表与磁盘仍一致（每个旧快照先删文件再摘注册项），只是
 //    暂时多出几份，下一次 take_snapshot 或显式 apply_retention 会重试。
-// opts.kind 不是 "manual" / "auto" 时在写任何文件之前抛 invalid_snapshot_kind
+// opts.kind 不是 "manual" / "auto" / "held" 时在写任何文件之前抛 invalid_snapshot_kind
 // （保留策略只认 "auto"，拼错会悄悄丢掉回滚锚点保护）；reason 不配对同样在这里拒。
 // fs::space 返回「未知」（uintmax_t(-1)，FUSE / 网络文件系统）时跳过磁盘守卫。
 // 任何 SQLite 错误都转成 snapshot_failed，并保证不留下 partial 文件。
@@ -222,7 +275,9 @@ SnapshotEntry take_snapshot(RegistryDb& reg, const std::string& world,
 // 按保留份数 N（RegistryDb::snapshot_retention）修剪该世界的快照，并删除对应的文件，返回被删除的
 // id 列表。「最新」「最旧」指 RegistryDb::snapshots 的顺序（登记顺序，后登记的在前）。
 // 开头先 validate_world（裁定 R12），不通过抛它的码，什么都不删。
-// 规则（spec §4.4）：
+// 规则（spec §4.4；held 见 spec §7.1）：
+//   - kind="held" 的快照不参与：不计入总数，也从不删除（只能 delete_snapshot 显式删）。下面的「总数」
+//     只数 auto 与 manual。
 //   - 总数 <= N：不删。
 //   - 超出部分从最旧的开始删，优先删 auto；auto 删完还超出时才删 manual，从最旧的开始。
 //   - 但列表里有 auto 时，至少保留最新的 1 份 auto（回滚锚点）。
@@ -279,8 +334,8 @@ struct AutoSnapshotResult {
 //      否则拍一份，reason="interval"。没有 last、last 的 created_at 解析不了、last 晚于 now（时钟
 //      回拨，或那份快照的时间来自跳到未来的时钟）、last 没有 content_mark（W4 之前的条目），对应
 //      那一项都按「需要拍」处理。manual 快照不参与判断。
-//   5. 决定要拍之后、拍之前（Codex I-3）：先跑一次 apply_retention（异常接住）；之后该世界的快照数
-//      仍 >= snapshot_retention 就返回 refused（原因点名 retention 与修剪的错误），不拍、不写新文件、
+//   5. 决定要拍之后、拍之前（Codex I-3）：先跑一次 apply_retention（异常接住）；之后该世界参与修剪的
+//      快照数（不含 held）仍 >= snapshot_retention 就返回 refused（原因点名 retention 与修剪的错误），不拍、不写新文件、
 //      不抛。否则修剪卡住（最旧的 auto 路径越界或删不掉）时，每次触发都会多登记一份，无人值守地
 //      一直涨到磁盘守卫。拒绝时部分修剪的结果已写入注册表：卡住条目之前排着的正常 victim 已删文件、
 //      已摘注册项（r2 R2-2），调用方计为失败。
@@ -352,6 +407,9 @@ struct RollbackOptions {
 struct RollbackResult {
     std::string archive_path;   // 被替换的库现在的位置；库原本不存在时为空
     std::int64_t restored_bytes = 0;
+    // 恢复后的库上算出的摘要（第 12 步）。恢复出来的库缺 statements / statement_vectors / events 之一时
+    // 为空串（裁定 R10）。
+    std::string digest;
 };
 
 // 回滚的预检：只做 rollback_world 第 1–4 步的只读检查，顺序、错误码与 rollback_world 相同：
@@ -413,11 +471,15 @@ void check_rollback(const RegistryDb& reg, const std::string& world,
 //      按主文件加 WAL 重建），替换随后失败时旧库少了它们照常可用；替换之后再删，会有一段时间
 //      旧库的 -shm / -wal 挂在新库旁边。
 //   11. rename(partial, 库路径)，原子替换。旧 inode 只剩归档名这一个名字。
+//   12. 只读打开恢复后的库，算该世界租户的 digest（缺表时空串，裁定 R10），填进结果。快照条目带
+//      digest（非空）时两者必须相等，否则抛 restore_digest_mismatch：库已经替换（旧库在归档名下），说明
+//      快照文件在登记之后被改过，作为硬错误上报（spec §7.2）。条目的 digest 为空（第 3 期之前的条目）
+//      时不比较，照常返回恢复后的摘要。摘要算不出来抛 snapshot_failed，消息写明库已替换。
 // 第 1–9 步任何失败：目标库原样不动，partial 删掉。
 // 第 10–11 步失败：库路径上仍是旧库，摘掉归档名（经 remove_within），删掉 partial，抛
 // snapshot_failed。归档名摘不掉时它是现役库的第二个名字：记 stderr，错误信息写明不能用写
 // 连接打开它（清理它只删一个名字，无害）。
-// 不改注册表。所有非 WorldStoreError 的异常都转成 snapshot_failed。
+// 不改注册表。所有非 WorldStoreError 的异常都转成 snapshot_failed（第 12 步见上）。
 RollbackResult rollback_world(const RegistryDb& reg, const std::string& world,
                               const std::string& snapshot_id, const RollbackOptions& opts);
 
@@ -437,5 +499,75 @@ struct ArchiveEntry {
 // 删除 list_rollback_archives 列出的全部文件（经它先跑 validate_world），每个都经
 // remove_within(archive 目录, 文件)。返回删除的个数。确认越界的文件不删，抛 snapshot_failed。
 std::size_t purge_rollback_archives(const RegistryDb& reg, const std::string& world);
+
+// ---- 分叉、种子与升级种子（spec §6.1、§6.2） ------------------------------------
+
+struct ForkOptions {
+    std::string snapshot_id;                       // 空 = 以世界当前状态为来源
+    std::map<std::string, std::string> labels;     // 新世界的标签（建时一次写入，之后不能改）
+    std::string retention_group;
+    bool reclaimable = false, seed = false;        // seed 蕴含 read_only
+    std::string settings_overrides_json;           // 空 = 复制来源的设置
+    std::string now_iso;                           // 调用方给的时刻，记作新世界的 created_at
+    // 测试注入用：VACUUM INTO 写完 partial 之后、再读来源的 data_version 之前调用，参数是 partial 的
+    // 路径（模拟复制被篡改、复制途中来源被写）。为空时不调用（生产）。
+    std::function<void(const std::filesystem::path& partial)> after_copy_for_test;
+};
+
+struct ForkResult {
+    WorldRecord world;    // 登记后的新世界
+    std::string digest;   // 新世界的摘要（等于来源的摘要）
+};
+
+// 分叉一个开着的世界（有引擎）：复制与来源摘要都走引擎自己的连接 source_conn，读到它最近一次提交
+// （spec §6.1）。opts.snapshot_id 必须为空（以快照为来源用 fork_world：快照文件建好之后不再写），否则抛
+// std::invalid_argument。顺序：
+//   1. new_name 不合规则 invalid_world_name；已被占用 world_exists；来源不存在 world_not_found；
+//      validate_world(来源)（registry_corrupt 等）；opts.settings_overrides_json 合并到来源的设置上
+//      （merge_settings，非法时 invalid_settings 等）。都在任何文件 I/O 之前。
+//   2. 来源 schema_migrations 的最高版本（表不存在算 0）低于 MigrationRunner::latest_embedded_version()
+//      → world_schema_behind。不在来源上跑迁移，来源字节不变。
+//   3. 经 RegistryDb::create_populated 选 dir_id、建 worlds/<dir_id>/（与 create_world 同一套布局），
+//      然后在注册表锁之外：
+//      a. 读来源的 PRAGMA data_version 与 sqlite3_total_changes64（裁定 R11），在来源上算 digest；
+//      b. VACUUM INTO worlds/<dir_id>/world.db.partial；调用 opts.after_copy_for_test（非空时）；
+//      c. 再读一次 data_version 与 total_changes：任一变了（别的连接或同一条连接在复制途中提交了
+//         写入）→ world_busy（瞬态，调用方重试）。所以 fork_digest_mismatch 只表示「来源没变，复制
+//         却不同」；
+//      d. 只读打开 partial：PRAGMA integrity_check 必须为 "ok"（否则 snapshot_failed），算 digest，
+//         与 a 的不同 → fork_digest_mismatch；
+//      e. rename(partial, world.db)。
+//   4. 登记：tenant 取来源（语句行的 tenant_id 不可变）、label 为空、labels / retention_group /
+//      reclaimable / seed 取 opts（seed 蕴含 read_only）、fork_of_world=source、fork_of_snapshot 为空、
+//      设置是第 1 步合并的结果（只读时后台强制关）。第 3 步之后名字被抢先登记 → world_exists。
+// 任何一步失败：删掉整个新世界目录，不登记。不在注册表锁内复制。
+// 前提（调用方保证，Task 3.3 的 Python 侧持该世界的世界锁）：分叉期间没有别的写入落到来源上；有的话
+// 第 3c 步报 world_busy，不会产出不一致的副本。
+// SQLite 与文件系统错误转成 snapshot_failed。
+ForkResult fork_world_from_connection(RegistryDb& reg, persistence::Connection& source_conn,
+                                      const std::string& source, const std::string& new_name,
+                                      const ForkOptions& opts);
+
+// 分叉一个关着的世界，或它的一份快照（opts.snapshot_id 非空）：
+//   - 世界为来源：Connection::open_read_only(来源库) 之后走 fork_world_from_connection 的全部步骤。
+//     库文件不存在 → snapshot_failed。前提（裁定 R5）：来源关着，且调用方在分叉期间持着它（Python 的
+//     WorldPool 持世界锁 / 租约），没有写连接能打开它：只读打开可能走 immutable=1（不加锁、看不见之后
+//     的写入），这时第 3c 步的检查也看不见别的连接的写入。来源开着时用 fork_world_from_connection。
+//   - 快照为来源：快照不存在 snapshot_not_found；快照路径解析后越出来源的 snapshot_dir snapshot_failed；
+//     快照文件缺失 snapshot_corrupt；然后只读打开快照文件走同样的步骤（快照文件建好之后不再写，只读打开
+//     总是安全的）。新世界的 fork_of_snapshot = snapshot_id。
+ForkResult fork_world(RegistryDb& reg, const std::string& source, const std::string& new_name,
+                      const ForkOptions& opts);
+
+// 升级种子（spec §6.2，由人显式来做）：来源不是种子（seed=false）抛 invalid_settings（消息写明不是种子）。
+// new_name 的校验同 fork_world 第 1 步。然后经 RegistryDb::create_populated：只读打开旧种子的库，
+// VACUUM INTO 新世界目录的 world.db.partial，integrity_check，在 partial 上 SqliteAdapter::open（跑迁移
+// 到最新）并关闭（WAL 合并进主文件；之后 partial 旁边还有 -wal / -journal 就 snapshot_failed），
+// rename 成 world.db，再只读打开算 digest（缺表时空串，裁定 R10）。迁移可能给语句行加列，所以不与
+// 旧种子的摘要比较。登记：seed=true（蕴含只读）、fork_of_world=source、tenant / label / labels /
+// 设置取旧种子，created_at=now_iso。旧种子原样保留，字节不变（只读连接、不跑迁移）。
+// 任何一步失败：删掉新世界目录，不登记。SQLite 与文件系统错误转成 snapshot_failed。
+ForkResult upgrade_seed(RegistryDb& reg, const std::string& source, const std::string& new_name,
+                        const std::string& now_iso);
 
 }  // namespace starling::governance

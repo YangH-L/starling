@@ -210,6 +210,7 @@ add_executable(starling_tests
     test_registry_db.cpp
     test_registry_import.cpp
     test_world_settings.cpp
+    test_world_fork.cpp
 )
 target_include_directories(starling_tests BEFORE PRIVATE
     "${gtest_SOURCE_DIR}/include"
