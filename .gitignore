@@ -42,3 +42,6 @@ dashboard/web/build
 # Claude Code 会话目录与 firecrawl 缓存(本机产物,不提交)
 .claude/
 .firecrawl/
+
+# starling-client 构建时生成
+clients/python/starling_client/_build_info.py
