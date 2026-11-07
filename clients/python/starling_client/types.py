@@ -1,7 +1,7 @@
 """Result types. Plain dataclasses; no dependency on the Starling core."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 
 @dataclass
@@ -56,3 +56,14 @@ class StatementRow:
     consolidation_state: str
     review_status: str
     evidence_json: str
+    # The service serializes the whole row (spec §13.3); these three arrived after 4.4.
+    affect_json: str = ""
+    semantic_claim_json: str = ""
+    source_spans_json: str = ""
+
+
+def from_fields(cls, data: dict):
+    """Build dataclass `cls` from a service dict. Keys the class does not know are
+    dropped, so a newer service that adds a field does not break an older client."""
+    known = {item.name for item in fields(cls)}
+    return cls(**{key: value for key, value in data.items() if key in known})

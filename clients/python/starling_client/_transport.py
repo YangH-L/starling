@@ -10,6 +10,7 @@ PROTOCOL = 1
 
 class Transport:
     def __init__(self, url: str, token: str, timeout_s: float = 30.0, *, _httpx_transport=None):
+        self.timeout_s = float(timeout_s)
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         try:
             self._client = httpx.Client(
@@ -24,8 +25,12 @@ class Transport:
     def close(self) -> None:
         self._client.close()
 
-    def post(self, path: str, json: dict | None = None) -> dict:
-        return self._request("POST", path, json=json)
+    def post(self, path: str, json: dict | None = None, *, timeout_s: float | None = None) -> dict:
+        """timeout_s overrides the client timeout for this one request (e.g. a handle close that
+        waits on the service side for in-flight calls)."""
+        if timeout_s is None:
+            return self._request("POST", path, json=json)
+        return self._request("POST", path, json=json, timeout=timeout_s)
 
     def get(self, path: str, params: dict | None = None) -> dict:
         return self._request("GET", path, params=params)
