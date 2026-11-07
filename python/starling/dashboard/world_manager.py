@@ -156,6 +156,8 @@ __all__ = ["EngineFactory", "EngineLease", "WorldContext", "WorldPool", "WorldSw
 _LEASE_DRAIN_TIMEOUT_S = 30.0
 # 丢掉引擎后等旧 Runtime 被回收的宽限：异常回溯、刚返回的栈帧可能还短暂引用着它。
 _RUNTIME_RELEASE_GRACE_S = 1.0
+# 句柄 close(timeout) 等在途调用归零的轮询间隔（秒）。
+_HANDLE_CLOSE_POLL_S = 0.02
 # on_world_changed 的去抖窗口（秒）：每个世界每秒至多一次。
 _CHANGE_DEBOUNCE_S = 1.0
 # 统计缓存的后台刷新间隔（spec §5.5）。
@@ -497,18 +499,100 @@ class WorldPool:
                 return engine
             if closing:
                 raise WorldSwitchError("world_busy", world)
-            ctx = self.context(world)
-            self._refuse_leaked(ctx.db_path)          # 旧 Runtime 还开着这个库：不开第二条写连接
-            if not ctx.is_default:
-                self._verify_tenant(ctx)              # 裁定 R36：在打开库之前，拒开时什么都没建
-            engine = self._open_engine(world, ctx)
-            if not self._publish(world, engine):
-                box, engine = [engine], None          # 交出唯一的引用：回收证明要求本帧不再钉住它
-                self._discard_unpublished(box, ctx.db_path)
-                raise WorldSwitchError("world_busy", "the pool is shutting down")
-            return engine
+            return self._open_and_publish(world)
         finally:
             lock.release()
+
+    def _open_and_publish(self, world: str) -> DashboardEngine:
+        """持世界锁调用（表上没有它的引擎）：按此刻的 context 建引擎并发布，返回引擎。_build 与 admit_client_handle 共用。"""
+        ctx = self.context(world)
+        self._refuse_leaked(ctx.db_path)              # 旧 Runtime 还开着这个库：不开第二条写连接
+        if not ctx.is_default:
+            self._verify_tenant(ctx)                  # 裁定 R36：在打开库之前，拒开时什么都没建
+        engine = self._open_engine(world, ctx)
+        if not self._publish(world, engine):
+            box, engine = [engine], None              # 交出唯一的引用：回收证明要求本帧不再钉住它
+            self._discard_unpublished(box, ctx.db_path)
+            raise WorldSwitchError("world_busy", "the pool is shutting down")
+        return engine
+
+    # ───────────────────────── 客户端句柄（给 4.5 的路由，裁定 R61） ─────────────────────────
+
+    def admit_client_handle(self, world: str, session_id: str, holder: str, read_only: bool,
+                            now_ms: int) -> str:
+        """客户端的每一次开句柄（只读、可写都一样）都经这里，在 world 的世界锁内执行（裁定 R61），返回 handle_id。
+
+        世界锁以 50 毫秒为一段轮询着取（同首次建引擎）：世界处在关闭窗口里（关闭、恢复、删除），或等锁时进了关闭窗口，或池已
+        关停，就回 world_busy（瞬态），什么都不登记。所以关闭、恢复、删除与开句柄互相排斥。调用方在工作线程里调，不持租约。
+
+        可写打开：
+          1. C++ world_require_writable(rec, for_client_write=True, held_by_other=False)：种子、只读世界 world_read_only。两个
+             客户端之间的写占用冲突由 SessionTable.open_handle 抛 world_held。
+          2. 池里已有可写引擎：写者已经在了（库旁边有 -wal/-shm，冻结退回普通 mode=ro），不用等，直接登记。
+          3. 池里没有可写引擎（没有引擎，或只有只读引擎）：进关闭窗口，走与 close_world 相同的路径等该世界的全部租约（build=True
+             与 build=False）归零、把只读引擎完整关掉并确认它的 Runtime 已回收（裁定 R30、R37、R53）；然后先登记写占用
+             （open_handle），再按此刻的 context 建可写引擎（held 已为真，C++ 判 rw、不冻结，裁定 R67）；最后退出窗口。窗口里
+             谁也打不开这个世界的库，所以任何检视连接要么在登记之前已经关掉，要么在登记之后才打开（冻结判定给 Shared）。
+             建引擎失败：撤销这个句柄（不留没有引擎的写占用），原样抛出。旧 Runtime 回收不了：world_busy，不登记。
+        只读打开：不切换引擎。池里没有引擎时按看板的方式打开（此刻没人占着写入就是 decide_open_mode(rec, false)），然后登记。
+
+        会话未知或已过期：SessionTable 抛 session_expired。now_ms 必须来自池的时钟（now_ms()，裁定 R60）。"""
+        sessions = self._sessions
+        if sessions is None:
+            raise WorldSwitchError("worlds_unavailable", "the pool has no client session table")
+        rec = self._record(world)                     # world_not_found：未知世界名不建世界锁
+        lock = self._acquire_for_build(world)         # 关闭窗口里 → world_busy
+        try:
+            with self._lock:
+                closing = world in self._closing or self._shut
+                engine = self._engines.get(world)
+            if closing:
+                raise WorldSwitchError("world_busy", world)
+            has_writer = engine is not None and not getattr(engine, "read_only", False)
+            has_engine = engine is not None
+            engine = None
+            if read_only:
+                if not has_engine:
+                    self._open_and_publish(world)
+                return sessions.open_handle(session_id, world, holder, True, now_ms)
+            _core.world_require_writable(rec, for_client_write=True, held_by_other=False)
+            if has_writer:
+                return sessions.open_handle(session_id, world, holder, False, now_ms)
+            return self._admit_first_writer(world, rec, session_id, holder, now_ms)
+        finally:
+            lock.release()
+
+    def _admit_first_writer(self, world: str, rec: dict, session_id: str, holder: str,
+                            now_ms: int) -> str:
+        """持世界锁调用（池里没有 world 的可写引擎）：关闭窗口里排干全部租约、关掉只读引擎，登记写占用，建可写引擎。"""
+        sessions = self._sessions
+        with _ClosingWindow(self, world):
+            if not self._close_engine(world, _LEASE_DRAIN_TIMEOUT_S):
+                raise WorldSwitchError(
+                    "world_busy", "the read-only engine's runtime is still referenced")
+            self._refuse_leaked(rec["db_path"])
+            handle = sessions.open_handle(session_id, world, holder, False, now_ms)
+            try:
+                self._open_and_publish(world)
+            except BaseException:
+                sessions.close_handle(handle)
+                raise
+            return handle
+
+    def close_client_handle(self, handle_id: str, timeout_s: float) -> None:
+        """句柄的 close(timeout)（spec §11）：等这个句柄的在途调用（SessionTable.in_flight）归零再关。超时回 world_busy，句柄保持
+        打开。未知或已关闭的句柄直接返回（幂等）。短轮询（20 毫秒），不取世界锁、不持租约。"""
+        sessions = self._sessions
+        if sessions is None:
+            raise WorldSwitchError("worlds_unavailable", "the pool has no client session table")
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while sessions.in_flight(handle_id) > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WorldSwitchError(
+                    "world_busy", f"{sessions.in_flight(handle_id)} call(s) still in flight")
+            time.sleep(min(_HANDLE_CLOSE_POLL_S, remaining))
+        sessions.close_handle(handle_id)
 
     @staticmethod
     def _verify_tenant(ctx: WorldContext) -> None:
