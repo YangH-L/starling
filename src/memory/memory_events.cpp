@@ -420,7 +420,7 @@ RememberOutcome remember_event_finish(persistence::SqliteAdapter& adapter,
                   .engram_ref = begun.prepared.engram_ref,
                   .statement_ids = {},
                   .outcome = begun.prepared.outcome,
-                  .extraction_failed = false};
+                  .extraction_failed = false,};
     } else {
         // remember_commit_all 抛异常时行留 pending(不 catch),异常原样上抛。
         result = remember_commit_all(adapter, llm, base, begun.prepared, extracted, policy);
