@@ -85,7 +85,7 @@ def _open_pool(config: DashboardConfig, engine_factory) -> WorldPool:
 
 class _NotReadyGate:
     """就绪之前（spec §10.1：注册表打开、默认世界引擎建好之前）所有 HTTP 请求回 503 worlds_unavailable（瞬态，码表里
-    已有），WebSocket 握手直接拒绝。就绪之后原样放行。纯 ASGI 中间件：lifespan 消息不经这里拦。"""
+    已有），WebSocket 先 accept 再以 1013 关闭。就绪之后原样放行。纯 ASGI 中间件：lifespan 消息不经这里拦。"""
 
     def __init__(self, app, *, state) -> None:
         self.app = app
@@ -96,7 +96,12 @@ class _NotReadyGate:
             await self.app(scope, receive, send)
             return
         if scope["type"] == "websocket":
-            await send({"type": "websocket.close", "code": 1013})
+            # 先 accept 再以 1013（Try Again Later）关闭（裁定 R83 M3）：握手前的 close 在 ASGI 里是拒绝握手（HTTP 403），客户端
+            # 看不到关闭码。先收下 connect 消息。
+            message = await receive()
+            if message["type"] == "websocket.connect":
+                await send({"type": "websocket.accept"})
+                await send({"type": "websocket.close", "code": 1013})
             return
         from starling.dashboard.routes.world_scope import error_body, status_for
         await JSONResponse(error_body("worlds_unavailable"),

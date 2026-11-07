@@ -346,3 +346,36 @@ def test_starling_serve_console_script_is_declared():
     with open(ROOT / "pyproject.toml", "rb") as fh:
         scripts = tomllib.load(fh)["project"].get("scripts", {})
     assert scripts.get("starling-serve") == "starling.service.serve:main"
+
+
+# ───────────────────────── 修复轮：R83 M3、R85 ─────────────────────────
+
+def test_websocket_before_ready_is_accepted_then_closed_1013(services, tmp_path):
+    """R83 M3：就绪之前的 WebSocket 先 accept、再以 1013（Try Again Later）关闭：客户端拿到明确的关闭码，而不是握手被拒
+    （HTTP 403）。"""
+    import asyncio
+
+    import websockets
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    launcher = scripts / "gated_serve.py"
+    launcher.write_text(_GATED_LAUNCHER, encoding="utf-8")
+    gate = tmp_path / "gate"
+    service = services(tmp_path / "D", launcher=launcher, env_extra={"T43_GATE": str(gate)})
+    service.wait_listening()
+
+    async def _probe():
+        url = f"ws://127.0.0.1:{service.port}/ws/converse?token={TOKEN}"
+        async with websockets.connect(url, additional_headers={"Authorization": f"Bearer {TOKEN}"}) as ws:
+            try:
+                await asyncio.wait_for(ws.recv(), 10)
+            except websockets.ConnectionClosed as closed:
+                return closed.rcvd.code if closed.rcvd else None
+        return None
+    try:
+        assert asyncio.run(_probe()) == 1013
+    finally:
+        gate.write_text("open", encoding="utf-8")
+    service.wait_ready()
+
+

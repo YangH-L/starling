@@ -773,12 +773,13 @@ class WorldPool:
         return engine
 
     def _wire(self, world: str, engine) -> None:
-        """挂上池的回调：统计去抖广播（on_commit）与按会话的自动快照钩子（有注册表时）。钩子只挂给可写打开、且不可回收的世界
-        （spec §6.3、裁定 R68）：只读引擎与可回收世界（切成可写引擎也一样）不起摄入，没有调用钩子的地方。"""
+        """挂上池的回调：统计去抖广播（on_commit）与按会话的自动快照钩子（有注册表时）。钩子只由摄入线程调，所以只挂给可写打开、
+        且 C++ 给的生效设置开着摄入的世界（spec §6.3、裁定 R68、R83 M1）：只读引擎不挂；可回收世界的生效设置后台全关（C++
+        effective_world_settings 判，切成可写引擎也一样），不挂。Python 不另判世界类型。"""
         engine.on_commit = lambda: self._note_change(world)
         if self._registry is None or getattr(engine, "read_only", False):
             return
-        if self._record(world).get("reclaimable"):
+        if not engine._settings["background"]["ingest"]:
             return
         self.attach_hooks(world, engine)
 
@@ -1050,27 +1051,40 @@ class WorldPool:
         关掉的世界。一个世界关不掉（租约排干超时、线程停不下：world_busy）或出别的错只记日志，不挡别的世界，下一轮再试。没有会话表时
         什么都不关。
 
-        判与关之间有窗口：判过之后来了新租约或新句柄，close_world 照常等它的租约归零再关（与显式关闭一样），客户端下一次调用会
-        重建引擎；所以这里不再持锁复判。"""
+        每轮开头先 expire(now)（裁定 R52）。默认世界的判定也交给 C++（is_default=True 时 may_close_world 恒为 false，R83 M1）。
+        判为可关的世界在世界锁内、关闭窗口里再判一次才关（_close_if_still_idle，R83 M2）。"""
         sessions = self._sessions
         if sessions is None:
             return []
+        try:
+            sessions.expire(self.now_ms())            # 裁定 R52：清过期会话、24 小时以上的墓碑
+        except Exception:  # noqa: BLE001 — 后台路径：清理失败不挡空闲关闭
+            logger.exception("session expiry sweep failed")
         default = self.default_world()
         timeout_s = _LEASE_DRAIN_TIMEOUT_S if drain_timeout_s is None else drain_timeout_s
         closed: list[str] = []
         for world in self.open_worlds():
-            if world == default or not sessions.may_close_world(world, False, self.now_ms()):
+            is_default = world == default
+            if not sessions.may_close_world(world, is_default, self.now_ms()):
                 continue
             try:
-                self.close_world(world, timeout_s)
+                if self._close_if_still_idle(world, is_default, timeout_s):
+                    closed.append(world)
             except WorldSwitchError as exc:
                 logger.info("idle close of world %s skipped: %s", world, exc.code)
-                continue
             except Exception:  # noqa: BLE001 — 后台路径：一个世界出错不挡别的世界
                 logger.exception("idle close of world %s failed", world)
-                continue
-            closed.append(world)
         return closed
+
+    def _close_if_still_idle(self, world: str, is_default: bool, timeout_s: float) -> bool:
+        """空闲轮里关一个世界（裁定 R83 M2）：在世界锁内、进了关闭窗口之后、动引擎之前再问一次 C++ may_close_world。窗口里不会有
+        新句柄、新租约，所以这次判定之后到关完之间世界不会重新变忙；第一次判定之后（窗口打开之前）来的句柄或租约由这次挡住。
+        返回是否关了。默认世界的判定由 C++ 给（恒 false），这里不另判。"""
+        with self._world_lock(world), _ClosingWindow(self, world):
+            if not self._sessions.may_close_world(world, is_default, self.now_ms()):
+                return False
+            self._close_engine(world, timeout_s)
+        return True
 
     def _idle_close_loop(self, stop: threading.Event, poll_s: float, first_delay_s: float) -> None:
         if stop.wait(first_delay_s):
@@ -1356,7 +1370,11 @@ class WorldPool:
     def delete_world(self, world: str) -> None:
         """删世界：先关（等租约、停线程、丢引擎），旧 Runtime 回收不了就拒绝（world_busy，什么都不删），
         再由 C++ 删注册项与目录。默认世界由 C++ 拒绝（world_protected），引擎不动。全程持世界锁、处于
-        关闭窗口：删的途中没有新租约能把它重新打开。"""
+        关闭窗口：删的途中没有新租约能把它重新打开。
+
+        会话表（裁定 R60、R83 M4）：第一步是 forget_world，有活句柄或在途调用时 world_in_use、什么都不动。它一旦通过，会话表里
+        这个世界的记录（最后活动、句柄条目、墓碑）就已经清掉了；之后的步骤再失败（world_busy、C++ 删注册项失败），世界还在、记录
+        却没了：空闲关闭按「没有记录」处理（不关），下一次看板请求或客户端开句柄会重新记上。不恢复记录。"""
         reg = self._require_registry()
         if world == reg.default_world():
             reg.remove(world)                         # C++ 抛 world_protected

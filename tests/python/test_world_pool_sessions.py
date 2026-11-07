@@ -1001,3 +1001,101 @@ def test_dashboard_write_counter_and_hold_check_are_serialised(app_client):
             pass
     assert _code(ei) == "world_held"
     assert pool.dashboard_writes_in_flight("w1") == 0
+
+
+# ═════════════════════════ 修复轮：R83 的小项 ═════════════════════════
+
+def test_hook_follows_the_cpp_effective_settings(tmp_path):
+    """M1：挂不挂按会话的自动快照钩子取 C++ 给的生效设置（background.ingest），Python 不判 reclaimable。可写的普通世界关掉
+    摄入后也不挂（钩子只由摄入线程调）；默认开着的照挂；可回收世界（生效设置后台全关）切成可写也不挂。"""
+    pool, sessions, clock = _idle_pool(tmp_path)
+    try:
+        pool.create_world("off", "", overrides={"background": {"ingest": False}})
+        pool.fork_world("w1", "rollout-1", reclaimable=True)
+        with pool.lease("w1") as on_engine, pool.lease("off") as off_engine:
+            assert on_engine.session_snapshot_hook is not None
+            assert off_engine.session_snapshot_hook is None
+            on_engine = off_engine = None
+        sid = sessions.connect(clock())
+        pool.admit_client_handle("rollout-1", sid, "alice", False, clock())
+        with pool.lease("rollout-1") as engine:
+            assert engine.read_only is False and engine.session_snapshot_hook is None
+            engine = None
+    finally:
+        pool.close_all()
+
+
+def test_idle_round_leaves_the_default_decision_to_cpp(tmp_path, monkeypatch):
+    """M1：空闲轮给 may_close_world 传 is_default=(world == default)，不在 Python 里先跳过默认世界。"""
+    pool, sessions, clock = _idle_pool(tmp_path)
+    try:
+        with pool.lease("default"), pool.lease("w1"):
+            pass
+        clock.now += 1_001
+        calls: list = []
+
+        class _Spy:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def may_close_world(self, world, is_default, now_ms):
+                calls.append((world, is_default))
+                return self._inner.may_close_world(world, is_default, now_ms)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+        pool.attach_sessions(_Spy(sessions))
+        assert pool.idle_close_round() == ["w1"]
+        assert ("default", True) in calls and ("w1", False) in calls
+        assert "default" in pool.open_worlds()
+    finally:
+        pool.close_all()
+
+
+def test_idle_round_rechecks_inside_the_closing_window(tmp_path, monkeypatch):
+    """M2：轮里判过「可以关」之后、真正关之前，世界有了新活动（这里：判定之后立刻来了一个只读句柄）：在世界锁内、关闭窗口里
+    再问一次 may_close_world，不关。"""
+    pool, sessions, clock = _idle_pool(tmp_path)
+    try:
+        with pool.lease("w1"):
+            pass
+        clock.now += 1_001
+        real = sessions.may_close_world
+        state = {"first": True}
+
+        class _Spy:
+            def may_close_world(self, world, is_default, now_ms):
+                verdict = real(world, is_default, now_ms)
+                if world == "w1" and state["first"]:
+                    state["first"] = False
+                    sid = sessions.connect(now_ms)          # 判过之后：来了一个句柄
+                    sessions.open_handle(sid, "w1", "alice", True, now_ms)
+                return verdict
+
+            def __getattr__(self, name):
+                return getattr(sessions, name)
+        pool.attach_sessions(_Spy())
+        assert pool.idle_close_round() == []
+        assert "w1" in pool.open_worlds()
+        assert not pool.closing_worlds()
+    finally:
+        pool.close_all()
+
+
+def test_idle_round_expires_sessions_first(tmp_path):
+    """另加项（R52）：每轮开头 sessions.expire(now)。可观察到的只有 expire 做得到的事：过期会话的句柄先成墓碑（记下 expired_at），
+    24 小时之后的一轮把墓碑清掉，此后 resolve 回 handle_closed（不调 expire 时一直是 session_expired）。"""
+    pool, sessions, clock = _idle_pool(tmp_path)
+    try:
+        sid = sessions.connect(clock())
+        handle = sessions.open_handle(sid, "w1", "alice", False, clock())
+        clock.now += 30_000
+        pool.idle_close_round()                            # 这一轮把它变成墓碑
+        clock.now += 86_400_001
+        pool.idle_close_round()                            # 这一轮清掉超过 24 小时的墓碑
+        with pytest.raises(_core.WorldStoreError) as ei:
+            sessions.resolve(handle, clock())
+        assert _code(ei) == "handle_closed"
+    finally:
+        pool.close_all()
+
