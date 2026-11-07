@@ -192,6 +192,7 @@ target_sources(starling_core PRIVATE
     src/governance/registry_import.cpp
     src/governance/world_settings.cpp
     src/governance/error_catalog.cpp
+    src/governance/session_table.cpp
 )
 target_compile_options(starling_core PRIVATE ${STARLING_WARNING_FLAGS})
 if(TARGET SQLite3::SQLite3)

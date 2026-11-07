@@ -356,9 +356,18 @@ OpenMode decide_open_mode(const WorldRecord& rec, bool for_client_write) {
     return OpenMode::ReadWrite;
 }
 
-pst::ReadOnlyFreeze read_only_freeze_for(const WorldRecord& rec) {
-    return decide_open_mode(rec, false) == OpenMode::ReadOnly ? pst::ReadOnlyFreeze::Frozen
-                                                              : pst::ReadOnlyFreeze::Shared;
+void require_writable(const WorldRecord& rec, bool for_client_write, bool held_by_other) {
+    if (held_by_other) {
+        throw WorldStoreError("world_held", rec.name + " is held for write by a client session");
+    }
+    if (decide_open_mode(rec, for_client_write) == OpenMode::ReadOnly) {
+        throw WorldStoreError("world_read_only", rec.name);
+    }
+}
+
+pst::ReadOnlyFreeze read_only_freeze_for(const WorldRecord& rec, bool held_for_write) {
+    const bool frozen = decide_open_mode(rec, false) == OpenMode::ReadOnly && !held_for_write;
+    return frozen ? pst::ReadOnlyFreeze::Frozen : pst::ReadOnlyFreeze::Shared;
 }
 
 WorldSettings effective_world_settings(const WorldRecord& rec) {

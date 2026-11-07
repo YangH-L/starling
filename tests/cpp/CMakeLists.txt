@@ -210,6 +210,7 @@ add_executable(starling_tests
     test_registry_db.cpp
     test_registry_import.cpp
     test_error_catalog.cpp
+    test_session_table.cpp
     test_world_settings.cpp
     test_world_fork.cpp
 )
