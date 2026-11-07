@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "starling/governance/error_catalog.hpp"
 #include "starling/governance/registry_db.hpp"
 #include "starling/governance/world_settings.hpp"
 #include "starling/governance/world_store.hpp"
@@ -206,6 +207,19 @@ void bind_15_world(pybind11::module_& m) {
         const auto pos = text.find(':');
         return pos == std::string::npos ? text : text.substr(0, pos);
     }, py::arg("exc"));
+
+    // 错误码目录（spec §13.2）：[{code, transient, http_status}]，顺序固定。
+    m.def("error_catalog", [] {
+        py::list out;
+        for (const auto& info : gov::error_catalog()) {
+            py::dict item;
+            item["code"] = std::string(info.code);
+            item["transient"] = info.transient;
+            item["http_status"] = info.http_status;
+            out.append(std::move(item));
+        }
+        return out;
+    });
 
     m.def("world_is_valid_name", &gov::is_valid_world_name, py::arg("name"));
 

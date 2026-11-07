@@ -411,7 +411,7 @@ def test_write_to_read_only_world_is_409_world_read_only(client, kind):
               ("/commitment/withdraw", {"stmt_id": stmt_id}))
     for path, body in writes:
         resp = client.post(f"/api/w/ro-1{path}", json=body)
-        assert (resp.status_code, resp.json()) == (409, {"detail": "world_read_only"}), path
+        assert (resp.status_code, resp.json()) == (409, {"code": "world_read_only", "transient": False, "detail": "world_read_only"}), path
     with client.websocket_connect("/ws/converse") as ws:
         ws.send_json({"message": "who owns billing?", "world": "ro-1"})
         assert ws.receive_json() == {"type": "error", "error": "world_read_only"}
@@ -436,7 +436,7 @@ def test_read_only_engine_maps_a_real_sqlite_readonly_write_to_409(client, monke
     del ei
     monkeypatch.setattr(core, "recall", lambda *_a, **_k: core.tick("2026-11-06T00:00:00Z"))
     resp = client.post("/api/w/rollout-1/recall", json={"query": "auth"})
-    assert (resp.status_code, resp.json()) == (409, {"detail": "world_read_only"})
+    assert (resp.status_code, resp.json()) == (409, {"code": "world_read_only", "transient": False, "detail": "world_read_only"})
 
 
 def test_read_only_engine_maps_write_rejections_to_world_read_only(client, monkeypatch):
@@ -457,7 +457,7 @@ def test_read_only_engine_maps_write_rejections_to_world_read_only(client, monke
                 _core.ReadOnlyWriteRejected("Stmt: step failed: attempt to write a readonly database")):
         raised["exc"] = exc
         resp = client.post("/api/w/rollout-1/recall", json={"query": "auth"})
-        assert (resp.status_code, resp.json()) == (409, {"detail": "world_read_only"}), exc
+        assert (resp.status_code, resp.json()) == (409, {"code": "world_read_only", "transient": False, "detail": "world_read_only"}), exc
     for exc in (ValueError("something else"),
                 RuntimeError("Stmt: step failed: attempt to write a readonly database")):
         raised["exc"] = exc

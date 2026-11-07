@@ -3,7 +3,7 @@
 每个检视、命令路由挂两次（create_app）：前缀 /api 指向默认世界（旧路径，现有脚本、hook、前端照旧可用），
 前缀 /api/w/{world} 指向指定世界。请求落在哪个世界只由 world_name 这一个依赖项决定，租约、只读检视都经它。
 
-世界错误统一由 install_error_handlers 注册的异常处理器转成 {"detail": "<码>"}（前端按 detail 显示提示）：
+世界错误统一由 install_error_handlers 注册的异常处理器转成 {"code", "transient", "detail"}（detail 等于码）（前端按 detail 显示提示）：
 引擎池的 WorldSwitchError（取租约时：世界不存在、正在关闭等），以及引擎调用里抛出的 C++ WorldStoreError
 （如 endpoint_changed：继承的 provider 地址已改）。码由池或 C++ 给出，这里只查表定 HTTP 状态。
 
@@ -17,7 +17,7 @@ import logging
 import threading
 
 from anyio import to_thread
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from starling import _core
@@ -28,17 +28,23 @@ logger = logging.getLogger(__name__)
 # 指定世界的前缀；检视与命令路由在 /api 之外再挂到这里。
 WORLD_PREFIX = "/api/w/{world}"
 
-# 错误码 → HTTP 状态。未登记的码按 500。
-_STATUS = {
-    "world_not_found": 404, "invalid_world_name": 400,
-    "world_busy": 503, "worlds_unavailable": 503,
-    "endpoint_changed": 409, "world_protected": 409, "world_tenant_mismatch": 409,
-    "invalid_settings": 400,
-    "world_open_failed": 500, "rollback_reopen_failed": 500,
-    # 第 3 期（spec §6、§13.2）：只读世界上写入、分叉来源 schema 落后、分叉或恢复后摘要对不上。
-    "world_read_only": 409, "world_schema_behind": 409, "world_not_seed": 409,
-    "fork_digest_mismatch": 500, "restore_digest_mismatch": 500,
-}
+# 错误码 → HTTP 状态与瞬态标志，都取自 C++ 错误码目录（spec §13.2）。未登记的码按 500、非瞬态。
+_CATALOG = {row["code"]: row for row in _core.error_catalog()}
+_STATUS = {code: row["http_status"] for code, row in _CATALOG.items()}
+
+
+def error_body(code: str) -> dict:
+    """统一错误体：detail 仍等于 code（前端 describeError 读 detail），code 与 transient 给程序用。"""
+    row = _CATALOG.get(code)
+    return {"code": code, "transient": bool(row and row["transient"]), "detail": code}
+
+
+class WorldHTTPError(HTTPException):
+    """带统一错误体的世界错误；由 install_error_handlers 注册的处理器渲染。"""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(status_code=_STATUS.get(code, 500), detail=code)
+        self.code = code
 
 
 def world_name(request: Request) -> str:
@@ -106,14 +112,18 @@ def install_error_handlers(app: FastAPI) -> None:
         status = status_for(exc.code)
         if status >= 500:
             logger.warning("world error %s: %s", exc.code, exc.detail)
-        return JSONResponse({"detail": exc.code}, status_code=status)
+        return JSONResponse(error_body(exc.code), status_code=status)
 
     async def _store_error(_request: Request, exc: Exception) -> JSONResponse:
         code = _core.world_store_error_code(exc)
         status = status_for(code)
         if status >= 500:
             logger.warning("world store error %s: %s", code, exc)
-        return JSONResponse({"detail": code}, status_code=status)
+        return JSONResponse(error_body(code), status_code=status)
 
+    async def _world_http_error(_request: Request, exc: WorldHTTPError) -> JSONResponse:
+        return JSONResponse(error_body(exc.code), status_code=exc.status_code)
+
+    app.add_exception_handler(WorldHTTPError, _world_http_error)
     app.add_exception_handler(WorldSwitchError, _switch_error)
     app.add_exception_handler(_core.WorldStoreError, _store_error)

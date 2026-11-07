@@ -29,26 +29,13 @@ from pydantic import BaseModel, StrictBool, StrictInt
 
 from starling import _core
 from starling.dashboard.engine import endpoint_api_key
+from starling.dashboard.routes.world_scope import _STATUS as _SCOPE_STATUS, WorldHTTPError
 from starling.dashboard.world_manager import WorldSwitchError
 
 logger = logging.getLogger(__name__)
 
-# 错误码 → HTTP 状态。未登记的码按 500。
-_STATUS = {
-    "invalid_world_name": 400, "confirm_mismatch": 400, "rollback_mode_unsupported": 400,
-    "invalid_auto_snapshot": 400, "invalid_settings": 400, "invalid_labels": 400,
-    "invalid_world_query": 400,
-    "world_not_found": 404, "snapshot_not_found": 404,
-    "world_exists": 409, "world_protected": 409, "labels_immutable": 409,
-    "snapshot_unsupported_backend": 409, "invalid_retention": 409, "endpoint_changed": 409,
-    "world_tenant_mismatch": 409, "snapshot_corrupt": 409, "world_in_use": 409,
-    "insufficient_disk": 507, "world_busy": 503, "worlds_unavailable": 503,
-    "world_open_failed": 500, "snapshot_failed": 500, "registry_corrupt": 500,
-    "rollback_reopen_failed": 500,
-    # 第 3 期（spec §6、§13.2）。
-    "world_read_only": 409, "world_schema_behind": 409, "world_not_seed": 409,
-    "fork_digest_mismatch": 500, "restore_digest_mismatch": 500,
-}
+# 错误码 → HTTP 状态：与作用域路由共用同一张取自 C++ 错误码目录的表。
+_STATUS = _SCOPE_STATUS
 
 # 世界设置里带 provider 密钥的段（返回时每段加 key_set）。
 _ENDPOINT_SECTIONS = ("extraction", "embedding", "chat", "consolidation")
@@ -107,7 +94,7 @@ class RollbackBody(BaseModel):
 
 
 def _fail(code: str) -> HTTPException:
-    return HTTPException(status_code=_STATUS.get(code, 500), detail=code)
+    return WorldHTTPError(code)
 
 
 async def _run(fn, *args, **kwargs):

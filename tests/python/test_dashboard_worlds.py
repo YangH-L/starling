@@ -539,7 +539,7 @@ def test_first_open_refuses_a_world_with_foreign_tenant_rows(tmp_path):
     for method, path, body in (("post", "/api/w/sim-1/tick", {}),
                                ("post", "/api/w/sim-1/remember", {"text": "x"})):
         r = client.request(method, path, json=body)
-        assert (r.status_code, r.json()) == (409, {"detail": "world_tenant_mismatch"}), path
+        assert (r.status_code, r.json()) == (409, {"code": "world_tenant_mismatch", "transient": False, "detail": "world_tenant_mismatch"}), path
     assert built == [] and "sim-1" not in pool.open_worlds()
     assert client.post("/api/tick", json={}).status_code == 200      # 默认世界照常
     pool.close_all()

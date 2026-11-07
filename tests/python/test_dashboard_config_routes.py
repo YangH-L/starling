@@ -138,7 +138,8 @@ def test_invalid_settings_rejected_before_anything_is_written(tmp_path, monkeypa
         "providers": {"p2": {"provider": "openai", "model": "m", "api_key": "sk-new"}},
         "roles": {"extraction": "p2"},
         "gist_thresholds": gist})
-    assert (r.status_code, r.json()) == (400, {"detail": "invalid_settings"})
+    assert (r.status_code, r.json()) == (400, {"code": "invalid_settings", "transient": False,
+                                              "detail": "invalid_settings"})
     assert cfgfile.read_bytes() == before
     assert cfg.to_dict() == snapshot
     assert client.get("/api/config").json()["gist_thresholds"] == {"min_holders": 3}
