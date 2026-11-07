@@ -102,16 +102,17 @@ async def _engine(request: Request, world: str = Depends(world_name)):
 
 
 async def _writable_engine(request: Request, world: str = Depends(world_name)):
-    """改内容的命令路由的依赖项（裁定 R51）：先过 C++ 的看板写入准入（pool.require_dashboard_writable：被客户端占着写入的
-    世界 409 world_held，可回收世界也是；没人占着的只读打开的世界 409 world_read_only），再与 _engine 一样持一份引擎租约。
-    被拒时不取租约、不建引擎。召回与 working_set 不经这里。"""
+    """改内容的命令路由的依赖项（裁定 R51、R82）：进 pool.dashboard_write(world)——C++ 的看板写入准入（被客户端占着写入的世界
+    409 world_held，可回收世界也是；没人占着的只读打开的世界 409 world_read_only）与在途计数在同一次持池锁内完成——再与 _engine
+    一样持一份引擎租约，覆盖整个请求。计数在请求结束（含异常、取消）时减回去；计数大于 0 时客户端的可写 admit 回 world_busy。
+    被拒时不计数、不取租约、不建引擎。召回与 working_set 不经这里。"""
     pool = request.app.state.pool
-    pool.require_dashboard_writable(world)
-    lease = await lease_off_loop(pool, world)
-    try:
-        yield lease.engine
-    finally:
-        lease.release()
+    with pool.dashboard_write(world):
+        lease = await lease_off_loop(pool, world)
+        try:
+            yield lease.engine
+        finally:
+            lease.release()
 
 
 def build_commands_router(require_token) -> APIRouter:

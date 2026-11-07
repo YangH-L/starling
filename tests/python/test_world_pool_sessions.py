@@ -898,3 +898,106 @@ def test_admit_drain_refuses_new_leases_and_the_writer_is_shared_afterwards(setu
         assert engine is not None and engine.read_only is False
         assert pool.context("rollout-1").frozen is False
         engine = None
+
+
+
+
+# ═════════════════════════ 修复轮：在途的看板写入挡住客户端写占用（R82） ═════════════════════════
+
+def test_in_flight_dashboard_write_makes_a_client_writable_admit_world_busy(app_client, monkeypatch):
+    """R82（与 R59 对称）：一条已经通过准入的看板写入还在途（Event 卡在引擎的 remember 里），客户端可写 admit 回 world_busy
+    （瞬态），什么都不登记；写入提交、结束之后 admit 成功。只读 admit 不受影响。"""
+    client = app_client
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    engine = _engine_of(pool, "w1")
+    entered, release = threading.Event(), threading.Event()
+    real_remember = engine.remember
+
+    def _slow_remember(*args, **kwargs):
+        entered.set()
+        release.wait(10)
+        return real_remember(*args, **kwargs)
+    monkeypatch.setattr(engine, "remember", _slow_remember)
+    engine = None
+    result: dict = {}
+
+    def _write():
+        result["resp"] = client.post("/api/w/w1/remember", json={"text": "Bob owns auth"})
+    writer = threading.Thread(target=_write)
+    writer.start()
+    try:
+        assert entered.wait(10)
+        assert pool.dashboard_writes_in_flight("w1") == 1
+        sid = sessions.connect(pool.now_ms())
+        with pytest.raises(WorldSwitchError) as ei:
+            pool.admit_client_handle("w1", sid, "alice", False, pool.now_ms())
+        assert ei.value.code == "world_busy"
+        assert not sessions.world_write_held("w1", pool.now_ms())
+        handle = pool.admit_client_handle("w1", sid, "bob", True, pool.now_ms())   # 只读可以
+        pool.close_client_handle(handle, timeout_s=1.0)
+    finally:
+        release.set()
+        writer.join(10)
+    assert result["resp"].status_code == 200, result["resp"].text
+    assert pool.dashboard_writes_in_flight("w1") == 0
+    pool.admit_client_handle("w1", sid, "alice", False, pool.now_ms())
+    assert sessions.world_write_held("w1", pool.now_ms())
+
+
+def test_in_flight_converse_turn_counts_as_a_dashboard_write(app_client, monkeypatch):
+    """R82：/ws/converse 的一整轮算一次看板写入：轮次在途时客户端可写 admit 回 world_busy，轮次结束后成功。"""
+    client = app_client
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    engine = _engine_of(pool, "w1")
+    entered, release = threading.Event(), threading.Event()
+
+    def _slow_stream(message, **_kwargs):
+        entered.set()
+        release.wait(10)
+        return {"reply": "ok", "statement_ids": []}
+    monkeypatch.setattr(engine, "converse_stream", _slow_stream)
+    engine = None
+    frames: list = []
+
+    def _turn():
+        with client.websocket_connect("/ws/converse") as ws:
+            ws.send_json({"message": "hello", "world": "w1"})
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame["type"] in ("done", "error"):
+                    break
+    turn = threading.Thread(target=_turn)
+    turn.start()
+    try:
+        assert entered.wait(10)
+        assert pool.dashboard_writes_in_flight("w1") == 1
+        sid = sessions.connect(pool.now_ms())
+        with pytest.raises(WorldSwitchError) as ei:
+            pool.admit_client_handle("w1", sid, "alice", False, pool.now_ms())
+        assert ei.value.code == "world_busy"
+    finally:
+        release.set()
+        turn.join(10)
+    assert frames[-1]["type"] == "done"
+    deadline = time.monotonic() + 5
+    while pool.dashboard_writes_in_flight("w1") and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pool.dashboard_writes_in_flight("w1") == 0
+    pool.admit_client_handle("w1", sid, "alice", False, pool.now_ms())
+
+
+def test_dashboard_write_counter_and_hold_check_are_serialised(app_client):
+    """R82 的另一半：客户端占着写入时看板写入回 world_held，计数不加；被拒的写入不留计数。"""
+    client = app_client
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    sid = sessions.connect(pool.now_ms())
+    pool.admit_client_handle("w1", sid, "alice", False, pool.now_ms())
+    resp = client.post("/api/w/w1/remember", json={"text": "x"})
+    assert (resp.status_code, resp.json()["code"]) == (409, "world_held")
+    assert pool.dashboard_writes_in_flight("w1") == 0
+    with pytest.raises(_core.WorldStoreError) as ei:
+        with pool.dashboard_write("w1"):
+            pass
+    assert _code(ei) == "world_held"
+    assert pool.dashboard_writes_in_flight("w1") == 0

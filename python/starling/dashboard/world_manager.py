@@ -325,6 +325,8 @@ class WorldPool:
         self._vector_warned = False                   # 非 sqlite 的 config 只提醒一次（裁定 R26）
         # 发布时没起来后台线程的世界（裁定 R23）：下一次租约在世界锁内补起，补起之前引擎照常服务请求。
         self._workers_lost: set[str] = set()
+        # 每个世界在途的看板写入数（dashboard_write，裁定 R82）：客户端的可写 admit 在同一把 _lock 下看到它大于 0 就 world_busy。
+        self._dashboard_writes: dict[str, int] = {}
 
     # ───────────────────────── 注册表与上下文 ─────────────────────────
 
@@ -574,10 +576,19 @@ class WorldPool:
                 return sessions.open_handle(session_id, world, holder, True, now_ms)
             _core.world_require_writable(rec, for_client_write=True, held_by_other=False)
             if has_writer:
-                return sessions.open_handle(session_id, world, holder, False, now_ms)
+                return self._open_writable_handle(world, session_id, holder, now_ms)
             return self._admit_first_writer(world, rec, session_id, holder, now_ms)
         finally:
             lock.release()
+
+    def _open_writable_handle(self, world: str, session_id: str, holder: str, now_ms: int) -> str:
+        """登记一个可写句柄（裁定 R82，与 R59 对称）：与看板写入的准入（dashboard_write）在同一把 _lock 下串行。世界上还有在途
+        的看板写入（已经通过准入、可能正在提交）时回 world_busy（瞬态，客户端重试），什么都不登记；否则 open_handle。所以一旦
+        客户端登记了写占用，此后不会再有看板写入提交进这个世界，此前通过准入的那些都已经结束。"""
+        with self._lock:
+            if self._dashboard_writes.get(world, 0) > 0:
+                raise WorldSwitchError("world_busy", f"{world} has a dashboard write in flight")
+            return self._sessions.open_handle(session_id, world, holder, False, now_ms)
 
     def _admit_first_writer(self, world: str, rec: dict, session_id: str, holder: str,
                             now_ms: int) -> str:
@@ -588,7 +599,8 @@ class WorldPool:
                 raise WorldSwitchError(
                     "world_busy", "the read-only engine's runtime is still referenced")
             self._refuse_leaked(rec["db_path"])
-            handle = sessions.open_handle(session_id, world, holder, False, now_ms)
+            # 关闭窗口已排干全部租约，看板写入（全程持一份租约）都已结束、窗口里也进不来；计数检查仍走同一个函数，不另开一路。
+            handle = self._open_writable_handle(world, session_id, holder, now_ms)
             try:
                 self._open_and_publish(world)
             except BaseException:
@@ -599,10 +611,37 @@ class WorldPool:
     def require_dashboard_writable(self, world: str) -> None:
         """看板写入类命令的准入（裁定 R51）：C++ world_require_writable(rec, for_client_write=False,
         held_by_other=world_write_held(world, now))。被客户端占着写入的世界 world_held（可回收世界也是 world_held，不是
-        world_read_only）；没人占着的只读打开的世界 world_read_only。改内容的命令路由与 /ws/converse 在动引擎之前调。
-        只读检视与召回不调。"""
+        world_read_only）；没人占着的只读打开的世界 world_read_only。只判、不计数；要占住写入请用 dashboard_write。"""
         _core.world_require_writable(self._record(world), for_client_write=False,
                                      held_by_other=self._write_held(world))
+
+    @contextlib.contextmanager
+    def dashboard_write(self, world: str):
+        """一次看板写入（改内容的命令路由、/ws/converse 的一整轮）的准入与在途计数（裁定 R51、R82）。进入时在同一次持 _lock 内
+        先过 C++ 准入（world_require_writable，held 现读：被客户端占着 world_held，只读打开的世界 world_read_only），再把该世界的
+        在途看板写入数加一；退出时（含异常、取消）减一。客户端的可写 admit 在同一把 _lock 下看到计数大于 0 就回 world_busy，所以
+        「看板写入已通过准入、还没提交」与「客户端登记写占用」不会同时发生（与 R59 对称）。调用方在 with 体里取引擎租约、调引擎。
+
+        持 _lock 调 C++：world_require_writable 是纯判定，world_write_held 只取会话表自己的互斥锁，都不回到池里，不会形成锁环。"""
+        rec = self._record(world)                     # world_not_found：在池锁之外读注册表
+        with self._lock:
+            _core.world_require_writable(rec, for_client_write=False,
+                                         held_by_other=self._write_held(world))
+            self._dashboard_writes[world] = self._dashboard_writes.get(world, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                left = self._dashboard_writes.get(world, 0) - 1
+                if left > 0:
+                    self._dashboard_writes[world] = left
+                else:
+                    self._dashboard_writes.pop(world, None)
+
+    def dashboard_writes_in_flight(self, world: str) -> int:
+        """world 上此刻在途的看板写入数（dashboard_write 计的）。"""
+        with self._lock:
+            return self._dashboard_writes.get(world, 0)
 
     def _refuse_while_held(self, world: str) -> None:
         """改设置的三条路由（PUT 设置、重新确认端点、改自动快照）的准入（裁定 R73），持世界锁调用（与 admit_client_handle

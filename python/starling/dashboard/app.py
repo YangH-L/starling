@@ -335,10 +335,11 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         # （裁定 R32：首次打开要等世界锁，事件循环不等），在工作线程里、引擎用完的那一刻归还（见
         # run_blocking），协程被取消也不会提前放走仍在跑的这一轮。
         world = world or pool.default_world()          # 缺省或空串：默认世界
+        # 回合末要写入：整一轮算一次看板写入（裁定 R51、R82）。pool.dashboard_write 在同一次持池锁内过 C++ 准入（客户端占着写入
+        # world_held，只读打开的世界 world_read_only）并计数；计数与租约一起在工作线程里、引擎用完的那一刻归还（end_turn）。
+        write = pool.dashboard_write(world)
         try:
-            # 回合末要写入：先过看板写入准入（裁定 R51，C++ 判：客户端占着写入 world_held，只读打开的世界 world_read_only）。
-            pool.require_dashboard_writable(world)
-            lease = await lease_off_loop(pool, world)
+            write.__enter__()
         except WorldSwitchError as exc:
             await ws.send_json({"type": "error", "error": exc.code})
             await ws.close()
@@ -348,12 +349,28 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
             await ws.close()
             return
         try:
+            lease = await lease_off_loop(pool, world)
+        except BaseException as exc:
+            write.__exit__(None, None, None)
+            if isinstance(exc, WorldSwitchError):
+                await ws.send_json({"type": "error", "error": exc.code})
+                await ws.close()
+                return
+            raise
+
+        def end_turn() -> None:
+            """归还本轮的租约与看板写入计数（只调一次）。"""
+            try:
+                lease.release()
+            finally:
+                write.__exit__(None, None, None)
+        try:
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue = asyncio.Queue()
             done = object()
             box: dict = {}
         except BaseException:
-            lease.release()
+            end_turn()
             raise
 
         def on_token(delta: str) -> None:
@@ -383,13 +400,13 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
                     box["error"] = "converse_failed"
             finally:
                 del engine
-                lease.release()
+                end_turn()
                 loop.call_soon_threadsafe(queue.put_nowait, done)
 
         try:
             loop.run_in_executor(None, run_blocking)
         except BaseException:
-            lease.release()
+            end_turn()
             raise
 
         # Drain deltas until the worker signals done. call_soon_threadsafe
