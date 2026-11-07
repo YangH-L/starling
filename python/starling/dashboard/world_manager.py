@@ -579,6 +579,21 @@ class WorldPool:
                 raise
             return handle
 
+    def require_dashboard_writable(self, world: str) -> None:
+        """看板写入类命令的准入（裁定 R51）：C++ world_require_writable(rec, for_client_write=False,
+        held_by_other=world_write_held(world, now))。被客户端占着写入的世界 world_held（可回收世界也是 world_held，不是
+        world_read_only）；没人占着的只读打开的世界 world_read_only。改内容的命令路由与 /ws/converse 在动引擎之前调。
+        只读检视与召回不调。"""
+        _core.world_require_writable(self._record(world), for_client_write=False,
+                                     held_by_other=self._write_held(world))
+
+    def _refuse_while_held(self, world: str) -> None:
+        """改设置的三条路由（PUT 设置、重新确认端点、改自动快照）的准入（裁定 R73），持世界锁调用（与 admit_client_handle
+        互斥）：只看写占用（C++ SessionTable.world_write_held），不判只读——它们写的是 registry.db，不碰世界库（R38 不变）；
+        但会重新配置客户端正在用的那个引擎，所以被占着时回 world_held，什么都不写。"""
+        if self._write_held(world):
+            raise WorldSwitchError("world_held", f"{world} is held for write by a client session")
+
     def close_client_handle(self, handle_id: str, timeout_s: float) -> None:
         """句柄的 close(timeout)（spec §11）：等这个句柄的在途调用（SessionTable.in_flight）归零再关。超时回 world_busy，句柄保持
         打开。未知或已关闭的句柄直接返回（幂等）。短轮询（20 毫秒），不取世界锁、不持租约。"""
@@ -1246,6 +1261,11 @@ class WorldPool:
             return
         rec = self._record(world)
         with self._world_lock(world), _ClosingWindow(self, world):
+            # 裁定 R60：删除之前先问会话表。有活句柄（可写或只读）或在途调用时 C++ forget_world 抛 world_in_use，什么都
+            # 不删、引擎不动；通过了就清掉它的最后活动与墓碑（同名世界重建后从「没有记录」开始）。窗口里 admit_client_handle
+            # 一律 world_busy，所以从这里到删完不会有新句柄。
+            if self._sessions is not None:
+                self._sessions.forget_world(world, self.now_ms())
             if not self._close_engine(world, _LEASE_DRAIN_TIMEOUT_S):
                 raise WorldSwitchError(
                     "world_busy", "the closed world's runtime is still referenced")
@@ -1314,6 +1334,7 @@ class WorldPool:
         if world == reg.default_world():
             self._require_default_world_editable(overrides)
         with self._world_lock(world):
+            self._refuse_while_held(world)            # 裁定 R73：被客户端占着写入时 world_held，什么都不写
             # 裁定 R40：合并、核对继承来的 endpoint、写都在 C++ 的同一次持锁内；endpoint_changed 时什么都不写。
             merged = reg.update_settings(world, overrides,
                                          provider_endpoints=self._provider_endpoints())
@@ -1349,6 +1370,7 @@ class WorldPool:
             current = {name: provider_endpoint_settings(name, prov or {})
                        for name, prov in list(self._config.providers.items())}
         with self._world_lock(world):
+            self._refuse_while_held(world)            # 裁定 R73
             merged = reg.reconfirm_endpoints(world, current)
             settings = self._effective_settings(reg.get(world), merged)
             with self._lock:
@@ -1379,6 +1401,7 @@ class WorldPool:
         # 交给引擎之间，先把合并后的设置（含新 endpoint）换上引擎，apply_world_settings 随后看不出变化、不重建
         # 适配器。路由在工作线程里调，不持租约，按锁顺序可以等世界锁。
         with self._world_lock(world):
+            self._refuse_while_held(world)            # 裁定 R73
             _core.world_set_auto_snapshot(reg, world, on_session, interval_hours)
             rec = reg.get(world)
             settings = _core.world_effective_settings(rec["settings"], record=rec)
@@ -1428,6 +1451,10 @@ class WorldPool:
         backend = self._vector_backend(world)
         _core.world_check_rollback(reg, world, snapshot_id, vector_backend=backend)
         with self._world_lock(world), _ClosingWindow(self, world):
+            # 裁定 R25、R61 (3)：有活句柄（可写或只读，C++ world_has_live_handles）时 world_held，在进 C++ 回滚、动引擎之前；
+            # 在途调用由下面的租约排干等到（每次客户端调用全程持一份租约，裁定 R63）。窗口里不会有新句柄。
+            if self._sessions is not None and self._sessions.world_has_live_handles(world, self.now_ms()):
+                raise WorldSwitchError("world_held", f"{world} has open client handles")
             self._refuse_leaked(rec["db_path"])
             with self._lock:
                 was_open = world in self._engines

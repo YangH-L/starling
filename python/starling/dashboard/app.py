@@ -330,9 +330,15 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         # run_blocking），协程被取消也不会提前放走仍在跑的这一轮。
         world = world or pool.default_world()          # 缺省或空串：默认世界
         try:
+            # 回合末要写入：先过看板写入准入（裁定 R51，C++ 判：客户端占着写入 world_held，只读打开的世界 world_read_only）。
+            pool.require_dashboard_writable(world)
             lease = await lease_off_loop(pool, world)
         except WorldSwitchError as exc:
             await ws.send_json({"type": "error", "error": exc.code})
+            await ws.close()
+            return
+        except _core.WorldStoreError as exc:
+            await ws.send_json({"type": "error", "error": _core.world_store_error_code(exc)})
             await ws.close()
             return
         try:

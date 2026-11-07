@@ -101,12 +101,25 @@ async def _engine(request: Request, world: str = Depends(world_name)):
         lease.release()
 
 
+async def _writable_engine(request: Request, world: str = Depends(world_name)):
+    """改内容的命令路由的依赖项（裁定 R51）：先过 C++ 的看板写入准入（pool.require_dashboard_writable：被客户端占着写入的
+    世界 409 world_held，可回收世界也是；没人占着的只读打开的世界 409 world_read_only），再与 _engine 一样持一份引擎租约。
+    被拒时不取租约、不建引擎。召回与 working_set 不经这里。"""
+    pool = request.app.state.pool
+    pool.require_dashboard_writable(world)
+    lease = await lease_off_loop(pool, world)
+    try:
+        yield lease.engine
+    finally:
+        lease.release()
+
+
 def build_commands_router(require_token) -> APIRouter:
     """路由不带前缀：create_app 把它挂在 /api 与 /api/w/{world} 两处（见 world_scope）。"""
     router = APIRouter(dependencies=[Depends(require_token)])
 
     @router.post("/remember")
-    async def remember(body: RememberBody, request: Request, eng=Depends(_engine)):
+    async def remember(body: RememberBody, request: Request, eng=Depends(_writable_engine)):
         from starling.dashboard.engine import _LLMNotConfigured
         from starling import _core
         try:
@@ -148,7 +161,7 @@ def build_commands_router(require_token) -> APIRouter:
         return {"results": out}
 
     @router.post("/converse")
-    async def converse(body: ConverseBody, request: Request, eng=Depends(_engine)):
+    async def converse(body: ConverseBody, request: Request, eng=Depends(_writable_engine)):
         from starling.dashboard.engine import _LLMNotConfigured
         try:
             r = await to_thread.run_sync(partial(
@@ -165,7 +178,7 @@ def build_commands_router(require_token) -> APIRouter:
         return r
 
     @router.post("/tick")
-    async def tick(body: TickBody, request: Request, eng=Depends(_engine)):
+    async def tick(body: TickBody, request: Request, eng=Depends(_writable_engine)):
         payload = await to_thread.run_sync(eng.tick, body.now or _now_iso())
         await _broadcast(request, "tick", payload)
         if payload["fired"]:
@@ -181,13 +194,13 @@ def build_commands_router(require_token) -> APIRouter:
             holder=holder))
 
     @router.post("/forget")
-    async def forget(body: ForgetBody, request: Request, eng=Depends(_engine)):
+    async def forget(body: ForgetBody, request: Request, eng=Depends(_writable_engine)):
         r = await to_thread.run_sync(partial(eng.forget, body.ids, now=body.now))
         await _broadcast(request, "statement_forgotten", r)
         return r
 
     @router.post("/clear_memory")
-    async def clear_memory(body: ClearMemoryBody, request: Request, eng=Depends(_engine)):
+    async def clear_memory(body: ClearMemoryBody, request: Request, eng=Depends(_writable_engine)):
         # 设置页「危险区」:物理清空当前租户的全部记忆(保留 self 认知体),并把该租户
         # spool 里尚未 claim 的会话 job 移到 discarded/。confirm 必须等于当前租户名。
         from starling import _core
@@ -207,14 +220,14 @@ def build_commands_router(require_token) -> APIRouter:
 
     # ── 片 6 干预集:触发式安全写(全经 engine self._lock 串行) ─────────────
     @router.post("/review")
-    async def review(body: ReviewBody, request: Request, eng=Depends(_engine)):
+    async def review(body: ReviewBody, request: Request, eng=Depends(_writable_engine)):
         # approve:review_requested→approved(守卫幂等;非该态返回 approved=0)。
         r = await to_thread.run_sync(partial(eng.approve_review, body.stmt_id))
         await _broadcast(request, "statement_added", {"statement_ids": [body.stmt_id]})
         return r
 
     @router.post("/replay_trigger")
-    async def replay_trigger(body: ReplayTriggerBody, request: Request, eng=Depends(_engine)):
+    async def replay_trigger(body: ReplayTriggerBody, request: Request, eng=Depends(_writable_engine)):
         # 手动触发 replay;持写锁整段(操作者发起)。新批次 → 刷新梦境/生命周期。
         mode = body.mode if body.mode in ("sleep", "idle") else "idle"
         r = await to_thread.run_sync(partial(eng.run_replay, mode))
@@ -222,7 +235,7 @@ def build_commands_router(require_token) -> APIRouter:
         return r
 
     @router.post("/reconsolidate")
-    async def reconsolidate(body: ReconsolidateBody, request: Request, eng=Depends(_engine)):
+    async def reconsolidate(body: ReconsolidateBody, request: Request, eng=Depends(_writable_engine)):
         # 请求再固化(发 reconsolidate.requested 事件,引擎异步开可塑窗)。每次发新 uuid
         # request_id;真正的重复去重在引擎侧按 stmt_id+tenant 归并到同一窗口(open_or_append),
         # 故连点不会建重复窗口(非「当日去重」——那个键因 uuid 唯一从不命中)。
@@ -233,7 +246,7 @@ def build_commands_router(require_token) -> APIRouter:
 
     @router.post("/commitment/fulfill")
     async def commitment_fulfill(body: CommitmentBody, request: Request,
-                                 eng=Depends(_engine)):
+                                 eng=Depends(_writable_engine)):
         # 手动 fulfill:ACTIVE→FULFILLED(核心 CommitmentEngine 原子守卫)。非 ACTIVE 不
         # 改状态 → 409(不广播);成功广播 commitment_transition 供面板即时刷新。
         r = await to_thread.run_sync(partial(eng.fulfill_commitment, body.stmt_id))
@@ -245,7 +258,7 @@ def build_commands_router(require_token) -> APIRouter:
 
     @router.post("/commitment/withdraw")
     async def commitment_withdraw(body: CommitmentBody, request: Request,
-                                  eng=Depends(_engine)):
+                                  eng=Depends(_writable_engine)):
         # 手动 withdraw:ACTIVE→WITHDRAWN(释放承诺 → 它保护的记忆此后可衰减)。同样
         # ACTIVE-only:非 ACTIVE → 409,不广播。
         r = await to_thread.run_sync(partial(eng.withdraw_commitment, body.stmt_id))

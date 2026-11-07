@@ -152,15 +152,21 @@ def test_reclaimable_world_opened_writable_runs_no_background(setup):
 
 
 def test_update_settings_on_a_reclaimable_world_keeps_background_off(setup):
-    """PUT 设置换给开着的引擎的同样是生效的设置（裁定 R68）：存着的 background 改了，可回收世界的引擎照旧全关。"""
+    """PUT 设置换给开着的引擎的同样是生效的设置（裁定 R68）：存着的 background 改了，可回收世界的引擎照旧全关；之后被客户端
+    占着写入、重建成可写引擎，按改过的设置也照旧全关。（被占着时 PUT 设置本身回 world_held，裁定 R73，见单元 4。）"""
     pool, sessions, clock = setup
-    _writer(sessions, clock)
     with pool.lease("rollout-1"):
         pass
     settings, _warnings = pool.update_settings("rollout-1", {"background": {"tick_interval_s": 5.0}})
     assert pool.record("rollout-1")["settings"]["background"]["tick_interval_s"] == 5.0
     assert settings["background"]["tick_interval_s"] == 0.0
     assert _engine_of(pool, "rollout-1")._settings["background"]["tick_interval_s"] == 0.0
+    _writer(sessions, clock)
+    pool.close_world("rollout-1")
+    with pool.lease("rollout-1") as engine:
+        assert engine.read_only is False
+        assert engine._settings["background"]["tick_interval_s"] == 0.0
+        engine = None
 
 
 # ───────────────────────── R66：list_sessions 在世界锁内调 C++ ─────────────────────────
@@ -523,3 +529,173 @@ def test_close_client_handle_waits_for_in_flight_calls_and_times_out_open(setup)
     assert _code(ei) == "handle_closed"
     assert not sessions.world_write_held("rollout-1", pool.now_ms())
     pool.close_client_handle(handle, timeout_s=0.0)                          # 幂等
+
+
+# ═════════════════════════ 单元 4：看板写入准入、恢复与删除检查句柄（R25、R51、R60、R61、R73） ═════════════════════════
+
+import hashlib  # noqa: E402
+import os  # noqa: E402
+
+
+def _sha256(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+_STUB_JSON = ('[{"holder":"self","holder_perspective":"FIRST_PERSON","subject":"Bob",'
+              '"predicate":"responsible_for","object":"auth","modality":"BELIEVES",'
+              '"polarity":"POS","nesting_depth":0}]')
+
+
+def _stub_factory(ctx, providers):
+    from starling.dashboard.engine import DashboardEngine
+    engine = DashboardEngine(ctx, providers)
+    fake = _core.FakeLLMAdapter()
+    fake.set_default_response(_STUB_JSON, True, "")
+    engine.llm = fake
+    return engine
+
+
+@pytest.fixture
+def app_client(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from starling.dashboard import create_app
+    cfg = _cfg(tmp_path)
+    with TestClient(create_app(cfg, engine_factory=_stub_factory)) as client:
+        pool = client.app.state.pool
+        pool.create_world("w1", "")
+        assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+        pool.fork_world("w1", "rollout-1", reclaimable=True)
+        yield client
+
+
+def _held_error(code: str) -> dict:
+    row = {r["code"]: r for r in _core.error_catalog()}[code]
+    return {"code": code, "transient": bool(row["transient"]), "detail": code}
+
+
+def _content_writes(stmt_id: str):
+    return (("/remember", {"text": "Carol owns billing"}),
+            ("/converse", {"message": "who owns billing?"}),
+            ("/tick", {}),
+            ("/forget", {"ids": [stmt_id]}),
+            ("/clear_memory", {"confirm": "w1"}),
+            ("/review", {"stmt_id": stmt_id}),
+            ("/replay_trigger", {"mode": "idle"}),
+            ("/reconsolidate", {"stmt_id": stmt_id}),
+            ("/commitment/fulfill", {"stmt_id": stmt_id}),
+            ("/commitment/withdraw", {"stmt_id": stmt_id}))
+
+
+@pytest.mark.parametrize("world", ["w1", "rollout-1"])
+def test_dashboard_writes_on_a_client_held_world_are_409_world_held(app_client, world):
+    """context 第 8 条第 4 项（裁定 R51）：被客户端占着写入的普通世界与可回收世界，看板写入一律 409 world_held（不是
+    world_read_only）；召回、检视照常。库文件不变。"""
+    client = app_client
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    stmt_id = client.get(f"/api/w/{world}/statements").json()["rows"][0]["id"]
+    sid = sessions.connect(pool.now_ms())
+    pool.admit_client_handle(world, sid, "alice", False, pool.now_ms())
+    db = pool.record(world)["db_path"]
+    pool_engine = _engine_of(pool, world)
+    rows_before = client.get(f"/api/w/{world}/statements").json()["rows"]
+    pool_engine = None
+    for path, body in _content_writes(stmt_id):
+        resp = client.post(f"/api/w/{world}{path}", json=body)
+        assert (resp.status_code, resp.json()) == (409, _held_error("world_held")), path
+    with client.websocket_connect("/ws/converse") as ws:
+        ws.send_json({"message": "who owns billing?", "world": world})
+        assert ws.receive_json() == {"type": "error", "error": "world_held"}
+    # R73：三条设置路由被占用时同样 world_held。
+    for method, path, body in (("put", f"/api/worlds/{world}/settings", {"gist_thresholds": {"min_holders": 4}}),
+                               ("post", f"/api/worlds/{world}/settings/reconfirm", None),
+                               ("put", f"/api/worlds/{world}/auto_snapshot",
+                                {"on_session": True, "interval_hours": 6})):
+        resp = getattr(client, method)(path, json=body) if body is not None else getattr(client, method)(path)
+        assert (resp.status_code, resp.json()) == (409, _held_error("world_held")), path
+    resp = client.post(f"/api/w/{world}/recall", json={"query": "who owns auth"})
+    assert resp.status_code == 200, resp.text                                   # 召回照常
+    assert client.get(f"/api/w/{world}/statements").json()["rows"] == rows_before
+    assert client.get(f"/api/w/{world}/working_set", params={"interlocutor": "claude"}).status_code == 200
+    assert os.path.exists(db)
+
+
+def test_settings_routes_on_a_free_reclaimable_world_keep_r38(app_client):
+    """R73：设置路由只看写占用，不判只读（它们写的是 registry.db）。没人占着的可回收世界照旧 200（R38）。"""
+    client = app_client
+    resp = client.put("/api/worlds/rollout-1/auto_snapshot", json={"on_session": True, "interval_hours": 6})
+    assert resp.status_code == 200, resp.text
+    resp = client.put("/api/worlds/rollout-1/settings", json={"gist_thresholds": {"min_holders": 4}})
+    assert resp.status_code == 200, resp.text
+    # 看板内容写入照旧 world_read_only（没人占着：可回收世界看板只读）。
+    resp = client.post("/api/w/rollout-1/remember", json={"text": "x"})
+    assert (resp.status_code, resp.json()) == (409, _held_error("world_read_only"))
+
+
+def test_dashboard_write_after_the_hold_is_released_succeeds(app_client):
+    client = app_client
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    sid = sessions.connect(pool.now_ms())
+    handle = pool.admit_client_handle("w1", sid, "alice", False, pool.now_ms())
+    assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 409
+    pool.close_client_handle(handle, timeout_s=1.0)
+    assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+    sid2 = sessions.connect(pool.now_ms())
+    pool.admit_client_handle("w1", sid2, "bob", True, pool.now_ms())          # 只读句柄不占写入
+    assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+
+
+def test_rollback_with_a_live_handle_is_world_held_and_leaves_the_file(app_client):
+    """context 第 8 条第 5 项（裁定 R25、R61 (3)）：有活句柄（只读也算）时恢复回 world_held，库文件、归档都不动。"""
+    client = app_client
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    snap = client.post("/api/worlds/w1/snapshots", json={}).json()
+    assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
+    for read_only in (True, False):
+        sid = sessions.connect(pool.now_ms())
+        handle = pool.admit_client_handle("w1", sid, "alice", read_only, pool.now_ms())
+        pool.close_world("w1")                          # 合并 WAL，sha256 才稳定
+        db = pool.record("w1")["db_path"]
+        sha = _sha256(db)
+        resp = client.post("/api/worlds/w1/rollback",
+                           json={"snapshot_id": snap["id"], "confirm": "w1"})
+        assert (resp.status_code, resp.json()) == (409, _held_error("world_held")), read_only
+        assert _sha256(db) == sha
+        assert pool.archives("w1") == []
+        pool.close_client_handle(handle, timeout_s=1.0)
+    resp = client.post("/api/worlds/w1/rollback", json={"snapshot_id": snap["id"], "confirm": "w1"})
+    assert resp.status_code == 200, resp.text                                     # 没有句柄了：照常恢复
+
+
+def test_delete_with_a_live_handle_or_in_flight_call_is_world_in_use_and_deletes_nothing(app_client):
+    """context 第 8 条第 5 项（裁定 R60）：删除先问 forget_world，有活句柄或在途调用时 world_in_use，注册项、目录、库都在。"""
+    client = app_client
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    sid = sessions.connect(pool.now_ms())
+    handle = pool.admit_client_handle("w1", sid, "alice", False, pool.now_ms())
+    pool.close_world("w1")
+    db = pool.record("w1")["db_path"]
+    sha = _sha256(db)
+    resp = client.delete("/api/worlds/w1", params={"confirm": "w1"})
+    assert (resp.status_code, resp.json()) == (409, _held_error("world_in_use"))
+    sessions.call_enter(handle, pool.now_ms())
+    sessions.close_handle(handle)                      # 句柄关了，调用还在途
+    resp = client.delete("/api/worlds/w1", params={"confirm": "w1"})
+    assert (resp.status_code, resp.json()) == (409, _held_error("world_in_use"))
+    assert pool.record("w1")["db_path"] == db and _sha256(db) == sha
+    sessions.call_exit(handle, pool.now_ms())
+    resp = client.delete("/api/worlds/w1", params={"confirm": "w1"})
+    assert resp.status_code == 200, resp.text
+    assert not os.path.exists(db)
+    with pytest.raises(WorldSwitchError):
+        pool.record("w1")
+
+
+def test_delete_forgets_the_world_so_a_recreated_world_starts_fresh(app_client):
+    """forget_world 通过之后才删（R60）：删掉的世界的最后活动与墓碑清掉，同名世界重建后从「没有记录」开始（不判可关）。"""
+    client = app_client
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    sessions.touch_world("w1", pool.now_ms())
+    assert client.delete("/api/worlds/w1", params={"confirm": "w1"}).status_code == 200
+    assert sessions.may_close_world("w1", False, pool.now_ms() + 10 ** 9) is False
