@@ -86,6 +86,38 @@ def test_expire_returns_released_handles():
     assert sorted(table.expire(LEASE)) == sorted([first, second])
 
 
+def test_late_heartbeat_does_not_revive_an_expired_session():
+    """审查 I1 的复现序列（裁定 R57）：B 在 A 的租约边界拿到写占用后，A 迟到的旧心跳被拒绝，不会两个会话同时占写。"""
+    table = _core.SessionTable()
+    sid_a = table.connect(0)
+    sid_b = table.connect(20000)
+    table.open_handle(sid_a, "w", "alice", False, 0)
+    table.open_handle(sid_b, "w", "bob", False, LEASE)
+    with pytest.raises(_core.WorldStoreError) as late:
+        table.heartbeat(sid_a, LEASE - 1)
+    assert _code(late.value) == "session_expired"
+    assert not table.world_write_held_by_other("w", sid_b, LEASE + 1)
+    assert table.world_write_held_by_other("w", sid_a, LEASE + 1)
+
+
+def test_forget_world():
+    """裁定 R54：有活句柄时 world_in_use；忘掉之后墓碑报 handle_closed，空闲判定回到「没有记录」。"""
+    table = _core.SessionTable(lease_ms=LEASE, idle_close_ms=1000)
+    sid = table.connect(0)
+    hid = table.open_handle(sid, "w", "alice", False, 0)
+    with pytest.raises(_core.WorldStoreError) as busy:
+        table.forget_world("w")
+    assert _code(busy.value) == "world_in_use"
+    table.expire(LEASE)
+    assert table.may_close_world("w", False, LEASE)
+    table.forget_world("w")
+    assert not table.may_close_world("w", False, LEASE)
+    with pytest.raises(_core.WorldStoreError) as gone:
+        table.resolve(hid, LEASE)
+    assert _code(gone.value) == "handle_closed"
+    table.forget_world("never-seen")
+
+
 def test_argument_errors_map_to_python_types():
     with pytest.raises(ValueError):
         _core.SessionTable(lease_ms=0)

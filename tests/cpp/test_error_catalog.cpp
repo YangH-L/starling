@@ -42,15 +42,18 @@ constexpr Expected kSpecCodes[] = {
     {"rollback_reopen_failed", false, 500}, {"world_open_failed", false, 500},
 };
 
-// grep 'WorldStoreError("' src/governance 得到的全部码。
+// src/governance/*.cpp 里以字面量给出的全部码：WorldStoreError("<code>" 与 WorldStoreError::after_replace("<code>"，
+// 含参数跨行的调用（正则 WorldStoreError(::after_replace)?\(\s*"([a-z_]+)"）。以变量传码的几处（unresolvable、
+// 布局校验）只传 registry_corrupt / snapshot_failed，两者已在表内。session_table.cpp 贡献 handle_closed、
+// session_expired、world_held、world_in_use；registry_db.cpp 的 require_writable 贡献 world_held、world_read_only。
 constexpr std::string_view kThrownBySrcGovernance[] = {
-    "endpoint_changed", "fork_digest_mismatch", "insufficient_disk", "invalid_auto_snapshot",
-    "invalid_labels", "invalid_retention", "invalid_settings", "invalid_snapshot_kind",
-    "invalid_world_name", "invalid_world_query", "labels_immutable", "registry_corrupt",
-    "restore_digest_mismatch", "snapshot_corrupt", "snapshot_failed", "snapshot_not_found",
-    "snapshot_unsupported_backend", "world_busy", "world_exists", "world_in_use",
-    "world_not_found", "world_not_seed", "world_protected", "world_read_only",
-    "world_schema_behind", "world_tenant_mismatch",
+    "endpoint_changed", "fork_digest_mismatch", "handle_closed", "insufficient_disk",
+    "invalid_auto_snapshot", "invalid_labels", "invalid_retention", "invalid_settings",
+    "invalid_snapshot_kind", "invalid_world_name", "invalid_world_query", "labels_immutable",
+    "registry_corrupt", "restore_digest_mismatch", "session_expired", "snapshot_corrupt",
+    "snapshot_failed", "snapshot_not_found", "snapshot_unsupported_backend", "world_busy",
+    "world_exists", "world_held", "world_in_use", "world_not_found", "world_not_seed",
+    "world_protected", "world_read_only", "world_schema_behind", "world_tenant_mismatch",
 };
 
 // 看板两张旧 _STATUS 表（routes/worlds.py、routes/world_scope.py）的键并集。

@@ -6,8 +6,10 @@
 // now_ms 应取单调时钟（Python 用 time.monotonic），时间倒退不报错，按下面各条的 max 规则处理。
 //
 // 会话：connect 分配 session_id，租约 lease_ms。只有 heartbeat 续约（取 max，乱序的旧心跳不缩短租约），
-// 调用不续约。距最后一次心跳 >= lease_ms 即过期；过期是终态，过期后的 heartbeat 与 open_handle 抛
-// session_expired，客户端要重新 connect。disconnect 释放该会话的全部句柄。
+// 调用不续约。距最后一次心跳 >= lease_ms 即过期；过期后的 heartbeat 与 open_handle 抛 session_expired，客户端要
+// 重新 connect。过期是终态（裁定 R57）：任何一个带 now_ms 的方法第一次看出会话过期，就把它标死，之后时间戳更早的
+// 迟到心跳也被拒绝，所以别的会话据此拿到的写占用、客户端已收到的 session_expired 都不会被推翻。
+// disconnect 释放该会话的全部句柄。
 //
 // 句柄：open_handle 在会话下登记一个句柄，绑定 world 与 holder。同一个会话可以在同一个世界开多个句柄，
 // holder 可以相同。句柄「活着」= 没关闭，且所属会话此刻没过期（不论 expire 跑没跑）。
@@ -29,7 +31,9 @@
 // 最后活动由 open_handle、call_enter、call_exit、touch_world 更新（取 max，裁定 R50）；看板没有会话，
 // 由调用方在引擎打开时和看板每次按世界取租约时调 touch_world。表里没有记录的世界不判可关（兜底）。
 //
-// id：session_id 与 handle_id 都是 std::random_device 取 16 字节、转成 32 位小写十六进制。
+// 删世界：forget_world 删这个世界的最后活动与墓碑（裁定 R54），同名世界重建后不继承旧的空闲时间。
+//
+// id：session_id 与 handle_id 都是 std::random_device 取 16 字节、转成 32 位小写十六进制（熵源见 fresh_id）。
 //
 // 线程安全：每个公开方法持内部的一把互斥锁，可在多线程间共享。
 // 错误：业务错误抛 WorldStoreError（world_held / session_expired / handle_closed）；参数错误抛
@@ -98,12 +102,17 @@ public:
     // 空闲判定，规则见文件头。
     [[nodiscard]] bool may_close_world(const std::string& world, bool is_default,
                                        std::int64_t now_ms) const;
+    // 世界被删掉之后忘掉它（裁定 R54）：删这个世界的最后活动与它的全部墓碑，同名世界重建后从「没有记录」开始。
+    // 不收 now_ms：会话过没过期只看已知状态，没被任何带 now 的调用看出过期的会话照样算活（保守）；调用方先
+    // expire(now)。还有活句柄（可写或只读）或在途调用时抛 world_in_use，什么都不删。没有记录的世界什么都不做。
+    void forget_world(const std::string& world);
 
 private:
     enum class HandleState : std::uint8_t { Open, Closed, Expired };
     struct Session {
         std::int64_t last_heartbeat_ms = 0;
-        bool dead = false;   // heartbeat 已发现它过期（过期是终态，时间倒退也不复活）
+        // 某条持锁路径已看出它过期（裁定 R57）：终态，迟到的旧心跳也不让它复活。session_live（const）在持锁时置位。
+        mutable bool dead = false;
     };
     struct Handle {
         HandleInfo info;

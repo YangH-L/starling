@@ -648,6 +648,8 @@ void bind_15_world(pybind11::module_& m) {
     // world_decide_open_mode。True 只在只读打开的世界（只读、种子、可回收）上、且 held_for_write 为 False 时；
     // held_for_write 传 SessionTable.world_write_held(world, now)（客户端写入期间一律 False）。Python 把结果传给
     // read_only_uri / open_read_only / world_stats 等的 frozen，自己不判。
+    // 不释放 GIL（审查 M3）：判定是亚微秒级的纯函数（三个 bool），没有 I/O、不加锁、不会阻塞；spec §12 要求释放的是
+    // 会阻塞的调用。读 record 的三个键本身要持 GIL，释放再取回只会更慢。
     m.def("world_read_only_frozen",
           [](const py::dict& record, bool held_for_write) {
               const auto flag = [&record](const char* key) {
@@ -761,7 +763,9 @@ void bind_15_world(pybind11::module_& m) {
         .def("world_write_held_by_other", &gov::SessionTable::world_write_held_by_other,
              py::arg("world"), py::arg("session_id"), py::arg("now_ms"), GilFree())
         .def("may_close_world", &gov::SessionTable::may_close_world, py::arg("world"),
-             py::arg("is_default"), py::arg("now_ms"), GilFree());
+             py::arg("is_default"), py::arg("now_ms"), GilFree())
+        // 裁定 R54：删世界之后调；还有活句柄或在途调用时抛 WorldStoreError（world_in_use）。
+        .def("forget_world", &gov::SessionTable::forget_world, py::arg("world"), GilFree());
 
     // 写入准入（裁定 R51，C++ require_writable）：record 同 world_decide_open_mode（另读 name，只用于错误文本）。
     // held_by_other 传 SessionTable.world_write_held_by_other(world, session_id, now)（看板传 ""）。

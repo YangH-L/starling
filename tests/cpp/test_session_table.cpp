@@ -127,6 +127,78 @@ TEST(SessionTable, ExpiredSessionReleasesWriteHold) {
     EXPECT_FALSE(table.world_write_held_by_other("w", new_sid, kLease + 1));
 }
 
+// 审查 I1 路径一（裁定 R57）：B 在 A 的租约边界上拿到写占用之后，A 时间戳更早、却迟到的心跳不能让 A 复活，
+// 否则两个会话同时占着一个世界的写入。
+TEST(SessionTable, LateHeartbeatCannotReviveAfterAnotherSessionTookTheHold) {
+    SessionTable table(SessionConfig{});
+    const auto sid_a = table.connect(0);
+    const auto sid_b = table.connect(20000);
+    table.open_handle(sid_a, "w", "alice", false, 0);
+    table.open_handle(sid_b, "w", "bob", false, kLease);   // A 在 30000 过期，B 拿到写占用
+
+    EXPECT_EQ(code_of([&] { table.heartbeat(sid_a, kLease - 1); }), "session_expired");
+    EXPECT_FALSE(table.world_write_held_by_other("w", sid_b, kLease + 1));
+    EXPECT_TRUE(table.world_write_held_by_other("w", sid_a, kLease + 1));
+    EXPECT_EQ(code_of([&] { table.open_handle(sid_a, "w", "alice", false, kLease - 1); }),
+              "session_expired");
+}
+
+// 审查 I1 路径二：resolve 已经报了 session_expired，之后迟到的心跳也被拒绝，句柄不会重新可用。
+TEST(SessionTable, LateHeartbeatCannotReviveAfterResolveSawExpiry) {
+    SessionTable table(SessionConfig{});
+    const auto sid = table.connect(0);
+    const auto hid = table.open_handle(sid, "w", "alice", false, 0);
+    EXPECT_EQ(code_of([&] { (void)table.resolve(hid, kLease); }), "session_expired");
+    EXPECT_EQ(code_of([&] { table.heartbeat(sid, kLease - 1); }), "session_expired");
+    EXPECT_EQ(code_of([&] { (void)table.resolve(hid, kLease + 1); }), "session_expired");
+    EXPECT_EQ(code_of([&] { (void)table.resolve(hid, kLease - 1); }), "session_expired");
+    EXPECT_FALSE(table.world_write_held("w", kLease - 1));
+}
+
+// 裁定 R57：任何一条持锁路径看出过期，过期就成了终态。逐条路径验证：先用一个过了边界的 now 观察一次，
+// 再用边界之前的 now 心跳，必须被拒绝。
+TEST(SessionTable, EveryObservationOfExpiryIsTerminal) {
+    using Observe = void (*)(SessionTable&, const std::string&, const std::string&);
+    const std::vector<std::pair<const char*, Observe>> paths = {
+        {"world_write_held",
+         [](SessionTable& table, const std::string&, const std::string&) {
+             (void)table.world_write_held("w", kLease);
+         }},
+        {"world_write_held_by_other",
+         [](SessionTable& table, const std::string&, const std::string&) {
+             (void)table.world_write_held_by_other("w", "", kLease);
+         }},
+        {"world_has_live_handles",
+         [](SessionTable& table, const std::string&, const std::string&) {
+             (void)table.world_has_live_handles("w", kLease);
+         }},
+        {"may_close_world",
+         [](SessionTable& table, const std::string&, const std::string&) {
+             (void)table.may_close_world("w", false, kLease + kDay);
+         }},
+        {"call_enter",
+         [](SessionTable& table, const std::string&, const std::string& hid) {
+             (void)code_of([&] { table.call_enter(hid, kLease); });
+         }},
+        {"open_handle",
+         [](SessionTable& table, const std::string& sid, const std::string&) {
+             (void)code_of([&] { table.open_handle(sid, "w2", "alice", true, kLease); });
+         }},
+        {"expire",
+         [](SessionTable& table, const std::string&, const std::string&) {
+             (void)table.expire(kLease);
+         }},
+    };
+    for (const auto& [name, observe] : paths) {
+        SessionTable table(SessionConfig{});
+        const auto sid = table.connect(0);
+        const auto hid = table.open_handle(sid, "w", "alice", false, 0);
+        observe(table, sid, hid);
+        EXPECT_EQ(code_of([&] { table.heartbeat(sid, kLease - 1); }), "session_expired") << name;
+        EXPECT_FALSE(table.world_write_held("w", kLease - 1)) << name;
+    }
+}
+
 // in_flight 计数正确；close_handle 不等在途调用（等待是调用方的事），之后 resolve 抛 handle_closed。
 // 关掉的句柄上没结束的调用照样算进世界的在途数，直到 call_exit。
 TEST(SessionTable, CloseHandleWaitsInFlightIsCallersJob) {
@@ -210,11 +282,12 @@ TEST(SessionTable, MayCloseWorldRules) {
     EXPECT_TRUE(table.may_close_world("w", false, 5000));    // 四条都满足
     EXPECT_FALSE(table.may_close_world("w", true, 5000));    // 否定「不是默认世界」
 
-    const auto reader = table.open_handle(sid, "w", "alice", true, 5000);   // 只读句柄也是活句柄
-    EXPECT_FALSE(table.may_close_world("w", false, 5000));
+    // 只读句柄也是活句柄（审查 M1）：空闲已超时、会话还活着（心跳在 5000，活到 35000），只靠这个只读句柄挡住。
+    const auto reader = table.open_handle(sid, "w", "alice", true, 5000);
+    EXPECT_FALSE(table.may_close_world("w", false, 6001));
     table.close_handle(reader);
-    EXPECT_FALSE(table.may_close_world("w", false, 6000));   // 否定「超过空闲时限」：正好 1000 不算超过
     EXPECT_TRUE(table.may_close_world("w", false, 6001));
+    EXPECT_FALSE(table.may_close_world("w", false, 6000));   // 否定「超过空闲时限」：正好 1000 不算超过
 
     const auto caller = table.open_handle(sid, "w", "alice", true, 6001);
     table.call_enter(caller, 6001);
@@ -320,6 +393,59 @@ TEST(SessionTable, CloseOrDisconnectClearsTombstones) {
     EXPECT_EQ(code_of([&] { (void)table.resolve(second, kLease); }), "session_expired");
     table.disconnect(sid);
     EXPECT_EQ(code_of([&] { (void)table.resolve(second, kLease); }), "handle_closed");
+}
+
+// 裁定 R54：forget_world 删掉这个世界的最后活动与墓碑；同名世界重建后从「没有记录」开始，不继承旧的空闲时间。
+// 还有活句柄（可写或只读）或在途调用时抛 world_in_use，什么都不删。
+TEST(SessionTable, ForgetWorldDropsActivityAndTombstones) {
+    SessionTable table(SessionConfig{.lease_ms = kLease, .idle_close_ms = 1000});
+    EXPECT_NO_THROW(table.forget_world("never-seen"));
+
+    const auto sid = table.connect(0);
+    const auto reader = table.open_handle(sid, "w", "alice", true, 0);
+    EXPECT_EQ(code_of([&] { table.forget_world("w"); }), "world_in_use");   // 只读活句柄
+    table.close_handle(reader);
+    const auto writer = table.open_handle(sid, "w", "alice", false, 0);
+    EXPECT_EQ(code_of([&] { table.forget_world("w"); }), "world_in_use");   // 可写活句柄
+    EXPECT_TRUE(table.world_write_held("w", 1));                             // 拒绝时什么都没删
+
+    const auto other = table.open_handle(sid, "w2", "alice", false, 0);
+    table.expire(kLease);   // writer、other 都成墓碑
+    EXPECT_EQ(code_of([&] { (void)table.resolve(writer, kLease); }), "session_expired");
+    EXPECT_TRUE(table.may_close_world("w", false, kLease));
+    table.forget_world("w");
+    EXPECT_EQ(code_of([&] { (void)table.resolve(writer, kLease); }), "handle_closed");
+    EXPECT_FALSE(table.may_close_world("w", false, kLease + kDay));   // 没有记录：兜底不关
+    // 别的世界不受影响。
+    EXPECT_EQ(code_of([&] { (void)table.resolve(other, kLease); }), "session_expired");
+    EXPECT_TRUE(table.may_close_world("w2", false, kLease));
+
+    // 同名重建：不继承旧的最后活动，从 touch 的那一刻起算。
+    table.touch_world("w", kLease + 5000);
+    EXPECT_FALSE(table.may_close_world("w", false, kLease + 6000));
+    EXPECT_TRUE(table.may_close_world("w", false, kLease + 6001));
+}
+
+// 有在途调用的句柄（关闭了或成了墓碑）挡住 forget_world；call_exit 归零之后可以忘掉。
+TEST(SessionTable, ForgetWorldWaitsForInFlightCalls) {
+    SessionTable table(SessionConfig{.lease_ms = kLease, .idle_close_ms = 1000});
+    const auto sid = table.connect(0);
+    const auto hid = table.open_handle(sid, "w", "alice", false, 0);
+    table.call_enter(hid, 1);
+    table.close_handle(hid);
+    EXPECT_EQ(code_of([&] { table.forget_world("w"); }), "world_in_use");
+    EXPECT_EQ(table.in_flight(hid), 1);
+    table.call_exit(hid, 2);
+    EXPECT_NO_THROW(table.forget_world("w"));
+    EXPECT_FALSE(table.may_close_world("w", false, kDay));
+
+    const auto busy = table.open_handle(sid, "w", "alice", false, 3);
+    table.call_enter(busy, 3);
+    table.expire(kLease);
+    EXPECT_EQ(code_of([&] { table.forget_world("w"); }), "world_in_use");
+    table.call_exit(busy, kLease + 1);
+    table.forget_world("w");
+    EXPECT_EQ(code_of([&] { (void)table.resolve(busy, kLease + 1); }), "handle_closed");
 }
 
 TEST(SessionTable, OpenHandleValidatesItsInputs) {
