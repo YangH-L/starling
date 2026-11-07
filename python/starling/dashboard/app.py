@@ -103,7 +103,7 @@ class _NotReadyGate:
                            status_code=status_for("worlds_unavailable"))(scope, receive, send)
 
 
-def _start_pool(pool: WorldPool, mgr, loop) -> None:
+def _start_pool(pool: WorldPool, mgr, loop, idle_close_interval_s: float | None = None) -> None:
     """池起来之后、服务请求之前的那一段（工作线程里调用）。池的线程（后台 tick、统计去抖计时器）→ 事件循环的桥：tick 的
     消息形状与手动 /api/tick 一致，前端无需区分自动/手动；world_changed 每个世界每秒至多一条（池里去抖）。
 
@@ -114,7 +114,10 @@ def _start_pool(pool: WorldPool, mgr, loop) -> None:
     pool.on_tick = mgr.bridge(loop, "tick")
     pool.on_world_changed = mgr.bridge(loop, "world_changed")
     pool.lease(pool.default_world()).release()
-    pool.start_background()
+    if idle_close_interval_s is None:
+        pool.start_background()
+    else:
+        pool.start_background(idle_close_interval_s=idle_close_interval_s)
 
 
 def _attach_sessions(app: FastAPI, pool: WorldPool) -> None:
@@ -139,7 +142,8 @@ def _stop_pool(pool: WorldPool) -> None:
 def create_app(config: DashboardConfig, *, engine: object | None = None,
                engine_factory: EngineFactory | None = None, deferred_open: bool = False,
                on_ready: Callable[[], None] | None = None,
-               on_open_failed: Callable[[BaseException], None] | None = None) -> FastAPI:
+               on_open_failed: Callable[[BaseException], None] | None = None,
+               idle_close_interval_s: float | None = None) -> FastAPI:
     """Build the dashboard app.
 
     世界由引擎池（app.state.pool，WorldPool）按需打开，每个世界一个引擎；没有「活动世界」。检视与命令
@@ -153,6 +157,7 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
     lifespan 本身立刻让出，服务器随即开始接受连接；开好之前 app.state.ready 为 False、app.state.pool 为 None，所有 API（含
     /health）回 503 worlds_unavailable（_NotReadyGate）。开好之后调 on_ready()；开的途中出错调 on_open_failed(exc)（之后照旧
     一律 503）。不能与 engine 同用。缺省 False：与之前一样在这里开池，app.state.ready 从一开始就是 True。
+    `idle_close_interval_s`：空闲关闭的轮询间隔（秒，spec §10.3）；None 取池的缺省 30 秒，0 不起空闲关闭线程。
     """
     config.validate_bind()
     # 左脑 lane 的开关一致性在启动时就拒绝，而不是等到第一次摄入才发现。
@@ -172,7 +177,7 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         opened = _open_pool(config, engine_factory)
         try:
             _attach_sessions(app, opened)
-            _start_pool(opened, app.state.ws_manager, loop)
+            _start_pool(opened, app.state.ws_manager, loop, idle_close_interval_s)
         except BaseException:
             _stop_pool(opened)
             raise
@@ -186,7 +191,8 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         loop = asyncio.get_running_loop()
         if not deferred_open:
             _attach_sessions(app, pool)
-            await to_thread.run_sync(_start_pool, pool, app.state.ws_manager, loop)
+            await to_thread.run_sync(_start_pool, pool, app.state.ws_manager, loop,
+                                     idle_close_interval_s)
             yield
             _stop_pool(pool)
             return

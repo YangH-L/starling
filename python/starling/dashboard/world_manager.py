@@ -100,8 +100,9 @@ DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个�
 world_read_only。分叉（fork_world）按来源选路、持锁（裁定 R5）：开着的来源持引擎锁、走引擎自己的连接，
 关着的来源持它的世界锁，快照来源直接复制。
 
-本期不做：没有空闲自动关闭（C++ 的空闲判定在第 4 期，裁定 R21）。世界开着直到 close_world、
-delete_world 或关停（close_all），默认世界只在关停时关。
+空闲关闭（第 4 期，spec §10.3）：注入了会话表时，后台线程 starling-idle-close 每 30 秒（服务配置项）一轮 idle_close_round，
+只按 C++ may_close_world 的判定关（裁定 R63）。池打开引擎时与每次取租约时调 touch_world，看板查看算作活动（裁定 R50）。世界
+另外在 close_world、delete_world 或关停（close_all）时关，默认世界只在关停时关。
 
 客户端会话与写占用（第 4 期，spec §6.4、§11）
 ---------------------------------------------
@@ -168,6 +169,9 @@ _STATS_THREAD = "starling-world-stats"
 _SCHEDULER_POLL_S = 600.0
 _SCHEDULER_FIRST_DELAY_S = 60.0
 _SCHEDULER_THREAD = "starling-auto-snapshot"
+# 空闲关闭的轮询（spec §10.3、§11，裁定 R50、R63）：每隔这么久问一次 C++ may_close_world。服务配置项 --idle-close-interval。
+_IDLE_CLOSE_POLL_S = 30.0
+_IDLE_CLOSE_THREAD = "starling-idle-close"
 # 默认世界在没有注册表（:memory: 等）时的名字。
 _DEFAULT_NAME = "default"
 # 注册表 list 的分页上限（RegistryDb::list 的 limit 1–500）。
@@ -449,11 +453,19 @@ class WorldPool:
             elif engine is not None and lost:
                 self._retry_lost_workers(world)
             lease.engine = engine
+            self._touch(world)                        # 裁定 R50：看板每次按世界取租约都算一次活动
         except BaseException:
             engine = None
             lease.release()
             raise
         return lease
+
+    def _touch(self, world: str) -> None:
+        """记一次世界活动（C++ SessionTable.touch_world，裁定 R50）：引擎打开时与每次取租约时。没有会话表时什么都不做。
+        客户端的开句柄、调用前后由 SessionTable 自己记。"""
+        sessions = self._sessions
+        if sessions is not None:
+            sessions.touch_world(world, self.now_ms())
 
     def _return_lease(self, world: str) -> None:
         with self._lock:
@@ -637,6 +649,7 @@ class WorldPool:
                 return False
             self._engines[world] = engine
             background = self._background
+        self._touch(world)                            # 裁定 R50：引擎打开算一次活动（admit 建的引擎也走这里）
         if background:
             self._start_workers_or_mark_lost(world, engine)
         return True
@@ -961,9 +974,11 @@ class WorldPool:
 
     def start_background(self, *, stats_interval_s: float = _STATS_REFRESH_S,
                          scheduler_poll_s: float = _SCHEDULER_POLL_S,
-                         scheduler_first_delay_s: float = _SCHEDULER_FIRST_DELAY_S) -> None:
+                         scheduler_first_delay_s: float = _SCHEDULER_FIRST_DELAY_S,
+                         idle_close_interval_s: float = _IDLE_CLOSE_POLL_S) -> None:
         """每个开着的世界按自己的 settings.background 起 tick / 摄入；此后新建的引擎也起。起按时间的
-        自动快照调度线程与 30 秒统计刷新线程（有注册表时）。已开着时是 no-op。"""
+        自动快照调度线程与 30 秒统计刷新线程（有注册表时），以及空闲关闭线程（注入了会话表时，每 idle_close_interval_s
+        一轮 idle_close_round）。已开着时是 no-op。"""
         with self._lock:
             if self._background or self._shut:
                 return
@@ -980,6 +995,48 @@ class WorldPool:
             self._start_thread(_SCHEDULER_THREAD, self._scheduler_loop,
                                scheduler_poll_s, scheduler_first_delay_s)
             self._start_thread(_STATS_THREAD, self._stats_loop, stats_interval_s, stats_interval_s)
+        if self._sessions is not None and idle_close_interval_s > 0:
+            self._start_thread(_IDLE_CLOSE_THREAD, self._idle_close_loop, idle_close_interval_s,
+                               idle_close_interval_s)
+
+    def idle_close_round(self, *, drain_timeout_s: float | None = None) -> list[str]:
+        """空闲关闭的一轮（spec §10.3，裁定 R50、R63）：对每个开着的世界问 C++ may_close_world(world, is_default, now)（没有活
+        句柄、没有在途调用、超过空闲时限、不是默认世界；判定只用它，不用 world_has_live_handles），说可以就 close_world。返回这一轮
+        关掉的世界。一个世界关不掉（租约排干超时、线程停不下：world_busy）或出别的错只记日志，不挡别的世界，下一轮再试。没有会话表时
+        什么都不关。
+
+        判与关之间有窗口：判过之后来了新租约或新句柄，close_world 照常等它的租约归零再关（与显式关闭一样），客户端下一次调用会
+        重建引擎；所以这里不再持锁复判。"""
+        sessions = self._sessions
+        if sessions is None:
+            return []
+        default = self.default_world()
+        timeout_s = _LEASE_DRAIN_TIMEOUT_S if drain_timeout_s is None else drain_timeout_s
+        closed: list[str] = []
+        for world in self.open_worlds():
+            if world == default or not sessions.may_close_world(world, False, self.now_ms()):
+                continue
+            try:
+                self.close_world(world, timeout_s)
+            except WorldSwitchError as exc:
+                logger.info("idle close of world %s skipped: %s", world, exc.code)
+                continue
+            except Exception:  # noqa: BLE001 — 后台路径：一个世界出错不挡别的世界
+                logger.exception("idle close of world %s failed", world)
+                continue
+            closed.append(world)
+        return closed
+
+    def _idle_close_loop(self, stop: threading.Event, poll_s: float, first_delay_s: float) -> None:
+        if stop.wait(first_delay_s):
+            return
+        while True:
+            try:
+                self.idle_close_round()
+            except Exception:  # noqa: BLE001 — 保活
+                logger.exception("idle close round failed")
+            if stop.wait(poll_s):
+                return
 
     def stop_background(self, timeout_s: float = 5.0) -> None:
         """停调度与统计线程（任何锁之外 join），再停每个开着的世界的 tick / 摄入线程。此后新建的引擎

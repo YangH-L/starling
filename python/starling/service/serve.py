@@ -1,6 +1,7 @@
 """`starling-serve`：记忆服务进程的入口（spec §10.1 启动、§10.2 停止，记忆服务第 4 期 Task 4.3）。
 
     starling-serve --data-dir D --host 127.0.0.1 --port P [--token-file F] [--drain-timeout S]
+                   [--idle-close-interval S]
 
 - 所有路径都在 D 之下：D/starling.json（可以没有；没有抽取 provider 时从 OPENAI_* 补一个）、D/dashboard.db（默认世界）、
   D/registry.db、D/worlds/、D/ingest-spool/。不读 ~/.starling，也不看环境变量里的路径（DashboardConfig.load_service）。
@@ -12,6 +13,7 @@
   开注册表、建默认世界的引擎；开好之前 /health 与其余 API 一律 503 worlds_unavailable（create_app 的 deferred_open），
   开好之后 stdout 打印「starling-serve ready」。开的途中出错：记日志，进程退出码 1（交给进程管理器重启，不留一个永远 503
   的服务）。
+- 空闲关闭：每 --idle-close-interval 秒（默认 30，0 关掉）一轮，按 C++ 的空闲判定关掉没人用的世界（默认世界不关）。
 - SIGTERM / SIGINT：停止接受新连接 → 等在途请求结束（上限 --drain-timeout，默认 30 秒）→ lifespan 的关停：各世界进
   DRAINING、停后台线程、逐个关闭世界（合并 WAL、写统计缓存）→ 释放数据目录锁 → 退出码 0。
 
@@ -42,6 +44,7 @@ __all__ = ["DataDirInUse", "lock_data_dir", "main", "run"]
 TOKEN_ENV = "STARLING_SERVICE_TOKEN"
 LOCK_NAME = ".lock"
 DEFAULT_DRAIN_TIMEOUT_S = 30.0
+DEFAULT_IDLE_CLOSE_INTERVAL_S = 30.0
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
@@ -92,7 +95,8 @@ def _say(line: str) -> None:
 def run(data_dir: str | os.PathLike, *, token_from_config: bool = False,
         config: DashboardConfig | None = None, token: str | None = None,
         host: str | None = None, port: int | None = None,
-        drain_timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S, engine_factory=None) -> int:
+        drain_timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S,
+        idle_close_interval_s: float = DEFAULT_IDLE_CLOSE_INTERVAL_S, engine_factory=None) -> int:
     """跑一个服务进程直到被 SIGTERM / SIGINT 停下，返回退出码（0 正常停止，1 启动失败，3 data_dir_in_use）。
 
     token_from_config=False（starling-serve）：配置是 DashboardConfig.load_service(data_dir, token)，token 必须给。
@@ -115,12 +119,13 @@ def run(data_dir: str | os.PathLike, *, token_from_config: bool = False,
               file=sys.stderr, flush=True)
         return EXIT_DATA_DIR_IN_USE
     try:
-        return _serve(cfg, drain_timeout_s, engine_factory)
+        return _serve(cfg, drain_timeout_s, idle_close_interval_s, engine_factory)
     finally:
         os.close(lock_fd)                     # 世界都关完了才放锁
 
 
-def _serve(cfg: DashboardConfig, drain_timeout_s: float, engine_factory) -> int:
+def _serve(cfg: DashboardConfig, drain_timeout_s: float, idle_close_interval_s: float,
+           engine_factory) -> int:
     try:
         sock = _bind(cfg.host, cfg.port)
     except OSError as exc:
@@ -139,7 +144,8 @@ def _serve(cfg: DashboardConfig, drain_timeout_s: float, engine_factory) -> int:
 
     try:
         app = create_app(cfg, engine_factory=engine_factory, deferred_open=True,
-                         on_ready=on_ready, on_open_failed=on_open_failed)
+                         on_ready=on_ready, on_open_failed=on_open_failed,
+                         idle_close_interval_s=idle_close_interval_s)
         server = uvicorn.Server(uvicorn.Config(
             app, timeout_graceful_shutdown=drain_timeout_s, lifespan="on"))
 
@@ -182,6 +188,8 @@ def _parser() -> argparse.ArgumentParser:
                     help=f"file holding the bearer token (else the {TOKEN_ENV} environment variable)")
     ap.add_argument("--drain-timeout", type=float, default=DEFAULT_DRAIN_TIMEOUT_S,
                     help="seconds to wait for in-flight requests after SIGTERM (default 30)")
+    ap.add_argument("--idle-close-interval", type=float, default=DEFAULT_IDLE_CLOSE_INTERVAL_S,
+                    help="seconds between idle-close rounds; 0 disables idle close (default 30)")
     return ap
 
 
@@ -196,9 +204,11 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"a token is required: --token-file F or the {TOKEN_ENV} environment variable")
     if args.drain_timeout < 0:
         ap.error("--drain-timeout must be >= 0")
+    if args.idle_close_interval < 0:
+        ap.error("--idle-close-interval must be >= 0")
     data_dir = os.path.abspath(os.path.expanduser(args.data_dir))
     return run(data_dir, token=token, host=args.host, port=args.port,
-               drain_timeout_s=args.drain_timeout)
+               drain_timeout_s=args.drain_timeout, idle_close_interval_s=args.idle_close_interval)
 
 
 if __name__ == "__main__":

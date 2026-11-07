@@ -699,3 +699,118 @@ def test_delete_forgets_the_world_so_a_recreated_world_starts_fresh(app_client):
     sessions.touch_world("w1", pool.now_ms())
     assert client.delete("/api/worlds/w1", params={"confirm": "w1"}).status_code == 200
     assert sessions.may_close_world("w1", False, pool.now_ms() + 10 ** 9) is False
+
+
+# ═════════════════════════ 单元 5：空闲关闭（R50、R63） ═════════════════════════
+
+
+def _idle_pool(tmp_path, idle_close_ms=1_000):
+    cfg = _cfg(tmp_path, tick_interval_s=0.0)
+    reg = _core.WorldRegistry.open(cfg.data_dir, cfg.db_path, cfg.tenant)
+    clock = _Clock()
+    sessions = _core.SessionTable(idle_close_ms=idle_close_ms)
+    pool = WorldPool(reg, cfg, monotonic_ms=clock)
+    pool.attach_sessions(sessions)
+    pool.sync_default_settings()
+    pool.create_world("w1", "")
+    return pool, sessions, clock
+
+
+def test_lease_and_engine_open_touch_the_world(tmp_path):
+    """R50：池打开引擎时与每次 lease（build 与否）都调 touch_world，看板查看算作活动。"""
+    pool, sessions, clock = _idle_pool(tmp_path)
+    try:
+        assert sessions.may_close_world("w1", False, clock() + 10 ** 6) is False     # 没有记录：不判可关
+        with pool.lease("w1", build=False):
+            pass
+        clock.now += 1_001
+        assert sessions.may_close_world("w1", False, clock()) is True                # build=False 的租约也记了活动
+        with pool.lease("w1"):                                                       # 建引擎 + 租约
+            pass
+        assert sessions.may_close_world("w1", False, clock()) is False
+        clock.now += 1_001
+        assert sessions.may_close_world("w1", False, clock()) is True
+    finally:
+        pool.close_all()
+
+
+def test_idle_round_closes_only_worlds_the_cpp_judgement_allows(tmp_path):
+    """R50、R63：一轮空闲关闭对每个开着的世界问 may_close_world（不是 world_has_live_handles），说可以就 close_world。
+    默认世界、有活句柄的、有在途调用的（句柄已关）、时限内有活动的都不关。"""
+    pool, sessions, clock = _idle_pool(tmp_path)
+    try:
+        for name in ("w2", "w3", "w4"):
+            pool.create_world(name, "")
+        for name in ("default", "w1", "w2", "w3", "w4"):
+            with pool.lease(name):
+                pass
+        sid = sessions.connect(clock())
+        live = pool.admit_client_handle("w2", sid, "alice", True, clock())          # w2：活句柄
+        busy = pool.admit_client_handle("w3", sid, "bob", False, clock())           # w3：句柄关了、调用在途
+        sessions.call_enter(busy, clock())
+        sessions.close_handle(busy)
+        clock.now += 1_001
+        sessions.heartbeat(sid, clock())
+        with pool.lease("w4", build=False):                                        # w4：刚有看板活动
+            pass
+        closed = pool.idle_close_round()
+        assert closed == ["w1"]
+        assert sorted(pool.open_worlds()) == ["default", "w2", "w3", "w4"]
+        sessions.call_exit(busy, clock())
+        pool.close_client_handle(live, timeout_s=1.0)
+        clock.now += 1_001
+        assert sorted(pool.idle_close_round()) == ["w2", "w3", "w4"]
+        assert pool.open_worlds() == ["default"]                                   # 默认世界不因空闲关闭
+    finally:
+        pool.close_all()
+
+
+def test_idle_round_skips_a_world_that_is_busy(tmp_path):
+    """一个世界关不掉（租约排干超时 → world_busy）只记日志，不挡别的世界，下一轮再试。"""
+    pool, sessions, clock = _idle_pool(tmp_path)
+    try:
+        pool.create_world("w2", "")
+        for name in ("w1", "w2"):
+            with pool.lease(name):
+                pass
+        clock.now += 1_001
+        held = pool.lease("w1", build=False)          # 持着一份租约不还：关闭等不到归零
+        try:
+            closed = pool.idle_close_round(drain_timeout_s=0.1)
+        finally:
+            held.release()
+        assert closed == ["w2"]
+        assert "w1" in pool.open_worlds()
+        clock.now += 1_001
+        assert pool.idle_close_round() == ["w1"]
+    finally:
+        pool.close_all()
+
+
+def test_idle_close_thread_runs_on_the_configured_interval(tmp_path):
+    """start_background 起空闲关闭线程，间隔取参数（服务配置项）；stop_background 停它。"""
+    pool, sessions, clock = _idle_pool(tmp_path)
+    try:
+        with pool.lease("w1"):
+            pass
+        clock.now += 1_001
+        pool.start_background(idle_close_interval_s=0.05)
+        deadline = time.monotonic() + 5
+        while "w1" in pool.open_worlds() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert "w1" not in pool.open_worlds()
+        assert any(t.name == "starling-idle-close" for t in threading.enumerate())
+        pool.stop_background()
+        assert not any(t.name == "starling-idle-close" for t in threading.enumerate())
+    finally:
+        pool.close_all()
+
+
+def test_idle_close_interval_is_a_service_option(tmp_path):
+    """--idle-close-interval（秒）进 create_app → start_background；缺省 30 秒。"""
+    from starling.service import serve
+    args = serve._parser().parse_args(["--data-dir", str(tmp_path), "--port", "0"])
+    assert args.idle_close_interval == 30.0
+    args = serve._parser().parse_args(["--data-dir", str(tmp_path), "--port", "0",
+                                       "--idle-close-interval", "5"])
+    assert args.idle_close_interval == 5.0
