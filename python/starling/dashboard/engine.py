@@ -1118,13 +1118,23 @@ class DashboardEngine:
 
     def remember_event(self, key: str, text: str, *, holder: str, interlocutor=None,
                        epoch: str = "2026-01-01T00:00:00Z") -> dict:
-        """按 key 写一次（C++ memoryops::remember_event 的三段状态机），事件与语句记在 holder 名下。抽取在 C++ 里、GIL 已释放，
-        但全程持引擎锁：三段共用这个引擎的写连接（与后台 tick、摄入同一把锁串行）。只读引擎 world_read_only。"""
+        """按 key 写一次，事件与语句记在 holder 名下（C++ memoryops::remember_event 的三段，修复轮 1 F1）。同看板的 remember：
+        ① begin（读行、认领、占位、补齐、写 engram）与 ③ finish（commit 与收据）持引擎锁，② 抽取（纯 LLM，几十秒起）在锁外，
+        同一世界的读、tick 不排在它后面。抽取适配器在 ① 锁内取好（_prepare_role：核对继承来的地址），作为局部变量带到锁外，
+        同 _converse_phased。锁外期间行被放弃或清空时 ③ 抛 EventConflict（C++ 的 state='pending' 围栏）。只读引擎 world_read_only。"""
         self._require_writable()
-        with self._lock:
-            self._prepare_role("extraction")          # 先核对继承来的地址（endpoint_changed），可能按新设置重建
-            out = self._core.remember_event(key, text, holder=holder,
-                                            interlocutor=interlocutor, epoch=epoch)
+        with self._lock:                                    # ① 短：读行 + 写 engram
+            extraction = self._prepare_role("extraction")
+            if extraction is None:                          # 与 Memory 一致：写 pending 行之前 fail-fast
+                raise LLMNotConfigured(
+                    "remember_event requires an llm adapter (bind the extraction role)")
+            begun = self._core.remember_event_begin(key, text, holder=holder,
+                                                    interlocutor=interlocutor, epoch=epoch)
+        if begun.done is not None:                          # committed 重入：不抽取、不写
+            return begun.done
+        extracted = self._core.remember_event_extract(begun, extraction)   # ② 锁外 LLM（不必抽取时 C++ 直接返回）
+        with self._lock:                                    # ③ 短：commit + 收据
+            out = self._core.remember_event_finish(begun, extracted, extraction)
         self._notify_commit()
         return out
 

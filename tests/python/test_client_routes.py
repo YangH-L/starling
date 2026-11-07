@@ -338,3 +338,34 @@ def test_route_codes_are_cataloged_except_internal_error():
     catalog = {row["code"] for row in _core.error_catalog()}
     assert set(ROUTE_CODES) - catalog == {"internal_error"}       # 兜底码，未登记 → 500 非瞬态
     assert (status_for("internal_error"), error_body("internal_error")["transient"]) == (500, False)
+
+
+# ───────────────────────── 修复轮 1 F1：抽取期间不持引擎锁 ─────────────────────────
+
+def test_same_world_recall_is_not_blocked_by_remember_event_extraction(svc):
+    """F1：客户端 remember_event 只在 begin 与 finish 持引擎锁，抽取（每次 LLM 调用 700 ms）在锁外。同一世界另一个句柄的
+    recall 在 200 ms 内返回，不排在抽取后面。"""
+    client, _clock = svc
+    sessions = client.app.state.sessions
+    sid = _connect(client)
+    writer = _ok(_open(client, sid, holder="alice"))["handle_id"]
+    reader = _ok(_open(client, sid, holder="bob"))["handle_id"]
+    assert _ok(_call(client, reader, "next_seq"))["result"] == 0
+    FAKES[-1].set_delay_ms(700)
+    box = {}
+    worker = threading.Thread(target=lambda: box.setdefault("resp", _call(
+        client, writer, "remember_event", key="slow", text="Bob owns auth", interlocutor="bob")))
+    worker.start()
+    deadline = time.monotonic() + 5
+    while sessions.in_flight(writer) == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    time.sleep(0.1)                                      # 进到抽取里
+    started = time.monotonic()
+    resp = _call(client, reader, "recall", query="x", strict=False, include_volatile=True)
+    waited = time.monotonic() - started
+    worker.join(15)
+    FAKES[-1].set_delay_ms(0)
+    assert resp.status_code == 200, resp.text
+    assert waited < 0.2, f"recall waited {waited * 1000:.0f} ms behind the extraction"
+    assert box["resp"].status_code == 200, box["resp"].text
+    assert box["resp"].json()["result"]["outcome"] == "accepted"

@@ -505,6 +505,33 @@ class MemoryCore:
             source_prefix=self.source_prefix, key=key, text=text,
             epoch_iso=epoch, policy=_build_policy(self._extraction))
 
+    # ── remember_event 的三段(服务端分相调用,修复轮 1 F1)。状态机全在 C++ memoryops::remember_event_begin /
+    #    remember_event_extract / remember_event_finish;remember_event 依次调这三段,Memory 门面仍走上面的单体调用。 ──
+
+    def remember_event_begin(self, key: str, text: str, *, holder: str | None = None,
+                             interlocutor=None, epoch: str = "2026-01-01T00:00:00Z"):
+        """第 1 段 + 补齐 + 写 engram(短,调用方持写锁)。返回不透明句柄;`.done` 不为 None 时已完成(committed 重入)。"""
+        return _core.memory_remember_event_begin(
+            self.rt.adapter, tenant_id=self.tenant, holder_id=holder or self.agent,
+            interlocutor=interlocutor or "", adapter_name=self.adapter_name,
+            source_prefix=self.source_prefix, key=key, text=text, epoch_iso=epoch)
+
+    def remember_event_extract(self, begun, llm):
+        """第 2 段:纯 LLM,不碰库(调用方在锁外调)。llm 由调用方在第 1 段锁内取好传进来。"""
+        if llm is None:
+            raise LLMNotConfigured(
+                "remember_event requires an llm adapter "
+                "(make_stub_llm / make_openai_llm / make_anthropic_llm)")
+        return _core.memory_remember_event_extract(
+            self.rt.adapter, llm, begun, self._extraction.belief_prompt,
+            self._extraction.episodic_prompt, self._extraction.general_fact_prompt,
+            policy=_build_policy(self._extraction))
+
+    def remember_event_finish(self, begun, extracted, llm) -> dict:
+        """第 3 段:commit + 收据(短,调用方持写锁)。锁外期间行被放弃或删掉时 EventConflict。"""
+        return _core.memory_remember_event_finish(
+            self.rt.adapter, llm, begun, extracted, policy=_build_policy(self._extraction))
+
     def abandon_event(self, key: str, *, holder: str | None = None) -> None:
         """把 pending 事件改成终态 abandoned。状态机在 C++
         `memoryops::abandon_event`(committed 抛 EventConflict,本 holder 没有这个 key 抛

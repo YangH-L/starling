@@ -9,6 +9,7 @@
 // 状态机与查询放在 C++(Starling CLAUDE.md 的边界);Python 绑定只转发,门面只把
 // 行包成 PendingEvent。
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -103,6 +104,51 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
                                std::string_view text,
                                std::string_view epoch_iso,
                                const extractor::ValidationPolicy& policy = {});
+
+// ── 分相入口(记忆服务第 4 期 Task 4.5 修复轮 1):remember_event 的三段,可以分开调 ──
+//
+// remember_event 就是依次调这三段(单一语义源,进程内 Memory 的行为不变)。服务端的引擎只在 begin 与 finish 持引擎锁,
+// extract 在锁外:抽取走网络,几十秒起,同一世界的读不能排在它后面(spec §12)。
+//
+//   begin   第 1 段的短事务(读行、认领、占位;冲突在这里抛)+ 补齐分支(只读库,不调 LLM)+ remember_prepare(写 engram)。
+//           committed 的行直接给出 done(idempotent),之后两段都不用调。
+//   extract 只调 LLM(remember_extract_all),不碰库。needs_extraction() 为 false 时什么都不做,返回空 bundle。
+//   finish  remember_commit_all(要抽取时)+ 第 3 段收据的 UPDATE(带 AND state='pending' 围栏:begin 与 finish 之间行被
+//           abandon_event 改成终态、或被 clear_tenant 删掉时抛 EventConflict)。
+//
+// RememberEventBegun 在三段之间原样传递,调用方不解构。begin 与 finish 必须在同一个 adapter 上调。
+struct RememberEventBegun {
+    std::optional<RememberOutcome> done;       // 有值 = 已完成(committed 重入),不必再调 extract / finish
+    RememberParams params;                     // 第 2 段的参数(payload、时刻、带 holder 的来源前缀、行里的说话对象)
+    std::string key;
+    RememberPrepared prepared;                 // remember_prepare 的结果(补齐时为空)
+    std::optional<RememberOutcome> completed;  // 补齐分支找回的结果(有值时不抽取,finish 只写收据)
+    [[nodiscard]] bool needs_extraction() const {
+        return !done && !completed && prepared.should_extract;
+    }
+};
+
+// 第 1 段 + 补齐 + prepare。错误同 remember_event 的第 1 段:空 holder → std::invalid_argument(零读写);
+// 冲突 → EventConflict(认领随事务回滚)。
+[[nodiscard]] RememberEventBegun remember_event_begin(persistence::SqliteAdapter& adapter,
+                                                      const RememberParams& base,
+                                                      std::string_view key,
+                                                      std::string_view text,
+                                                      std::string_view epoch_iso);
+
+// 第 2 段:纯 LLM。不持事务,不读写库。
+[[nodiscard]] RememberLlmBundle remember_event_extract(persistence::SqliteAdapter& adapter,
+                                                       extractor::LLMAdapter& llm,
+                                                       const RememberEventBegun& begun,
+                                                       const RememberPrompts& prompts,
+                                                       const extractor::ValidationPolicy& policy = {});
+
+// 第 3 段:commit + 收据。返回值与 remember_event 相同。
+[[nodiscard]] RememberOutcome remember_event_finish(persistence::SqliteAdapter& adapter,
+                                                    extractor::LLMAdapter& llm,
+                                                    const RememberEventBegun& begun,
+                                                    const RememberLlmBundle& extracted,
+                                                    const extractor::ValidationPolicy& policy = {});
 
 // 放弃 holder 名下的一个 key:一个短事务,把 state='pending' 的行改成终态 'abandoned'。
 // 放弃是终局,之后这个 holder 再对同一个 key remember_event 一律抛 EventConflict(不论

@@ -259,14 +259,13 @@ std::vector<PendingEventRow> pending_events(persistence::Connection& conn,
     return rows;
 }
 
-RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
-                               extractor::LLMAdapter& llm,
-                               const RememberParams& base,
-                               const RememberPrompts& prompts,
-                               std::string_view key,
-                               std::string_view text,
-                               std::string_view epoch_iso,
-                               const extractor::ValidationPolicy& policy) {
+RememberEventBegun remember_event_begin(persistence::SqliteAdapter& adapter,
+                                        const RememberParams& base,
+                                        std::string_view key,
+                                        std::string_view text,
+                                        std::string_view epoch_iso) {
+    RememberEventBegun begun;
+    begun.key = std::string(key);
     require_holder(base.holder_id, "remember_event");   // 零 DB 读写
     governance::require_write_admission(adapter);   // 门前抛 = 零 DB 写
     auto& conn = adapter.connection();
@@ -300,7 +299,8 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
                 done.source_preserved = !row.engram_ref.empty();
                 done.structured_claims_persisted = !done.statement_ids.empty();
                 txn.commit();
-                return done;
+                begun.done = std::move(done);
+                return begun;
             }
             // state == "pending":重试,用行里原来的 seq、原文与说话对象,不另分配序号。
             // interlocutor 决定抽取出的语句落在哪个 scope_parties 下,而 key 的契约是
@@ -348,7 +348,6 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
     params.created_at_iso8601 = add_seconds_to_iso(epoch_iso, row.seq);
 
     RememberOutcome result;
-    bool completed_from_engram = false;
     // 补齐分支(只在重试已有 pending 行时走):② 落了语句、③ 没写成。按来源身份找回
     // 上次的 engram,挂在它上面、holder 相同的语句就是上次抽取的成果——直接拿来用,不再
     // 抽取一次。不按 content_hash 找:同一段话写进几个 holder 名下就有几个 engram,内容
@@ -378,13 +377,53 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
             result.outcome       = "idempotent";
             result.source_preserved = true;
             result.structured_claims_persisted = true;
-            completed_from_engram = true;
+            begun.completed = std::move(result);
             break;
         }
     }
-    if (!completed_from_engram) {
-        // remember_all 抛异常时行留 pending(不 catch),异常原样上抛。
-        result = remember_all(adapter, llm, params, prompts, policy);
+    // 补齐不成(或不是重试):照 remember_all 的第一步写 engram;抽取与 commit 留给 extract / finish。
+    if (!begun.completed) {
+        begun.prepared = remember_prepare(adapter, params);
+    }
+    begun.params = std::move(params);
+    return begun;
+}
+
+RememberLlmBundle remember_event_extract(persistence::SqliteAdapter& adapter,
+                                         extractor::LLMAdapter& llm,
+                                         const RememberEventBegun& begun,
+                                         const RememberPrompts& prompts,
+                                         const extractor::ValidationPolicy& policy) {
+    if (!begun.needs_extraction()) {
+        return {};
+    }
+    return remember_extract_all(adapter, llm, begun.params, prompts, policy);
+}
+
+RememberOutcome remember_event_finish(persistence::SqliteAdapter& adapter,
+                                      extractor::LLMAdapter& llm,
+                                      const RememberEventBegun& begun,
+                                      const RememberLlmBundle& extracted,
+                                      const extractor::ValidationPolicy& policy) {
+    if (begun.done) {
+        return *begun.done;
+    }
+    auto& conn = adapter.connection();
+    const RememberParams& base = begun.params;           // tenant_id / holder_id 与调用方给的相同
+    const std::string_view key = begun.key;
+    RememberOutcome result;
+    if (begun.completed) {
+        result = *begun.completed;
+    } else if (!begun.prepared.should_extract) {
+        // 与 remember_all 的短路一致:no_store / rejected 不抽取、不 commit。
+        result = {.holder_id = base.holder_id,
+                  .engram_ref = begun.prepared.engram_ref,
+                  .statement_ids = {},
+                  .outcome = begun.prepared.outcome,
+                  .extraction_failed = false};
+    } else {
+        // remember_commit_all 抛异常时行留 pending(不 catch),异常原样上抛。
+        result = remember_commit_all(adapter, llm, base, begun.prepared, extracted, policy);
     }
 
     // ── 第 3 段:短事务,收尾写收据行。 ──
@@ -435,6 +474,23 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
         txn.commit();
     }
     return result;
+}
+
+RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
+                               extractor::LLMAdapter& llm,
+                               const RememberParams& base,
+                               const RememberPrompts& prompts,
+                               std::string_view key,
+                               std::string_view text,
+                               std::string_view epoch_iso,
+                               const extractor::ValidationPolicy& policy) {
+    // 三段依次调(单一语义源):Memory 门面与服务端的分相调用走的是同一套代码。
+    const auto begun = remember_event_begin(adapter, base, key, text, epoch_iso);
+    if (begun.done) {
+        return *begun.done;
+    }
+    const auto extracted = remember_event_extract(adapter, llm, begun, prompts, policy);
+    return remember_event_finish(adapter, llm, begun, extracted, policy);
 }
 
 void abandon_event(persistence::SqliteAdapter& adapter,
