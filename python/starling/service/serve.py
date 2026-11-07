@@ -119,13 +119,47 @@ def run(data_dir: str | os.PathLike, *, token_from_config: bool = False,
               file=sys.stderr, flush=True)
         return EXIT_DATA_DIR_IN_USE
     try:
+        if token_from_config:
+            return _serve_after_open(cfg, drain_timeout_s, idle_close_interval_s, engine_factory)
         return _serve(cfg, drain_timeout_s, idle_close_interval_s, engine_factory)
     finally:
         os.close(lock_fd)                     # 世界都关完了才放锁
 
 
+def _run_until_signalled(server: uvicorn.Server, sockets: list[socket.socket] | None) -> None:
+    """跑 uvicorn 直到 SIGTERM / SIGINT。uvicorn 在 serve 期间换上自己的处理器，退出时换回这里装的、再把收到的信号重发一次：
+    这里的处理器只置标志，进程不会在关完世界之后被默认处理器以 -15 杀掉。serve 之前收到的信号同样只是让它一起来就关停。"""
+    def on_signal(_signum, _frame) -> None:
+        server.should_exit = True
+
+    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        server.run(sockets=sockets)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _serve_after_open(cfg: DashboardConfig, drain_timeout_s: float, idle_close_interval_s: float,
+                      engine_factory) -> int:
+    """token_from_config（run_dashboard.py、8787）的启动顺序（裁定 R85）：维持改动之前的「先开池、再监听」。create_app 用缺省模式
+    （在这里开注册表与池），uvicorn 自己按 cfg.host/port 绑端口——它在 lifespan 启动（建默认世界引擎、起后台线程）跑完之后才
+    create_server，所以开池期间端口上没有监听。用户 launchd 下的 wedge-watch 以 curl -sf /health 探活、端口不在不算失败，这样它
+    在启动期间不会碰到 503 而把服务当成卡死。starling-serve 不走这里（_serve：先绑端口、就绪前 503，spec §10.1）。"""
+    app = create_app(cfg, engine_factory=engine_factory, idle_close_interval_s=idle_close_interval_s)
+    server = uvicorn.Server(uvicorn.Config(
+        app, host=cfg.host, port=cfg.port, timeout_graceful_shutdown=drain_timeout_s, lifespan="on"))
+    try:
+        _run_until_signalled(server, None)
+    except SystemExit as exc:                 # uvicorn 启动失败（lifespan 出错、端口被占）时 sys.exit(3)
+        return EXIT_FAILED if exc.code else EXIT_OK
+    return EXIT_OK if server.started else EXIT_FAILED
+
+
 def _serve(cfg: DashboardConfig, drain_timeout_s: float, idle_close_interval_s: float,
            engine_factory) -> int:
+    """starling-serve 的启动顺序（spec §10.1）：先绑端口、打印 listening，再在 lifespan 之后的工作线程里开池；就绪前 API 一律
+    503 worlds_unavailable，就绪后打印 ready。"""
     try:
         sock = _bind(cfg.host, cfg.port)
     except OSError as exc:
@@ -148,20 +182,9 @@ def _serve(cfg: DashboardConfig, drain_timeout_s: float, idle_close_interval_s: 
                          idle_close_interval_s=idle_close_interval_s)
         server = uvicorn.Server(uvicorn.Config(
             app, timeout_graceful_shutdown=drain_timeout_s, lifespan="on"))
-
-        def on_signal(_signum, _frame) -> None:
-            # uvicorn 在 serve 期间换上自己的处理器，退出时换回这个、再把收到的信号重发一次：这里只置标志，进程不会在关完
-            # 世界之后被默认处理器以 -15 杀掉。serve 之前收到的信号同样只是让它一起来就关停。
-            server.should_exit = True
-
-        previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
         shown_host, shown_port = sock.getsockname()[:2]
         _say(f"starling-serve listening on http://{_url_host(shown_host)}:{shown_port}")
-        try:
-            server.run(sockets=[sock])
-        finally:
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
+        _run_until_signalled(server, [sock])
     finally:
         sock.close()
     return EXIT_FAILED if failed else EXIT_OK

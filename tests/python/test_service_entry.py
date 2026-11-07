@@ -379,3 +379,72 @@ def test_websocket_before_ready_is_accepted_then_closed_1013(services, tmp_path)
     service.wait_ready()
 
 
+
+
+_DASHBOARD_PROBE = '''
+import json
+import os
+import socket
+import sys
+import time
+
+import starling.dashboard.app as app_module
+
+_real_open_pool = app_module._open_pool
+_port = int(os.environ["T43_PORT"])
+
+
+def _probing_open_pool(*args, **kwargs):
+    # token_from_config（run_dashboard / 8787）的路径：池开好之前端口上不能有监听（R85）。在开池时探一次。
+    sock = socket.socket()
+    try:
+        listening = sock.connect_ex(("127.0.0.1", _port)) == 0
+    finally:
+        sock.close()
+    print(json.dumps({"listening_while_opening": listening}), flush=True)
+    time.sleep(0.5)
+    return _real_open_pool(*args, **kwargs)
+
+
+app_module._open_pool = _probing_open_pool
+from starling.dashboard import DashboardConfig
+from starling.service import serve
+cfg = DashboardConfig.load(os.environ["T43_CONFIG"])
+sys.exit(serve.run(os.environ["T43_DATA"], token_from_config=True, config=cfg))
+'''
+
+
+def test_token_from_config_path_opens_the_pool_before_listening(tmp_path):
+    """R85：run_dashboard / 8787 的路径（token_from_config=True）维持改动之前的顺序：先开池、再监听。开池时端口上没有监听，
+    之后 /health 一来就是 200（watcher 的 curl -sf 不会碰到 503）。"""
+    import socket as _socket
+    probe_sock = _socket.socket()
+    probe_sock.bind(("127.0.0.1", 0))
+    port = probe_sock.getsockname()[1]
+    probe_sock.close()
+    data_dir = tmp_path / "home" / ".starling"
+    data_dir.mkdir(parents=True)
+    config = data_dir / "starling.json"
+    config.write_text(json.dumps({"db_path": str(data_dir / "dashboard.db"), "port": port,
+                                  "token": TOKEN, "tick_interval_s": 0,
+                                  "source_lane_enabled": False}), encoding="utf-8")
+    script = tmp_path / "probe_dashboard.py"
+    script.write_text(_DASHBOARD_PROBE, encoding="utf-8")
+    env = _clean_env(tmp_path / "home", T43_PORT=str(port), T43_CONFIG=str(config),
+                     T43_DATA=str(data_dir))
+    service = _Service([sys.executable, str(script)], env, tmp_path, tmp_path / "stderr-probe.log")
+    try:
+        line = service.wait_line(lambda text: "listening_while_opening" in text)
+        assert json.loads(line) == {"listening_while_opening": False}
+        deadline = time.monotonic() + _START_TIMEOUT_S
+        first = None
+        while time.monotonic() < deadline:
+            try:
+                first = httpx.get(f"http://127.0.0.1:{port}/health", timeout=2.0)
+                break
+            except httpx.TransportError:
+                time.sleep(0.05)
+        assert first is not None and first.status_code == 200      # 第一次连得上就是 200，没有 503
+        assert service.terminate() == 0
+    finally:
+        service.kill()
