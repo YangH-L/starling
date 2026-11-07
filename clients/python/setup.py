@@ -8,18 +8,16 @@ from setuptools.command.editable_wheel import editable_wheel
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_info_hook import write_build_info  # noqa: E402
 
-VERSION = "0.1.0"
-
 
 class _BuildPy(build_py):
     def run(self):
-        write_build_info(VERSION)
+        write_build_info()
         super().run()
 
 
 class _Editable(editable_wheel):
     def run(self):
-        write_build_info(VERSION)
+        write_build_info()
         super().run()
 
 

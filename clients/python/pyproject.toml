@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "starling-client"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Pure-Python client for the Starling memory service"
 requires-python = ">=3.9"
 dependencies = ["httpx>=0.27"]
 
 [tool.setuptools]
 packages = ["starling_client"]
+
+[tool.setuptools.dynamic]
+version = {attr = "starling_client._version.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

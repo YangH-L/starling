@@ -42,3 +42,13 @@ def test_legacy_body_without_transient():
 def test_non_dict_body_does_not_crash():
     e = E.from_body(502, None)
     assert isinstance(e, E.ServiceError) and e.transient is True
+
+
+def test_event_not_found_str_is_plain():
+    e = E.from_body(404, {"code": "event_not_found", "transient": False, "detail": "event_not_found"})
+    assert isinstance(e, KeyError) and str(e) == "event_not_found"
+
+
+def test_missing_code_falls_back_to_http_status():
+    e = E.from_body(404, None)
+    assert e.code == "http_404" and e.transient is False

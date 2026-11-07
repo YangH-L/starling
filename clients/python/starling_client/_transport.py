@@ -11,9 +11,12 @@ PROTOCOL = 1
 class Transport:
     def __init__(self, url: str, token: str, timeout_s: float = 30.0, *, _httpx_transport=None):
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        self._client = httpx.Client(
-            base_url=url, headers=headers, timeout=timeout_s, transport=_httpx_transport
-        )
+        try:
+            self._client = httpx.Client(
+                base_url=url, headers=headers, timeout=timeout_s, transport=_httpx_transport
+            )
+        except (httpx.InvalidURL, UnicodeError, ValueError):
+            raise errors.ServiceError("invalid client configuration", code="invalid_config") from None
 
     def __repr__(self) -> str:
         return "Transport(...)"
@@ -34,6 +37,9 @@ class Transport:
             raise errors.ServiceTimeout("service request timed out") from None
         except httpx.TransportError:
             raise errors.ServiceUnavailable("service unreachable") from None
+        except (httpx.HTTPError, httpx.InvalidURL, UnicodeError):
+            # DecodingError, TooManyRedirects, bad URL/header text: fixed text, no cause chain.
+            raise errors.ServiceError("service request failed", code="bad_request") from None
         if resp.status_code >= 400:
             try:
                 body = resp.json()

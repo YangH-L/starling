@@ -68,12 +68,79 @@ def test_non_json_5xx_is_transient_service_error():
     assert ei.value.transient is True
 
 
-def test_errors_do_not_leak_url_or_token():
-    t = Transport(url="http://127.0.0.1:1/x", token="secret-tok", timeout_s=1.0)
+URL_SECRET = "10.9.8.7:4242/secret-path"
+TOKEN_SECRET = "secret-tok"
+
+
+def _assert_clean(exc):
+    import traceback
+
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    for s in (str(exc), repr(exc), text):
+        assert URL_SECRET not in s and TOKEN_SECRET not in s
+
+
+@pytest.mark.parametrize(
+    "exc_factory,cls",
+    [
+        (lambda: httpx.ConnectError(f"refused {URL_SECRET} {TOKEN_SECRET}"), E.ServiceUnavailable),
+        (lambda: httpx.ReadTimeout(f"slow {URL_SECRET} {TOKEN_SECRET}"), E.ServiceTimeout),
+        (lambda: httpx.DecodingError(f"bad {URL_SECRET} {TOKEN_SECRET}"), E.ServiceError),
+        (lambda: httpx.TooManyRedirects(f"loop {URL_SECRET} {TOKEN_SECRET}"), E.ServiceError),
+        (lambda: httpx.InvalidURL(f"bad url {URL_SECRET} {TOKEN_SECRET}"), E.ServiceError),
+        (lambda: UnicodeEncodeError("ascii", TOKEN_SECRET, 0, 1, URL_SECRET), E.ServiceError),
+    ],
+)
+def test_errors_do_not_leak_url_or_token(exc_factory, cls):
+    def h(req):
+        raise exc_factory()
+
+    with pytest.raises(cls) as ei:
+        make(h).post("/p", {})
+    _assert_clean(ei.value)
+
+
+def test_constructor_invalid_url_is_wrapped(monkeypatch):
+    def boom(*a, **k):
+        raise httpx.InvalidURL(f"bad {URL_SECRET} {TOKEN_SECRET}")
+
+    monkeypatch.setattr(httpx, "Client", boom)
+    with pytest.raises(E.ServiceError) as ei:
+        Transport("http://x", TOKEN_SECRET, 1.0)
+    _assert_clean(ei.value)
+
+
+def test_non_ascii_token_is_wrapped_without_leak():
     with pytest.raises(E.StarlingClientError) as ei:
-        t.post("/p", {})
-    for s in (str(ei.value), repr(ei.value)):
-        assert "127.0.0.1:1" not in s and "secret-tok" not in s
+        t = Transport("http://svc.invalid", "tok\u00e9n-" + TOKEN_SECRET, 1.0,
+                      _httpx_transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+        t.get("/p", None)
+    _assert_clean(ei.value)
+
+
+def test_timeout_is_passed_to_httpx():
+    t = make(lambda r: httpx.Response(200, json={}))
+    assert t._client.timeout == httpx.Timeout(1.0)
+    t2 = Transport("http://svc.invalid", "tok", 7.5, _httpx_transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+    assert t2._client.timeout == httpx.Timeout(7.5)
+
+
+def test_non_json_4xx_gets_http_status_code():
+    with pytest.raises(E.StarlingClientError) as ei:
+        make(lambda r: httpx.Response(404, text="nope")).get("/p", None)
+    assert ei.value.code == "http_404" and ei.value.transient is False
+
+
+def test_200_non_json_is_service_error():
+    with pytest.raises(E.ServiceError) as ei:
+        make(lambda r: httpx.Response(200, text="<html>")).get("/p", None)
+    assert ei.value.code == "bad_response"
+
+
+def test_200_list_is_wrapped():
+    assert make(lambda r: httpx.Response(200, json=[1, 2])).get("/p", None) == {"result": [1, 2]}
 
 
 def test_client_has_no_starling_core_import():

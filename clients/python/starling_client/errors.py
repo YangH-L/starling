@@ -83,7 +83,9 @@ def from_body(status: int, body) -> StarlingClientError:
     transient = body.get("transient")
     if not isinstance(transient, bool):
         transient = status >= 500
+    if not code:
+        code = f"http_{status}"
     cls = _BY_CODE.get(code)
     if cls is None:
         cls = ServiceError if status >= 500 else WorldError
-    return cls(code or f"http_{status}", code=code, transient=transient)
+    return cls(code, code=code, transient=transient)
