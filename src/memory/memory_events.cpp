@@ -223,9 +223,10 @@ void require_pending_row_updated(persistence::Connection& conn, std::string_view
     if (sqlite3_changes(conn.raw()) != 0) {
         return;
     }
+    // 调用方都在同一个事务里先读到了 pending(remember_event_finish):抛出时事务回滚,语句与收据都不写。
     throw EventConflict(
         "remember_event: key was abandoned or removed while the write was in flight; "
-        "statements may already be stored (key=" + std::string(key) + ")");
+        "nothing was written (key=" + std::string(key) + ")");
 }
 
 }  // namespace
@@ -411,6 +412,35 @@ RememberOutcome remember_event_finish(persistence::SqliteAdapter& adapter,
     auto& conn = adapter.connection();
     const RememberParams& base = begun.params;           // tenant_id / holder_id 与调用方给的相同
     const std::string_view key = begun.key;
+
+    // ── 第 3 段:一个事务。先重读收据行,再决定提交还是放弃(修复轮 2 N1)。 ──
+    // begin 与 finish 之间(引擎锁外的抽取)同一个 key 可能被别的调用改过:
+    //   - 客户端超时后按 key 重放,重放的那次先跑完、行已 committed;
+    //   - abandon_event 把行改成终态,或 clear_tenant 把行删掉。
+    // 先提交语句、再用 AND state='pending' 围栏写收据,会在前一种情形留下孤儿语句并回 EventConflict,在后一种情形把语句留在
+    // 一个已放弃的 key 下面。所以这里在同一个事务里先读行:committed → 返回行里存的结果,bundle 不提交;abandoned 或行不在
+    // → 零写入,抛 EventConflict;仍 pending → 提交语句与收据。remember_commit_all 自己的 TransactionGuard 嵌在这里成了
+    // SAVEPOINT,写后泵的各订阅者本来就各在一个 SAVEPOINT 里(subscriber_pump.cpp run_isolated),都不需要在外层提交之后才跑。
+    persistence::TransactionGuard txn(conn);
+    const EventRow row = read_event(conn, base.tenant_id, base.holder_id, key);
+    if (!row.found || row.state == "abandoned") {
+        throw EventConflict(
+            "remember_event: key was abandoned or removed while the write was in flight; "
+            "nothing was written (key=" + std::string(key) + ")");
+    }
+    if (row.state == "committed") {
+        // 另一个调用(同一个 key、同一段文本:begin 已比对过 text_sha256)先提交了。照 begin 的 committed 分支返回。
+        RememberOutcome done;
+        done.holder_id     = base.holder_id;
+        done.engram_ref    = row.engram_ref;
+        done.statement_ids = parse_statement_ids(row.statement_ids_json);
+        done.outcome       = "idempotent";
+        done.source_preserved = !row.engram_ref.empty();
+        done.structured_claims_persisted = !done.statement_ids.empty();
+        txn.commit();                                    // 只读:提交与回滚等价
+        return done;
+    }
+
     RememberOutcome result;
     if (begun.completed) {
         result = *begun.completed;
@@ -422,57 +452,52 @@ RememberOutcome remember_event_finish(persistence::SqliteAdapter& adapter,
                   .outcome = begun.prepared.outcome,
                   .extraction_failed = false,};
     } else {
-        // remember_commit_all 抛异常时行留 pending(不 catch),异常原样上抛。
+        // 抛异常时整个事务回滚(语句与收据一起),行留 pending,异常原样上抛。
         result = remember_commit_all(adapter, llm, base, begun.prepared, extracted, policy);
     }
 
-    // ── 第 3 段:短事务,收尾写收据行。 ──
     // 只有「证据真入库了」且「抽取没失败」才算提交。只看 extraction_failed 不够:
     // no_store / rejected 在 remember_commit 之前就早退,source_missing 返回默认构造的
     // RememberOutcome,三者的 extraction_failed 都是 false(这个标记的含义只是「证据已
     // 入库但抽取 LLM 失败」,见 memory_ops.hpp 的注释)。若据此标 committed,这个 key
     // 以后每次调用都回 idempotent + 空语句,记忆静默丢失(设计源 §9 禁止)。stored 的
     // 判据与 memory_ops.cpp 里 converse_commit 算 remember_ok 的那一处一致。
-    // 两条 UPDATE 都带 AND state='pending' 并查受影响行数(require_pending_row_updated):
-    // 第 2 段在事务外,期间这行可能已被 abandon_event 改成终态、或被 clear_tenant 删掉,
-    // 无围栏时本段会把 'abandoned' 覆写回 'committed',复活一个已判终局的 key。
+    // 两条 UPDATE 仍带 AND state='pending' 并查受影响行数(require_pending_row_updated)。上面已在本事务里读到 pending,
+    // BEGIN IMMEDIATE 持着写锁,这道围栏在这里只是兜底:绝不把 'abandoned' 覆写回 'committed'。
     const bool stored = (result.outcome == "accepted" || result.outcome == "idempotent");
-    {
-        persistence::TransactionGuard txn(conn);
-        if (!stored || result.extraction_failed) {
-            // 行留 pending:下次调用照原 seq 重试,不另分配序号。本支不因失败而抛——留着
-            // pending 行才让 rise 看得见(pending_events 带 failure_category,门②据此记 T2
-            // 失败);只有行已不是 pending(被放弃或删了)才抛。
-            const std::string category = result.extraction_failed
-                ? result.failure_category : ("not_stored:" + result.outcome);
-            // 返回值也带上这个原因:未入库时 remember_all 的 failure_category 是空的
-            // (那条路径不填),只记进行里会让调用方拿到一个空原因——又是一种静默。
-            // 行里记什么就返回什么,与抽取失败那一支的既有不变式一致。
-            if (result.failure_category.empty()) {
-                result.failure_category = category;
-            }
-            persistence::Stmt upd(conn.raw(),
-                                  "UPDATE events SET failure_category=?1, "
-                                  "engram_ref=COALESCE(NULLIF(?2,''), engram_ref) "
-                                  "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
-                                  "AND state='pending'");
-            upd.bind(category, result.engram_ref, base.tenant_id, base.holder_id, key);
-            upd.step_done();
-            require_pending_row_updated(conn, key);
-        } else {
-            persistence::Stmt upd(conn.raw(),
-                                  "UPDATE events SET state='committed', engram_ref=?1, "
-                                  "statement_ids_json=?2, failure_category='' "
-                                  "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
-                                  "AND state='pending'");
-            upd.bind(result.engram_ref,
-                     nlohmann::json(result.statement_ids).dump(),
-                     base.tenant_id, base.holder_id, key);
-            upd.step_done();
-            require_pending_row_updated(conn, key);
+    if (!stored || result.extraction_failed) {
+        // 行留 pending:下次调用照原 seq 重试,不另分配序号。本支不因失败而抛——留着
+        // pending 行才让 rise 看得见(pending_events 带 failure_category,门②据此记 T2
+        // 失败);只有行已不是 pending(被放弃或删了)才抛。
+        const std::string category = result.extraction_failed
+            ? result.failure_category : ("not_stored:" + result.outcome);
+        // 返回值也带上这个原因:未入库时 remember_all 的 failure_category 是空的
+        // (那条路径不填),只记进行里会让调用方拿到一个空原因——又是一种静默。
+        // 行里记什么就返回什么,与抽取失败那一支的既有不变式一致。
+        if (result.failure_category.empty()) {
+            result.failure_category = category;
         }
-        txn.commit();
+        persistence::Stmt upd(conn.raw(),
+                              "UPDATE events SET failure_category=?1, "
+                              "engram_ref=COALESCE(NULLIF(?2,''), engram_ref) "
+                              "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
+                              "AND state='pending'");
+        upd.bind(category, result.engram_ref, base.tenant_id, base.holder_id, key);
+        upd.step_done();
+        require_pending_row_updated(conn, key);
+    } else {
+        persistence::Stmt upd(conn.raw(),
+                              "UPDATE events SET state='committed', engram_ref=?1, "
+                              "statement_ids_json=?2, failure_category='' "
+                              "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
+                              "AND state='pending'");
+        upd.bind(result.engram_ref,
+                 nlohmann::json(result.statement_ids).dump(),
+                 base.tenant_id, base.holder_id, key);
+        upd.step_done();
+        require_pending_row_updated(conn, key);
     }
+    txn.commit();
     return result;
 }
 

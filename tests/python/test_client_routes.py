@@ -512,3 +512,80 @@ def test_open_with_settings_seen_by_the_client_matches_an_inherited_endpoint(svc
     other_model = json.loads(json.dumps(seen))
     other_model["extraction"]["model"] = "m2"
     _err(_open(client, sid, world="r1", read_only=True, settings=other_model), "world_settings_mismatch")
+
+
+# ───────────────────────── 修复轮 2 N1：同一个 key 并发、写入途中被放弃 ─────────────────────────
+
+def _statements_and_receipts(pool, world):
+    import sqlite3
+    con = sqlite3.connect(f"file:{pool.record(world)['db_path']}?mode=ro", uri=True)
+    try:
+        ids = {row[0] for row in con.execute("SELECT id FROM statements")}
+        receipts = {key: (state, json.loads(sids or "[]"))
+                    for key, state, sids in con.execute("SELECT key, state, statement_ids_json FROM events")}
+    finally:
+        con.close()
+    return ids, receipts
+
+
+def test_concurrent_replay_of_one_key_converges_without_orphans(svc):
+    """N1：客户端超时后按 key 重放。第一次请求在假 LLM 里阻塞时第二次请求到达；两次都 200，后完成的那次是 idempotent，
+    两次的 statement_ids 相同，语句表里没有不在收据里的语句。"""
+    client, _clock = svc
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    sid = _connect(client)
+    handle = _ok(_open(client, sid))["handle_id"]
+    FAKES[-1].set_delay_ms(300)
+    box = {}
+    worker = threading.Thread(target=lambda: box.setdefault("first", _call(
+        client, handle, "remember_event", key="k", text="Bob owns auth", interlocutor="bob")))
+    worker.start()
+    deadline = time.monotonic() + 5
+    while sessions.in_flight(handle) == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    time.sleep(0.1)                                            # 第一次已进到抽取里（它在第 1 相锁内取好了适配器）
+    # 重放的那次换一个适配器、给出不同的抽取结果（生产里重抽多半不逐字相同；相同时 span key 去重会掩盖孤儿）。不在第一次
+    # 抽取途中改它的适配器：FakeLLMAdapter 不带锁。
+    replay_llm = _core.FakeLLMAdapter()
+    replay_llm.set_default_response(_STUB_JSON.replace('"auth"', '"billing"'), True, "")
+    with pool.lease("w1") as engine:
+        engine.llm = replay_llm
+        engine = None
+    second = _call(client, handle, "remember_event", key="k", text="Bob owns auth", interlocutor="bob")
+    worker.join(20)
+    FAKES[-1].set_delay_ms(0)
+    first = box["first"]
+    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
+    # 重放的那次没有延迟，先跑完、写出语句（outcome 是 idempotent：第一次的 begin 已写好 engram，证据重入；语句是新写的）。
+    # 被阻塞的第一次在 finish 里重读到 committed：idempotent，拿重放那次的语句，自己的 bundle 不提交。
+    assert first.json()["result"]["outcome"] == "idempotent"
+    assert second.json()["result"]["outcome"] in ("accepted", "idempotent")
+    assert second.json()["result"]["statement_ids"]
+    assert first.json()["result"]["statement_ids"] == second.json()["result"]["statement_ids"]
+    ids, receipts = _statements_and_receipts(pool, "w1")
+    assert receipts["k"][0] == "committed"
+    assert ids == set(receipts["k"][1]) and ids                    # 没有孤儿
+
+
+def test_abandon_during_a_write_wins_and_leaves_no_statements(svc):
+    """N1：写入途中 key 被放弃。abandon 200；remember_event 409 event_conflict；这个 key 下没有语句。"""
+    client, _clock = svc
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    sid = _connect(client)
+    writer = _ok(_open(client, sid))["handle_id"]
+    FAKES[-1].set_delay_ms(300)
+    box = {}
+    worker = threading.Thread(target=lambda: box.setdefault("write", _call(
+        client, writer, "remember_event", key="k", text="Bob owns auth", interlocutor="bob")))
+    worker.start()
+    deadline = time.monotonic() + 5
+    while sessions.in_flight(writer) == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    time.sleep(0.1)
+    assert _call(client, writer, "abandon_event", key="k").status_code == 200
+    worker.join(20)
+    FAKES[-1].set_delay_ms(0)
+    _err(box["write"], "event_conflict")
+    ids, receipts = _statements_and_receipts(pool, "w1")
+    assert receipts["k"] == ("abandoned", [])
+    assert ids == set()

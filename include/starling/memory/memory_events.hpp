@@ -84,11 +84,16 @@ struct PendingEventRow {
 //    failure_category 与行里记的一致(未入库时 remember_all 不填这个字段,这里补上),
 //    不因失败而抛:留着 pending 行才让调用方看得见,下次调用照原 seq 重试,记忆不会静默
 //    丢失。remember_all 抛异常时行同样留 pending,异常原样上抛。
-//    两条收尾 UPDATE 都带 AND state='pending' 并查受影响行数:② 在事务外,期间这行可能
-//    已被 abandon_event 改成终态 'abandoned',或被 clear_tenant 删掉。零行时抛
-//    EventConflict,消息点明语句可能已入库。不设这道围栏就会把终态覆写回 committed,
-//    复活一个已判终局的 key(设计源 §8:放弃是终局),或在行已不存在时静默收尾、让调用
-//    方以为收据写成了。
+//    ③ 是一个事务,先在事务里重读收据行,再决定提交还是放弃(修复轮 2 N1):② 在事务外,期间
+//    同一个 key 可能被别的调用改过。
+//      - 行已 committed(同 key、同文本的另一次调用先跑完,例如客户端超时后的重放):返回行里
+//        存的结果(outcome="idempotent"、行里的 engram_ref 与 statement_ids),本次抽取的
+//        结果不提交,零写入。所以两次调用并发时,后完成的那次拿到 idempotent,不抛。
+//      - 行已 abandoned,或已被 clear_tenant 删掉:零写入,抛 EventConflict(消息说明什么都
+//        没写)。语句不会落进一个已放弃的 key 下面。
+//      - 仍是 pending:语句(remember_commit_all,嵌套成 SAVEPOINT)与收据在同一个事务里提交。
+//    两条收尾 UPDATE 仍带 AND state='pending' 并查受影响行数,作兜底:绝不把终态覆写回
+//    committed(设计源 §8:放弃是终局)。
 //
 // base 提供 tenant_id / holder_id / interlocutor / adapter_name / source_prefix;
 // base 的 payload 与 created_at_iso8601 被忽略(由 key+text 与 epoch+seq 推出)。
@@ -113,8 +118,8 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
 //   begin   第 1 段的短事务(读行、认领、占位;冲突在这里抛)+ 补齐分支(只读库,不调 LLM)+ remember_prepare(写 engram)。
 //           committed 的行直接给出 done(idempotent),之后两段都不用调。
 //   extract 只调 LLM(remember_extract_all),不碰库。needs_extraction() 为 false 时什么都不做,返回空 bundle。
-//   finish  remember_commit_all(要抽取时)+ 第 3 段收据的 UPDATE(带 AND state='pending' 围栏:begin 与 finish 之间行被
-//           abandon_event 改成终态、或被 clear_tenant 删掉时抛 EventConflict)。
+//   finish  一个事务:先重读收据行(见上面的 ③)。committed → idempotent、零写入;abandoned 或不在 → EventConflict、
+//           零写入;pending → remember_commit_all(要抽取时)与收据 UPDATE 一起提交。
 //
 // RememberEventBegun 在三段之间原样传递,调用方不解构。begin 与 finish 必须在同一个 adapter 上调。
 struct RememberEventBegun {
