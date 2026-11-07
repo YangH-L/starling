@@ -117,6 +117,14 @@ def _start_pool(pool: WorldPool, mgr, loop) -> None:
     pool.start_background()
 
 
+def _attach_sessions(app: FastAPI, pool: WorldPool) -> None:
+    """建客户端会话表（C++ SessionTable，spec §11）并注入池（setter，池建好之后、服务请求之前），挂到 app.state.sessions。
+    租约与空闲时限取 C++ 的缺省值（30 秒、10 分钟）。"""
+    sessions = _core.SessionTable()
+    pool.attach_sessions(sessions)
+    app.state.sessions = sessions
+
+
 def _stop_pool(pool: WorldPool) -> None:
     """D-P2-6 关停顺序：先让每个开着的世界进 DRAINING（写门转为拒绝；在 lifespan 的 yield 之后做，不用信号处理器，后者与
     uvicorn 自己的关停竞争），再停摄入（在途的 remember 不再被取走），再停 tick（stop_background 对每个世界 quiesce：先摄入、
@@ -163,6 +171,7 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         """工作线程里：开注册表与池、建默认世界引擎、起后台线程，然后才发布池、置 ready。"""
         opened = _open_pool(config, engine_factory)
         try:
+            _attach_sessions(app, opened)
             _start_pool(opened, app.state.ws_manager, loop)
         except BaseException:
             _stop_pool(opened)
@@ -172,10 +181,11 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # lifespan 只在 ASGI 服务器 / `with TestClient` 下运行；直接构造 TestClient(app) 的测试不建引擎、不起线程。
-        # 建引擎（首次打开取世界锁）在工作线程里做，同 lease_off_loop。
+        # lifespan 只在 ASGI 服务器 / `with TestClient` 下运行；直接构造 TestClient(app) 的测试不建引擎、不起线程，也没有
+        # 会话表（app.state.sessions 为 None，池按没人占着写入处理）。建引擎（首次打开取世界锁）在工作线程里做，同 lease_off_loop。
         loop = asyncio.get_running_loop()
         if not deferred_open:
+            _attach_sessions(app, pool)
             await to_thread.run_sync(_start_pool, pool, app.state.ws_manager, loop)
             yield
             _stop_pool(pool)
@@ -205,6 +215,7 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
     app = FastAPI(title="Starling Dashboard", version="0.1.0", lifespan=lifespan)
     app.state.config = config
     app.state.pool = pool
+    app.state.sessions = None        # lifespan 里建（_attach_sessions）
     app.state.ready = not deferred_open
     # 写配置的路由（POST /api/config、DELETE /api/config/provider）彼此串行（见 routes/config.py）。线程锁，
     # 只在工作线程里取：事件循环上的锁（asyncio / anyio）不能跨事件循环唤醒等待者，而不进 lifespan 的

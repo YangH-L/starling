@@ -102,6 +102,32 @@ world_read_only。分叉（fork_world）按来源选路、持锁（裁定 R5）�
 
 本期不做：没有空闲自动关闭（C++ 的空闲判定在第 4 期，裁定 R21）。世界开着直到 close_world、
 delete_world 或关停（close_all），默认世界只在关停时关。
+
+客户端会话与写占用（第 4 期，spec §6.4、§11）
+---------------------------------------------
+会话、句柄、写占用、在途调用的状态机全在 C++（_core.SessionTable，app 在 lifespan 里建好后 attach_sessions 注入）。池只做两件
+事：把「此刻有没有客户端会话占着这个世界的写入」（SessionTable.world_write_held，含还有在途调用的已关闭、已过期句柄，裁定 R59）
+交给 C++ 的判定，以及按判定的结果建、关引擎。时钟只有一个（裁定 R60）：SessionTable 的每次调用都从 now_ms()（注入的单调时钟，
+缺省 time.monotonic 换算成毫秒）取 now_ms，不混用墙钟——过期是终态，一个超前的 now 会把会话永久判死。
+
+  - 打开方式：world_decide_open_mode(rec, for_client_write=held)（裁定 R67）。可回收世界没人占着时看板只读打开，被客户端占着
+    写入时建可写引擎；被占用的世界被关掉（close_world 照旧允许，spec §10.3）后，下一次租约重建的也是可写引擎。
+  - 冻结：world_read_only_frozen(rec, held)（裁定 R41、R49 (c)）。immutable 连接不加锁，文件在它活着时被写就读到撕裂的数据，
+    所以写占用期间一律普通 mode=ro。
+  - 后台：可回收世界不论按哪种方式打开都不起 tick、摄入，不挂按会话的自动快照钩子（裁定 R68，world_effective_settings 带
+    record=rec）。rollout 由客户端驱动。
+  - 没有注入会话表的池（测试里直接建的）按没人占着写入处理。
+
+世界锁内调用的 C++（不变式，裁定 R66）
+------------------------------------
+C++ 里有 7 处按记录、以默认 held=false 判冻结的只读打开（world_store.cpp 的 take_snapshot、rollback_world 回滚后算摘要、
+session_known、current_content_mark、list_sessions、fork_world、upgrade_seed）。它们只在没有写者时才可能走 immutable，而「没有
+写者」靠世界锁保证：建引擎持世界锁，所以持世界锁期间表上的引擎不会变；没有引擎就没有写连接，有可写引擎则库旁边有 -wal/-shm，
+冻结退回普通 mode=ro。所以凡是调用下面这些 C++ 函数，调用方都必须持着该世界的世界锁：
+    world_take_snapshot（take_snapshot）、world_take_auto_snapshot（_auto_snapshot；内含 session_known、current_content_mark）、
+    world_rollback（_rollback_in_cpp，在 rollback 的关闭窗口里）、world_list_sessions（list_sessions）、
+    world_fork（fork_world，来源世界的锁；以快照为来源时例外：快照文件登记之后不再被写）、world_upgrade_seed（upgrade_seed）。
+新增这些函数的调用点时照此取锁；等世界锁时手里不能持租约（见上面的锁顺序）。
 """
 from __future__ import annotations
 
@@ -253,13 +279,22 @@ class _ClosingWindow:
             self._pool._closing.discard(self._world)
 
 
+def _monotonic_ms() -> int:
+    """会话表的缺省时钟：time.monotonic 换算成毫秒（裁定 R60：一个进程只用这一个时钟）。"""
+    return int(time.monotonic() * 1000)
+
+
 class WorldPool:
     def __init__(self, registry, config, *, clock=None,
                  engine_factory: EngineFactory | None = None,
-                 on_world_changed: Callable[[str, dict], None] | None = None) -> None:
+                 on_world_changed: Callable[[str, dict], None] | None = None,
+                 monotonic_ms: Callable[[], int] | None = None) -> None:
         self._registry = registry                     # _core.WorldRegistry | None（裁定 R6）
         self._config = config
         self._clock = clock or _now_iso
+        # 会话表（_core.SessionTable，attach_sessions 注入）与喂给它的唯一时钟（裁定 R60）。没有会话表时一律按没人占着写入。
+        self._sessions = None
+        self._monotonic_ms = monotonic_ms or _monotonic_ms
         self._factory = engine_factory or _default_factory
         self.on_world_changed = on_world_changed
         # 后台 tick 的广播回调 on_tick(world, stats)。app 设置；引擎起 tick 线程时绑上世界名传进去。
@@ -292,6 +327,28 @@ class WorldPool:
         """_core.WorldRegistry；库路径没有父目录（:memory: 等）时为 None（裁定 R3、R6）。"""
         return self._registry
 
+    # ───────────────────────── 客户端会话表（第 4 期） ─────────────────────────
+
+    def attach_sessions(self, sessions) -> None:
+        """注入客户端会话表（_core.SessionTable）。app 在 lifespan 里建好后、开始服务请求之前调一次。之后池的冻结、打开方式、
+        空闲关闭、恢复与删除的检查都问它，now_ms 一律取 now_ms()（裁定 R60）。"""
+        self._sessions = sessions
+
+    @property
+    def sessions(self):
+        """注入的 _core.SessionTable；没注入（测试里直接建的池）时为 None。"""
+        return self._sessions
+
+    def now_ms(self) -> int:
+        """会话表的唯一时钟（注入的单调时钟，毫秒；裁定 R60）。SessionTable 的每次调用都从这里取 now_ms。"""
+        return int(self._monotonic_ms())
+
+    def _write_held(self, world: str) -> bool:
+        """此刻有没有客户端会话占着 world 的写入（C++ SessionTable.world_write_held：活的可写句柄，或还有在途调用的可写句柄，
+        裁定 R59）。没有会话表时 False。"""
+        sessions = self._sessions
+        return bool(sessions is not None and sessions.world_write_held(world, self.now_ms()))
+
     def _require_registry(self):
         if self._registry is None:
             raise WorldSwitchError("worlds_unavailable")
@@ -319,20 +376,33 @@ class WorldPool:
     def context(self, world: str) -> WorldContext:
         """一个世界打开引擎需要的全部输入：库、租户、C++ 补齐默认值后的设置、摄入分区目录
         （<config.ingest_spool_root()>/<world_ingest_partition(...)>，裁定 R4）。默认世界的向量后端与路径
-        取 config（裁定 R26，默认世界「原地」），其余世界 sqlite、没有路径。打开方式（read_only）问 C++
-        world_decide_open_mode（spec §6.4：只读世界、种子、可回收世界看板只读打开）。"""
+        取 config（裁定 R26，默认世界「原地」），其余世界 sqlite、没有路径。
+
+        三个判定都在 C++，这里只传 held（此刻有没有客户端会话占着它的写入，_write_held）：
+          - 打开方式 world_decide_open_mode(rec, for_client_write=held)（spec §6.4，裁定 R67）：只读世界、种子只读；可回收世界
+            没人占着时只读，被客户端占着写入时可写（客户端的写要能落库）；其余可写。
+          - 冻结 world_read_only_frozen(rec, held)（裁定 R41、R49 (c)）：只读打开且没人占着写入时才冻结。
+          - 设置 world_effective_settings(..., record=rec)（裁定 R68）：只读打开的世界与可回收世界后台全关，可回收世界切成可写
+            引擎也不起 tick、摄入（rollout 由客户端驱动）。"""
         rec = self._record(world)
+        held = self._write_held(world)
         is_default = world == self.default_world()
         partition = _core.world_ingest_partition(is_default, rec["tenant"], rec["dir_id"])
         backend, store_path = self._vector_store(world, is_default)
         return WorldContext(
             name=world, dir_id=rec["dir_id"], db_path=rec["db_path"], tenant=rec["tenant"],
             agent=self._config.agent,
-            settings=_core.world_effective_settings(rec["settings"]),
+            settings=self._effective_settings(rec),
             ingest_spool_dir=str(self._config.ingest_spool_root() / partition),
             is_default=is_default, vector_backend=backend, vector_store_path=store_path,
-            read_only=_core.world_decide_open_mode(rec) == "ro",
-            frozen=_core.world_read_only_frozen(rec))
+            read_only=_core.world_decide_open_mode(rec, for_client_write=held) == "ro",
+            frozen=_core.world_read_only_frozen(rec, held))
+
+    @staticmethod
+    def _effective_settings(rec: dict, settings: dict | None = None) -> dict:
+        """给引擎的设置：C++ 按记录算的生效设置（裁定 R33、R68）。settings 缺省取记录里存着的。"""
+        return _core.world_effective_settings(rec["settings"] if settings is None else settings,
+                                              record=rec)
 
     def _vector_store(self, world: str, is_default: bool | None = None) -> tuple[str, str]:
         """(向量后端, 路径)：默认世界取 config（裁定 R26），其余世界 ("sqlite", "")。快照、恢复、自动快照
@@ -547,11 +617,14 @@ class WorldPool:
         return engine
 
     def _wire(self, world: str, engine) -> None:
-        """挂上池的回调：统计去抖广播（on_commit）与按会话的自动快照钩子（有注册表时）。只读引擎不起摄入，
-        没有调用钩子的地方，不挂（spec §6.3：只读世界不起后台任务）。"""
+        """挂上池的回调：统计去抖广播（on_commit）与按会话的自动快照钩子（有注册表时）。钩子只挂给可写打开、且不可回收的世界
+        （spec §6.3、裁定 R68）：只读引擎与可回收世界（切成可写引擎也一样）不起摄入，没有调用钩子的地方。"""
         engine.on_commit = lambda: self._note_change(world)
-        if self._registry is not None and not getattr(engine, "read_only", False):
-            self.attach_hooks(world, engine)
+        if self._registry is None or getattr(engine, "read_only", False):
+            return
+        if self._record(world).get("reclaimable"):
+            return
+        self.attach_hooks(world, engine)
 
     def seed_engine(self, world: str, engine) -> None:
         """把一个已经建好的引擎作为 world 的引擎放进池（create_app(engine=...)：测试与嵌入式调用方注入默认
@@ -716,9 +789,10 @@ class WorldPool:
             deb.timer.cancel()
 
     def _frozen(self, world: str) -> bool:
-        """这个世界的只读连接能不能冻结（C++ world_read_only_frozen，裁定 R36）。读不到记录时 False（普通 mode=ro）。"""
+        """这个世界的只读连接能不能冻结（C++ world_read_only_frozen，裁定 R36、R41）：带上此刻的写占用。读不到记录时 False
+        （普通 mode=ro）。"""
         try:
-            return _core.world_read_only_frozen(self._record(world))
+            return _core.world_read_only_frozen(self._record(world), self._write_held(world))
         except Exception:  # noqa: BLE001 — 拿不准就不冻结
             return False
 
@@ -1117,9 +1191,12 @@ class WorldPool:
         return reg.snapshots(world)
 
     def list_sessions(self, world: str, limit: int = 200) -> dict:
-        """会话清单（C++ 只读打开该世界的库）：持一份不建引擎的租约，恢复要等它归还。"""
+        """会话清单（C++ world_list_sessions 只读打开该世界的库）。先阻塞取世界锁、再取一份不建引擎的租约，在锁内调 C++
+        （裁定 R66，见模块文档「世界锁内调用的 C++」）：C++ 按记录判冻结（held=false），持世界锁期间没有别的路径能在这个库上
+        建起写连接。等锁时手里没有租约，不与关闭、恢复（持世界锁等租约）互等。路由在工作线程里调。"""
         reg = self._require_registry()
-        with self.lease(world, build=False):
+        self._record(world)                           # world_not_found：未知世界名不建世界锁
+        with self._world_lock(world), self.lease(world, build=False):
             return _core.world_list_sessions(reg, world, limit)
 
     def archives(self, world: str) -> list[dict]:
@@ -1156,7 +1233,8 @@ class WorldPool:
             # 裁定 R40：合并、核对继承来的 endpoint、写都在 C++ 的同一次持锁内；endpoint_changed 时什么都不写。
             merged = reg.update_settings(world, overrides,
                                          provider_endpoints=self._provider_endpoints())
-            settings = _core.world_effective_settings(merged)
+            # 按记录算生效的设置（裁定 R68）：可回收世界的引擎后台照旧全关，与详情同一口径（R33）。
+            settings = self._effective_settings(reg.get(world), merged)
             with self._lock:
                 engine = self._engines.get(world)
             warnings: list[str] = []
@@ -1188,7 +1266,7 @@ class WorldPool:
                        for name, prov in list(self._config.providers.items())}
         with self._world_lock(world):
             merged = reg.reconfirm_endpoints(world, current)
-            settings = _core.world_effective_settings(merged)
+            settings = self._effective_settings(reg.get(world), merged)
             with self._lock:
                 engine = self._engines.get(world)
             warnings: list[str] = []
