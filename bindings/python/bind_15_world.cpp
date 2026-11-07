@@ -212,10 +212,8 @@ void bind_15_world(pybind11::module_& m) {
     m.def("error_catalog", [] {
         py::list out;
         for (const auto& info : gov::error_catalog()) {
-            py::dict item;
-            item["code"] = std::string(info.code);
-            item["transient"] = info.transient;
-            item["http_status"] = info.http_status;
+            py::dict item("code"_a = std::string(info.code), "transient"_a = info.transient,
+                          "http_status"_a = info.http_status);
             out.append(std::move(item));
         }
         return out;
