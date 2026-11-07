@@ -853,3 +853,48 @@ def test_pool_internal_leases_do_not_keep_an_idle_world_open(tmp_path, monkeypat
         assert "w2" in pool.open_worlds()
     finally:
         pool.close_all()
+
+
+# ═════════════════════════ 修复轮：排干期间关闭窗口挡住新租约（R81） ═════════════════════════
+
+def test_admit_drain_refuses_new_leases_and_the_writer_is_shared_afterwards(setup):
+    """R81：admit 进入排干（检视租约被 Event 卡着）之后，新的 lease(build=False) 与 lease() 都回 world_busy——关闭窗口挡住了
+    它们，否则一条新开的 immutable 检视连接会活过写者的出现。释放之后新租约看到的 context().frozen 为 False（写占用已登记）。"""
+    pool, sessions, _clock = setup
+    with pool.lease("rollout-1"):
+        pass                                                # 只读引擎开着
+    holding, release, admitted = threading.Event(), threading.Event(), threading.Event()
+
+    def inspect():
+        with pool.lease("rollout-1", build=False):
+            holding.set()
+            release.wait(10)
+
+    def admit():
+        _admit(pool, sessions)
+        admitted.set()
+
+    reader = threading.Thread(target=inspect)
+    reader.start()
+    assert holding.wait(5)
+    writer = threading.Thread(target=admit)
+    writer.start()
+    deadline = time.monotonic() + 5
+    while "rollout-1" not in pool.closing_worlds() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    try:
+        assert "rollout-1" in pool.closing_worlds(), "admit must be draining inside a closing window"
+        for build in (False, True):
+            with pytest.raises(WorldSwitchError) as ei:
+                pool.lease("rollout-1", build=build)
+            assert ei.value.code == "world_busy", build
+        assert not admitted.is_set()
+    finally:
+        release.set()
+        reader.join(5)
+    assert admitted.wait(10)
+    writer.join(5)
+    with pool.lease("rollout-1", build=False) as engine:
+        assert engine is not None and engine.read_only is False
+        assert pool.context("rollout-1").frozen is False
+        engine = None
