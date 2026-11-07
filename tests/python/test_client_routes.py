@@ -369,3 +369,122 @@ def test_same_world_recall_is_not_blocked_by_remember_event_extraction(svc):
     assert waited < 0.2, f"recall waited {waited * 1000:.0f} ms behind the extraction"
     assert box["resp"].status_code == 200, box["resp"].text
     assert box["resp"].json()["result"]["outcome"] == "accepted"
+
+
+# ───────────────────────── 修复轮 1 F2：KeyError 只在 abandon_event 上是 event_not_found ─────────────────────────
+
+def test_key_error_outside_abandon_event_is_internal_error(svc, monkeypatch):
+    """F2：只有 abandon_event 的 KeyError 是 404 event_not_found。别的方法里的 KeyError（这里是缺 content_id 的命中）是服务端的
+    bug，回 500 internal_error。"""
+    client, _clock = svc
+    sid = _connect(client)
+    handle = _ok(_open(client, sid))["handle_id"]
+    monkeypatch.setattr(DashboardEngine, "recall", lambda self, *a, **k: [{"row": None, "score": 0.0}])
+    _err(_call(client, handle, "recall", query="q"), "internal_error")
+    monkeypatch.setattr(DashboardEngine, "next_seq", lambda self: (_ for _ in ()).throw(ValueError("x")))
+    _err(_call(client, handle, "next_seq"), "internal_error")
+    _err(_call(client, handle, "abandon_event", key="nope"), "event_not_found")
+    _err(_call(client, handle, "recall", query=7), "invalid_request")       # 参数校验仍是 400
+
+
+# ───────────────────────── 修复轮 1 F3：holder 为空回 400 ─────────────────────────
+
+@pytest.mark.parametrize("read_only", [False, True], ids=["writable", "read_only"])
+def test_open_with_an_empty_holder_is_invalid_request(svc, read_only):
+    client, _clock = svc
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    sid = _connect(client)
+    _err(_open(client, sid, holder="", read_only=read_only), "invalid_request")
+    assert not sessions.world_has_live_handles("w1", pool.now_ms())
+
+
+# ───────────────────────── 修复轮 1 F4：复审时存活的 4 个变异 ─────────────────────────
+
+def test_recall_degraded_is_503_transient_with_the_default_strict(svc, monkeypatch):
+    """strict 缺省 True：查询词嵌入失败时 503 recall_degraded，transient=True。用真的引擎与失败的嵌入器。"""
+    client, _clock = svc
+    import starling
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    sid = _connect(client)
+    handle = _ok(_open(client, sid))["handle_id"]
+    pool = client.app.state.pool
+    with pool.lease("w1") as engine:
+        engine._core.set_embedder(starling.make_openai_embedder(
+            model="offline", dim=8, timeout_ms=10, base_url="unsupported-starling-test://invalid"))
+        engine = None
+    resp = _call(client, handle, "recall", query="anything")
+    assert (resp.status_code, resp.json()) == (503, {"code": "recall_degraded", "transient": True,
+                                                     "detail": "recall_degraded"})
+    assert _ok(_call(client, handle, "recall", query="anything", strict=False))["result"] == []
+
+
+def test_recall_forwards_strict_and_include_volatile_to_the_engine(svc, monkeypatch):
+    client, _clock = svc
+    seen = []
+    real = DashboardEngine.recall
+
+    def spy(self, *args, **kwargs):
+        seen.append((kwargs["strict"], kwargs["include_volatile"], kwargs["holder"]))
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(DashboardEngine, "recall", spy)
+    sid = _connect(client)
+    handle = _ok(_open(client, sid, holder="carol"))["handle_id"]
+    _ok(_call(client, handle, "recall", query="q"))
+    _ok(_call(client, handle, "recall", query="q", strict=False, include_volatile=False))
+    assert seen == [(True, True, "carol"), (False, False, "carol")]
+
+
+def test_remember_event_without_an_extraction_role_is_llm_not_configured(tmp_path):
+    FAKES.clear()
+
+    def no_llm(ctx, providers):
+        engine = DashboardEngine(ctx, providers)
+        engine.llm = None
+        return engine
+    app = create_app(_cfg(tmp_path, roles={}), engine_factory=no_llm, idle_close_interval_s=0)
+    with TestClient(app) as client:
+        client.app.state.pool.create_world("w1", "")
+        sid = _connect(client)
+        handle = _ok(_open(client, sid))["handle_id"]
+        _err(_call(client, handle, "remember_event", key="k", text="t", interlocutor="bob"),
+             "llm_not_configured")
+        assert _ok(_call(client, handle, "pending_events"))["result"] == []   # 写 pending 行之前就拒绝
+
+
+def test_facade_calls_count_as_world_activity(svc):
+    """门面调用的租约 touch=True（R80）：每次调用都把世界的最后活动推到「此刻」。会话按 10 s 一次心跳活着（心跳本身不算世界
+    活动），句柄一直开着；关掉句柄之后，空闲判定从最后一次调用算起。"""
+    client, clock = svc
+    pool, sessions = client.app.state.pool, client.app.state.sessions
+    idle = 600_000                                     # SessionTable 缺省 idle_close_ms
+    sid = _connect(client)
+    handle = _ok(_open(client, sid))["handle_id"]      # open_handle 记一次活动
+
+    def advance(ms):
+        while ms > 0:
+            step = min(ms, 10_000)
+            clock.now += step
+            ms -= step
+            _ok(client.post(f"{API}/heartbeat", json={"session_id": sid}))
+
+    advance(idle - 10_000)
+    _ok(_call(client, handle, "next_seq"))             # 门面调用：活动推到此刻
+    sessions.close_handle(handle)
+    advance(idle - 10_000)                              # 距 open 已远超 idle，距调用还差 10 s
+    assert not sessions.may_close_world("w1", False, pool.now_ms())
+    advance(20_000)
+    assert sessions.may_close_world("w1", False, pool.now_ms())
+
+
+def test_facade_call_lease_touches_the_world(svc, monkeypatch):
+    """R80：门面调用取的是算活动的租约（touch=True），经池记一次 touch_world。SessionTable 的 call_enter / call_exit 也记活动，
+    所以光看 may_close_world 分不出租约是否 touch；这里直接看池的 touch。"""
+    client, _clock = svc
+    pool = client.app.state.pool
+    sid = _connect(client)
+    handle = _ok(_open(client, sid))["handle_id"]
+    touched = []
+    real = pool._touch
+    monkeypatch.setattr(pool, "_touch", lambda world: (touched.append(world), real(world)))
+    _ok(_call(client, handle, "next_seq"))
+    assert touched == ["w1"]

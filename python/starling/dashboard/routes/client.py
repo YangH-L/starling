@@ -16,13 +16,14 @@ from __future__ import annotations
 import dataclasses
 import logging
 from functools import partial
+from typing import Literal
 
 from anyio import to_thread
 from fastapi import APIRouter, Body, Depends, FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from starling import _core
 from starling._memory_core import LLMNotConfigured, RecallDegradedError
@@ -65,7 +66,7 @@ class SessionBody(_Body):
 class OpenBody(_Body):
     session_id: str
     world: str
-    holder: str
+    holder: str = Field(min_length=1)          # 修复轮 1 F3：空 holder 是 0039 无主旧行的标记，不能当 holder 用
     read_only: bool = False
     settings: dict | None = None
 
@@ -85,9 +86,16 @@ class CallBody(_Body):
 class _RecallArgs(_Body):
     query: str
     k: int = 10
-    mode: str = "semantic"
+    mode: Literal["semantic", "completion"] = "semantic"
     strict: bool = True
     include_volatile: bool = True
+
+    @model_validator(mode="after")
+    def _completion_has_no_degraded_signal(self):
+        # MemoryCore.recall 对这两个组合抛 ValueError：在调引擎之前拦成 invalid_request（F2：引擎里的 ValueError 是 500）。
+        if self.mode == "completion" and (self.strict or self.include_volatile):
+            raise ValueError("strict / include_volatile need mode='semantic'")
+        return self
 
 
 class _RememberEventArgs(_Body):
@@ -200,21 +208,22 @@ _METHODS = {
 }
 
 
-def _engine_error_code(exc: Exception) -> str | None:
-    """引擎调用里抛出的非池、非 C++ 世界错误 → 码；None 表示不认识（按 internal_error 处理）。KeyError 只来自
-    abandon_event（参数已经过模型校验，这里不会有别的 KeyError）。"""
+def _engine_error_code(method: str, exc: Exception) -> str | None:
+    """引擎调用里抛出的非池、非 C++ 世界错误 → 码；None 表示不认识（按 internal_error 处理）。
+
+    KeyError 只在 abandon_event 上是 event_not_found（C++ 的「这个 holder 没有这个 key」，绑定译成 KeyError）；别的方法里
+    的 KeyError、ValueError 是服务端的 bug，回 internal_error（修复轮 1 F2）。参数在调引擎之前已经过模型校验，所以这里不会把
+    请求错误误判成 500；唯一的例外是 recall 的 strict=True 配 mode="completion"（C++ 之外、引擎之前的组合校验）。"""
     if isinstance(exc, RecallDegradedError):
         return "recall_degraded"
     if isinstance(exc, _core.EventConflict):
         return "event_conflict"
     if isinstance(exc, KeyError):
-        return "event_not_found"
+        return "event_not_found" if method == "abandon_event" else None
     if isinstance(exc, LLMNotConfigured):
         return "llm_not_configured"
     if isinstance(exc, _core.WriteGateRejected):
         return "world_busy"                     # 关停排水：写门已关，瞬态
-    if isinstance(exc, ValueError):
-        return "invalid_request"                # 如 strict=True 配 mode="completion"
     return None
 
 
@@ -237,7 +246,7 @@ def _facade_call(pool, sessions, handle_id: str, method: str, raw_args) -> objec
             except (WorldSwitchError, _core.WorldStoreError, WorldHTTPError):
                 raise
             except Exception as exc:  # noqa: BLE001 — 领域异常转码，其余记日志后回 internal_error
-                code = _engine_error_code(exc)
+                code = _engine_error_code(method, exc)
                 if code is None:
                     logger.exception("client call %s failed", method)
                     code = "internal_error"
