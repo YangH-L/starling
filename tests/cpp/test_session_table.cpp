@@ -395,25 +395,25 @@ TEST(SessionTable, CloseOrDisconnectClearsTombstones) {
     EXPECT_EQ(code_of([&] { (void)table.resolve(second, kLease); }), "handle_closed");
 }
 
-// 裁定 R54：forget_world 删掉这个世界的最后活动与墓碑；同名世界重建后从「没有记录」开始，不继承旧的空闲时间。
+// 裁定 R54、R60：forget_world 删掉这个世界的最后活动与墓碑；同名世界重建后从「没有记录」开始，不继承旧的空闲时间。
 // 还有活句柄（可写或只读）或在途调用时抛 world_in_use，什么都不删。
 TEST(SessionTable, ForgetWorldDropsActivityAndTombstones) {
     SessionTable table(SessionConfig{.lease_ms = kLease, .idle_close_ms = 1000});
-    EXPECT_NO_THROW(table.forget_world("never-seen"));
+    EXPECT_NO_THROW(table.forget_world("never-seen", 0));
 
     const auto sid = table.connect(0);
     const auto reader = table.open_handle(sid, "w", "alice", true, 0);
-    EXPECT_EQ(code_of([&] { table.forget_world("w"); }), "world_in_use");   // 只读活句柄
+    EXPECT_EQ(code_of([&] { table.forget_world("w", 1); }), "world_in_use");   // 只读活句柄
     table.close_handle(reader);
     const auto writer = table.open_handle(sid, "w", "alice", false, 0);
-    EXPECT_EQ(code_of([&] { table.forget_world("w"); }), "world_in_use");   // 可写活句柄
-    EXPECT_TRUE(table.world_write_held("w", 1));                             // 拒绝时什么都没删
+    EXPECT_EQ(code_of([&] { table.forget_world("w", 1); }), "world_in_use");   // 可写活句柄
+    EXPECT_TRUE(table.world_write_held("w", 1));                                // 拒绝时什么都没删
 
     const auto other = table.open_handle(sid, "w2", "alice", false, 0);
     table.expire(kLease);   // writer、other 都成墓碑
     EXPECT_EQ(code_of([&] { (void)table.resolve(writer, kLease); }), "session_expired");
     EXPECT_TRUE(table.may_close_world("w", false, kLease));
-    table.forget_world("w");
+    table.forget_world("w", kLease);
     EXPECT_EQ(code_of([&] { (void)table.resolve(writer, kLease); }), "handle_closed");
     EXPECT_FALSE(table.may_close_world("w", false, kLease + kDay));   // 没有记录：兜底不关
     // 别的世界不受影响。
@@ -433,19 +433,96 @@ TEST(SessionTable, ForgetWorldWaitsForInFlightCalls) {
     const auto hid = table.open_handle(sid, "w", "alice", false, 0);
     table.call_enter(hid, 1);
     table.close_handle(hid);
-    EXPECT_EQ(code_of([&] { table.forget_world("w"); }), "world_in_use");
+    EXPECT_EQ(code_of([&] { table.forget_world("w", 2); }), "world_in_use");
     EXPECT_EQ(table.in_flight(hid), 1);
     table.call_exit(hid, 2);
-    EXPECT_NO_THROW(table.forget_world("w"));
+    EXPECT_NO_THROW(table.forget_world("w", 3));
     EXPECT_FALSE(table.may_close_world("w", false, kDay));
 
     const auto busy = table.open_handle(sid, "w", "alice", false, 3);
     table.call_enter(busy, 3);
     table.expire(kLease);
-    EXPECT_EQ(code_of([&] { table.forget_world("w"); }), "world_in_use");
+    EXPECT_EQ(code_of([&] { table.forget_world("w", kLease); }), "world_in_use");
     table.call_exit(busy, kLease + 1);
-    table.forget_world("w");
+    table.forget_world("w", kLease + 1);
     EXPECT_EQ(code_of([&] { (void)table.resolve(busy, kLease + 1); }), "handle_closed");
+}
+
+// 裁定 R60：forget_world 收 now_ms，判活与 may_close_world 一致。租约已过、但还没有任何调用看出它过期的会话
+// 不挡删除，不用先 expire；顺带把它标死，之后迟到的旧心跳也被拒绝。
+TEST(SessionTable, ForgetWorldJudgesLivenessAtNow) {
+    SessionTable table(SessionConfig{.lease_ms = kLease, .idle_close_ms = 1000});
+    const auto sid = table.connect(0);
+    const auto writer = table.open_handle(sid, "w", "alice", false, 0);
+    EXPECT_EQ(code_of([&] { table.forget_world("w", kLease - 1); }), "world_in_use");
+    EXPECT_NO_THROW(table.forget_world("w", kLease));   // 没调 expire，也没别的调用看过这个会话
+    EXPECT_EQ(code_of([&] { (void)table.resolve(writer, kLease); }), "handle_closed");
+    EXPECT_FALSE(table.may_close_world("w", false, kLease + kDay));
+    EXPECT_EQ(code_of([&] { table.heartbeat(sid, kLease - 1); }), "session_expired");
+}
+
+// 裁定 R59：可写句柄只要 handle_live(now) 或 in_flight > 0 就占着写入，不论状态（活着、已关、已过期）。
+// 会话过期而它的写调用还在提交时，另一个会话不能接手写入，冻结判定也必须给 Shared。
+TEST(SessionTable, InFlightWriteOnExpiredSessionKeepsTheHold) {
+    SessionTable table(SessionConfig{});
+    const auto sid_a = table.connect(0);
+    const auto sid_b = table.connect(20000);
+    const auto writer = table.open_handle(sid_a, "w", "alice", false, 0);
+    table.call_enter(writer, 1000);
+
+    EXPECT_TRUE(table.world_write_held("w", kLease));                  // A 已过期，写调用还在途
+    EXPECT_TRUE(table.world_write_held_by_other("w", sid_b, kLease));
+    EXPECT_TRUE(table.world_write_held_by_other("w", "", kLease));
+    EXPECT_EQ(code_of([&] { table.open_handle(sid_b, "w", "bob", false, kLease); }), "world_held");
+    EXPECT_NO_THROW(table.open_handle(sid_b, "w", "bob", true, kLease));   // 只读照样能开
+    EXPECT_EQ(table.expire(kLease), std::vector<std::string>{writer});
+    EXPECT_TRUE(table.world_write_held("w", kLease + 1));              // 成了墓碑也一样
+
+    table.call_exit(writer, kLease + 2);
+    EXPECT_FALSE(table.world_write_held("w", kLease + 2));
+    EXPECT_FALSE(table.world_write_held_by_other("w", sid_b, kLease + 2));
+    EXPECT_NO_THROW(table.open_handle(sid_b, "w", "bob", false, kLease + 2));
+}
+
+// 裁定 R59：关掉一个还有写调用在途的可写句柄，写占用留到 call_exit。
+TEST(SessionTable, InFlightWriteOnClosedHandleKeepsTheHold) {
+    SessionTable table(SessionConfig{});
+    const auto sid_a = table.connect(0);
+    const auto sid_b = table.connect(0);
+    const auto writer = table.open_handle(sid_a, "w", "alice", false, 0);
+    table.call_enter(writer, 1);
+    table.close_handle(writer);
+
+    EXPECT_TRUE(table.world_write_held("w", 2));
+    EXPECT_TRUE(table.world_write_held_by_other("w", sid_b, 2));
+    EXPECT_FALSE(table.world_write_held_by_other("w", sid_a, 2));   // 是 A 自己占着
+    EXPECT_EQ(code_of([&] { table.open_handle(sid_b, "w", "bob", false, 2); }), "world_held");
+    EXPECT_FALSE(table.world_has_live_handles("w", 2));             // 「活句柄」的定义不变
+
+    table.call_exit(writer, 3);
+    EXPECT_FALSE(table.world_write_held("w", 3));
+    EXPECT_NO_THROW(table.open_handle(sid_b, "w", "bob", false, 3));
+}
+
+// 裁定 R59 的边界：只读句柄的在途调用不占写入；会话过期时没有在途调用，写占用照样立即释放（Review Focus 第 4 条）。
+TEST(SessionTable, InFlightReadDoesNotHoldWrite) {
+    SessionTable table(SessionConfig{});
+    const auto sid_a = table.connect(0);
+    const auto sid_b = table.connect(20000);
+    const auto reader = table.open_handle(sid_a, "w", "alice", true, 0);
+    table.call_enter(reader, 1);
+    table.close_handle(reader);
+    EXPECT_FALSE(table.world_write_held("w", 2));
+    EXPECT_NO_THROW(table.open_handle(sid_b, "w", "bob", false, 2));
+    table.call_exit(reader, 3);
+
+    const auto sid_c = table.connect(0);
+    table.open_handle(sid_c, "w2", "carol", false, 0);
+    const auto idle_writer = table.open_handle(sid_c, "w2", "carol", false, 0);
+    table.call_enter(idle_writer, 1);
+    table.call_exit(idle_writer, 2);
+    EXPECT_FALSE(table.world_write_held("w2", kLease));
+    EXPECT_NO_THROW(table.open_handle(sid_b, "w2", "bob", false, kLease + 999));   // B 活到 49999
 }
 
 TEST(SessionTable, OpenHandleValidatesItsInputs) {

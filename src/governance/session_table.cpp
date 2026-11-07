@@ -74,12 +74,14 @@ const SessionTable::Handle& SessionTable::checked_handle(const std::string& hand
     return handle;
 }
 
+// 裁定 R59：可写句柄活着，或者还有在途调用（不论 Open、Closed、Expired），都算占着写入。
 bool SessionTable::write_held_by_other(const std::string& world, const std::string& session_id,
                                        std::int64_t now_ms) const {
     return std::ranges::any_of(handles_, [&](const auto& entry) {
         const Handle& handle = entry.second;
         return !handle.info.read_only && handle.info.world == world &&
-               handle.info.session_id != session_id && handle_live(handle, now_ms);
+               handle.info.session_id != session_id &&
+               (handle.in_flight > 0 || handle_live(handle, now_ms));
     });
 }
 
@@ -241,16 +243,12 @@ bool SessionTable::may_close_world(const std::string& world, bool is_default,
     });
 }
 
-void SessionTable::forget_world(const std::string& world) {
+void SessionTable::forget_world(const std::string& world, std::int64_t now_ms) {
     const std::scoped_lock lock(mutex_);
-    // 不收 now：会话只按已知状态判（没被看出过期的照样算活），宁可多拒一次。
+    // 判活与 may_close_world 一致（裁定 R60）；handle_live 经 session_live，顺带把已过期的会话标死。
     const bool in_use = std::ranges::any_of(handles_, [&](const auto& entry) {
         const Handle& handle = entry.second;
-        if (handle.info.world != world) { return false; }
-        if (handle.in_flight > 0) { return true; }
-        if (handle.state != HandleState::Open) { return false; }
-        const auto session = sessions_.find(handle.info.session_id);
-        return session != sessions_.end() && !session->second.dead;
+        return handle.info.world == world && (handle.in_flight > 0 || handle_live(handle, now_ms));
     });
     if (in_use) {
         throw WorldStoreError("world_in_use", world + " still has live handles or in-flight calls");

@@ -764,8 +764,10 @@ void bind_15_world(pybind11::module_& m) {
              py::arg("world"), py::arg("session_id"), py::arg("now_ms"), GilFree())
         .def("may_close_world", &gov::SessionTable::may_close_world, py::arg("world"),
              py::arg("is_default"), py::arg("now_ms"), GilFree())
-        // 裁定 R54：删世界之后调；还有活句柄或在途调用时抛 WorldStoreError（world_in_use）。
-        .def("forget_world", &gov::SessionTable::forget_world, py::arg("world"), GilFree());
+        // 裁定 R54、R60：删世界之前、在世界锁内的关闭窗口里调；还有活句柄或在途调用时抛 WorldStoreError（world_in_use），
+        // 这时不要删世界。
+        .def("forget_world", &gov::SessionTable::forget_world, py::arg("world"), py::arg("now_ms"),
+             GilFree());
 
     // 写入准入（裁定 R51，C++ require_writable）：record 同 world_decide_open_mode（另读 name，只用于错误文本）。
     // held_by_other 传 SessionTable.world_write_held_by_other(world, session_id, now)（看板传 ""）。

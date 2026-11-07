@@ -101,21 +101,37 @@ def test_late_heartbeat_does_not_revive_an_expired_session():
 
 
 def test_forget_world():
-    """裁定 R54：有活句柄时 world_in_use；忘掉之后墓碑报 handle_closed，空闲判定回到「没有记录」。"""
+    """裁定 R54、R60：有活句柄时 world_in_use；按 now 判活，过了租约的会话不挡（不用先 expire）；忘掉之后
+    墓碑报 handle_closed，空闲判定回到「没有记录」。"""
     table = _core.SessionTable(lease_ms=LEASE, idle_close_ms=1000)
     sid = table.connect(0)
     hid = table.open_handle(sid, "w", "alice", False, 0)
     with pytest.raises(_core.WorldStoreError) as busy:
-        table.forget_world("w")
+        table.forget_world("w", LEASE - 1)
     assert _code(busy.value) == "world_in_use"
-    table.expire(LEASE)
     assert table.may_close_world("w", False, LEASE)
-    table.forget_world("w")
+    table.forget_world("w", now_ms=LEASE)
     assert not table.may_close_world("w", False, LEASE)
     with pytest.raises(_core.WorldStoreError) as gone:
         table.resolve(hid, LEASE)
     assert _code(gone.value) == "handle_closed"
-    table.forget_world("never-seen")
+    table.forget_world("never-seen", 0)
+
+
+def test_in_flight_write_keeps_the_hold():
+    """裁定 R59：会话过期但写调用还在途，写占用不放；call_exit 之后才放。"""
+    table = _core.SessionTable()
+    sid_a = table.connect(0)
+    sid_b = table.connect(20000)
+    hid = table.open_handle(sid_a, "w", "alice", False, 0)
+    table.call_enter(hid, 1000)
+    assert table.world_write_held("w", LEASE)
+    with pytest.raises(_core.WorldStoreError) as held:
+        table.open_handle(sid_b, "w", "bob", False, LEASE)
+    assert _code(held.value) == "world_held"
+    table.call_exit(hid, LEASE + 1)
+    assert not table.world_write_held("w", LEASE + 1)
+    table.open_handle(sid_b, "w", "bob", False, LEASE + 1)
 
 
 def test_argument_errors_map_to_python_types():
