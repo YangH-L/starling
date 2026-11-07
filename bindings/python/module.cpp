@@ -1,5 +1,8 @@
 #include <pybind11/pybind11.h>
 
+#include <string>
+
+#include "starling/build_info.hpp"
 #include "starling/version.hpp"
 
 #include "bindings.hpp"
@@ -7,6 +10,8 @@
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Starling Memory C++ core bindings";
     m.attr("__version__") = STARLING_VERSION_STRING;
+    // 构建时的 git 提交（40 位十六进制，拿不到时 "unknown"；spec §13.4，裁定 R88）。服务的 info().commit 从这里取。
+    m.def("build_commit", [] { return std::string(starling::build_commit()); });
 
     // Registration order is load-bearing: pybind11 requires base classes to
     // be registered before derived classes, and several segments reference

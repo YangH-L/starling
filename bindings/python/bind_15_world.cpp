@@ -423,6 +423,15 @@ void bind_15_world(pybind11::module_& m) {
         return to_py(normalized);
     }, py::arg("settings"), py::kw_only(), py::arg("record") = py::none());
 
+    // 客户端 open(settings=…) 的比较（裁定 R78）：stored 是注册表里存着的设置 dict，given 是客户端给的（可能不完整）。两边各经
+    // C++ settings_from_json 补齐默认值再比（settings_equal）；任一边非法时抛 WorldStoreError（invalid_settings 等）。
+    m.def("world_settings_equal", [](const py::dict& stored, const py::dict& given) {
+        const std::string stored_text = from_py(stored);
+        const std::string given_text = from_py(given);
+        const py::gil_scoped_release release;
+        return gov::settings_equal(stored_text, given_text);
+    }, py::arg("stored"), py::arg("given"));
+
     m.def("world_ingest_partition", &gov::ingest_partition, py::arg("is_default"),
           py::arg("tenant"), py::arg("dir_id"));
 

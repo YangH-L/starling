@@ -315,6 +315,11 @@ std::string settings_to_json(const WorldSettings& settings) {
     return root.dump();
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+bool settings_equal(const std::string& stored_json, const std::string& given_json) {
+    return settings_from_json(stored_json) == settings_from_json(given_json);
+}
+
 WorldSettings merge_settings(const WorldSettings& base, const std::string& overrides_json,
                              bool read_only) {
     const Json overrides = parse_object(overrides_json, "overrides");

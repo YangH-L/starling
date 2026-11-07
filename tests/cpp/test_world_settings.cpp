@@ -407,4 +407,29 @@ TEST(WorldSettings, IngestPartition) {
     EXPECT_EQ(ingest_partition(true, "a b~._-\xC3\xA9/", "x"), "tenant-a%20b~._-%C3%A9%2F");
 }
 
+// 裁定 R78：open(settings=…) 的比较。两边先经 settings_from_json 补齐默认值再比，所以键序、缺省的键、显式给出的默认值
+// 都不影响结果；比的是存着的设置（调用方传注册表里的 settings_json），不是生效的。
+TEST(WorldSettings, SettingsEqualComparesAfterFillingDefaults) {
+    WorldSettings stored;
+    stored.extraction = make_endpoint("x");
+    stored.gist_thresholds = {{"min_holders", 3.0}};
+    const std::string stored_json = settings_to_json(stored);
+    EXPECT_TRUE(settings_equal(stored_json, stored_json));
+    EXPECT_TRUE(settings_equal("{}", "{}"));
+    EXPECT_TRUE(settings_equal("{}", R"({"vector_backend": "sqlite", "background": {"ingest": true}})"));
+    EXPECT_TRUE(settings_equal(R"({"source_lane": {"dim": 1024, "enabled": true}})",
+                               R"({"source_lane": {"enabled": true, "dim": 1024}})"));
+    EXPECT_FALSE(settings_equal("{}", R"({"background": {"ingest": false}})"));
+    EXPECT_FALSE(settings_equal(stored_json, "{}"));
+    WorldSettings other = stored;
+    other.extraction->model = "model-y";
+    EXPECT_FALSE(settings_equal(stored_json, settings_to_json(other)));
+}
+
+TEST(WorldSettings, SettingsEqualRejectsInvalidGivenSettings) {
+    EXPECT_EQ(error_code([] { (void)settings_equal("{}", R"({"api_key": "k"})"); }),
+              "invalid_settings");
+    EXPECT_EQ(error_code([] { (void)settings_equal("{}", "not json"); }), "invalid_settings");
+}
+
 }  // namespace

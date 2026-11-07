@@ -70,6 +70,11 @@ WorldSettings settings_from_json(const std::string& text);
 // 序列化：可选字段（max_retries / enable_thinking / 四个 endpoint）未设置时不写出。
 std::string settings_to_json(const WorldSettings& settings);
 
+// 两份设置是否相同（裁定 R78，客户端 open(settings=…) 用）：两边各经 settings_from_json 补齐默认值后逐字段比较，所以键序、
+// 缺省的键与显式给出的默认值都不影响结果。stored_json 是注册表里存着的设置（不是按打开方式算的生效设置）。任一边非法时抛
+// settings_from_json 的错误（invalid_settings 等）。
+[[nodiscard]] bool settings_equal(const std::string& stored_json, const std::string& given_json);
+
 // overrides 是部分设置（JSON 对象，只含要覆盖的顶层键与子键）；没给的叶子从 base 复制。
 // 合并本身删不掉键，所以要「解绑一个角色」「清空阈值」时 overrides 给 null（规则同 settings_from_json）：
 // {"extraction": null} 删掉 base 里的 extraction，{"gist_thresholds": null} 把阈值重置为 {}。

@@ -482,12 +482,15 @@ class MemoryCore:
         return _core.memory_pending_events(self.conn, self.tenant)
 
     def remember_event(self, key: str, text: str, *, interlocutor=None,
-                       epoch: str = "2026-01-01T00:00:00Z") -> dict:
+                       epoch: str = "2026-01-01T00:00:00Z", holder: str | None = None) -> dict:
         """按调用方给的稳定 key 记一次写入,崩溃安全、可重放。三段状态机在 C++
         `memoryops::remember_event`,这里只做 fail-fast 与绑定转发。
 
         `epoch` 是时钟原点:engram 的 created_at 是 epoch + 事件行 seq 秒。时刻必须
-        由 seq 推出(seq 在第 1 段才分配,调用方事先拿不到),所以这里不收 `now`。"""
+        由 seq 推出(seq 在第 1 段才分配,调用方事先拿不到),所以这里不收 `now`。
+
+        holder:事件与语句记在谁名下,缺省是本门面的 agent(裁定 R76:服务端按客户端句柄的
+        holder 传进来;Memory 门面不传,行为不变)。"""
         if self.llm is None:   # 与 remember 一致:第 1 段会写 pending 行,故在写前查
             raise LLMNotConfigured(
                 "remember_event requires an llm adapter "
@@ -497,17 +500,17 @@ class MemoryCore:
             self._extraction.belief_prompt,
             self._extraction.episodic_prompt,
             self._extraction.general_fact_prompt,
-            tenant_id=self.tenant, holder_id=self.agent,
+            tenant_id=self.tenant, holder_id=holder or self.agent,
             interlocutor=interlocutor or "", adapter_name=self.adapter_name,
             source_prefix=self.source_prefix, key=key, text=text,
             epoch_iso=epoch, policy=_build_policy(self._extraction))
 
-    def abandon_event(self, key: str) -> None:
+    def abandon_event(self, key: str, *, holder: str | None = None) -> None:
         """把 pending 事件改成终态 abandoned。状态机在 C++
         `memoryops::abandon_event`(committed 抛 EventConflict,本 holder 没有这个 key 抛
         KeyError——key 在别的 holder 名下时消息点名它们;空 holder 抛 ValueError;
-        已 abandoned 幂等),这里只是绑定转发。holder 是本门面的 agent。"""
-        _core.memory_abandon_event(self.rt.adapter, self.tenant, self.agent, key)
+        已 abandoned 幂等),这里只是绑定转发。holder 缺省是本门面的 agent(裁定 R76)。"""
+        _core.memory_abandon_event(self.rt.adapter, self.tenant, holder or self.agent, key)
 
     def forget(self, ids: list[str], *, now=None) -> dict:
         """逻辑删除(→forgotten):核心 `memoryops::forget`,这里只签名归一。

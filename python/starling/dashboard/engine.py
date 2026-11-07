@@ -1105,11 +1105,62 @@ class DashboardEngine:
                                      now=now, provider=provider)
 
     def recall(self, query: str, *, perspective="first_person", k=10, mode="semantic",
-               holder=None) -> list:
+               holder=None, strict: bool = False, include_volatile: bool = False) -> list:
+        """strict / include_volatile 原样转发给 MemoryCore.recall（裁定 R77）：看板路由用缺省 False，客户端门面按 spec §13.3
+        的缺省 True 传进来。strict=True 且查询词嵌入失败时 RecallDegradedError。"""
         with self._lock, self._read_only_rejections():
             self._require_embedding_unchanged()   # 语义召回要嵌入查询词
             return self._core.recall(query, perspective=perspective, k=k, mode=mode,
-                                     holder=holder)
+                                     holder=holder, strict=strict,
+                                     include_volatile=include_volatile)
+
+    # ── 客户端门面（第 4 期 Task 4.5，裁定 R76）：按句柄的 holder 调 MemoryCore；状态机、规范化都在 C++ ─────────────
+
+    def remember_event(self, key: str, text: str, *, holder: str, interlocutor=None,
+                       epoch: str = "2026-01-01T00:00:00Z") -> dict:
+        """按 key 写一次（C++ memoryops::remember_event 的三段状态机），事件与语句记在 holder 名下。抽取在 C++ 里、GIL 已释放，
+        但全程持引擎锁：三段共用这个引擎的写连接（与后台 tick、摄入同一把锁串行）。只读引擎 world_read_only。"""
+        self._require_writable()
+        with self._lock:
+            self._prepare_role("extraction")          # 先核对继承来的地址（endpoint_changed），可能按新设置重建
+            out = self._core.remember_event(key, text, holder=holder,
+                                            interlocutor=interlocutor, epoch=epoch)
+        self._notify_commit()
+        return out
+
+    def abandon_event(self, key: str, *, holder: str) -> None:
+        """把 holder 名下 key 的 pending 事件改成 abandoned（C++ memoryops::abandon_event）。只读引擎 world_read_only。"""
+        self._require_writable()
+        with self._lock:
+            self._core.abandon_event(key, holder=holder)
+        self._notify_commit()
+
+    def content_ids(self, statement_ids) -> dict:
+        with self._lock, self._read_only_rejections():
+            return self._core.content_ids(list(statement_ids))
+
+    def digest(self) -> str:
+        with self._lock, self._read_only_rejections():
+            return self._core.digest()
+
+    def pending_events(self) -> list[dict]:
+        with self._lock, self._read_only_rejections():
+            return self._core.pending_events()
+
+    def next_seq(self) -> int:
+        with self._lock, self._read_only_rejections():
+            return self._core.next_seq()
+
+    def embed_pending(self, now: str) -> dict:
+        """只跑嵌入阶段直到积压清空（C++ memoryops::embed_pending）。先核对嵌入端点（endpoint_changed 照抛：调用方显式要嵌入，
+        不像 tick 那样只跳过）。写向量，只读引擎 world_read_only。"""
+        self._require_writable()
+        with self._lock:
+            self._require_embedding_unchanged()
+            out = self._core.embed_pending(now)
+        if out.get("embedded"):
+            self._notify_commit()
+        return out
 
     def tick(self, now: str) -> dict:
         """后台维护一轮。嵌入阶段走 embedding 端点，先核对继承来的地址（占位嵌入不核对）。核对不过
