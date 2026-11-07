@@ -4145,6 +4145,29 @@ std::string library_digest(const std::string& db_path, const std::string& tenant
     return memoryops::digest(conn, tenant);
 }
 
+// 关着的世界的摘要（Task 4.5，list_worlds(with_digest=True)）：只读打开，与 memoryops::digest 相同，库文件字节不变；
+// 库文件不存在、或缺 0038 的表时为空串（同 digest_or_empty，裁定 R10）。
+TEST(WorldDigest, MatchesLibraryDigestAndLeavesTheFile) {
+    const TempDir tmp;
+    auto reg = registry_with_world(tmp, "sim-1");
+    const std::string db_path = reg.get("sim-1").db_path;
+    seed_world_db(db_path, "sim-1", 3);
+    const auto read_bytes = [&db_path] {
+        std::ifstream in(db_path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+    const std::string before = read_bytes();
+    const std::string want = library_digest(db_path, "sim-1");
+    EXPECT_EQ(world_digest(db_path, "sim-1", persistence::ReadOnlyFreeze::Shared), want);
+    EXPECT_EQ(world_digest(db_path, "sim-1", persistence::ReadOnlyFreeze::Frozen), want);
+    EXPECT_EQ(read_bytes(), before);
+    EXPECT_EQ(world_digest((tmp.path() / "missing.db").string(), "sim-1",
+                           persistence::ReadOnlyFreeze::Shared), "");
+    const std::string bare = (tmp.path() / "bare.db").string();
+    exec_sql_unmigrated(bare, "CREATE TABLE engrams(id TEXT, tenant_id TEXT, created_at TEXT);");
+    EXPECT_EQ(world_digest(bare, "sim-1", persistence::ReadOnlyFreeze::Shared), "");
+}
+
 SnapshotOptions auto_interval() {
     SnapshotOptions opts;
     opts.kind = "auto";

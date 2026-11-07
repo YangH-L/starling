@@ -40,6 +40,8 @@ constexpr Expected kSpecCodes[] = {
     {"world_not_initialized", false, 409}, {"world_not_seed", false, 409},
     {"confirm_mismatch", false, 400}, {"rollback_mode_unsupported", false, 400},
     {"rollback_reopen_failed", false, 500}, {"world_open_failed", false, 500},
+    // Task 4.5：客户端路由的请求错误（未知方法、参数形状不对）与抽取角色没绑定。
+    {"invalid_request", false, 400}, {"llm_not_configured", false, 409},
 };
 
 // src/governance/*.cpp 里以字面量给出的全部码：WorldStoreError("<code>" 与 WorldStoreError::after_replace("<code>"，

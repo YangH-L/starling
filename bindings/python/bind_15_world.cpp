@@ -455,6 +455,20 @@ void bind_15_world(pybind11::module_& m) {
 
     // 租户不变式（spec §2.1）：只读扫一遍库，有别的租户的行抛 world_tenant_mismatch。
     // 2.6GB 的生产库约 90ms，释放 GIL。库文件不存在时直接通过。
+    // 关着的世界的 library 摘要（Task 4.5，list_worlds(with_digest=True)）：只读打开，不写文件；frozen 传
+    // world_read_only_frozen(record, held)（裁定 R36、R41）。库不在或缺 0038 的表时 None。读不出时 snapshot_failed。
+    m.def("world_digest",
+          [](const std::string& db_path, const std::string& tenant, bool frozen) {
+              std::string digest;
+              {
+                  const py::gil_scoped_release release;
+                  digest = gov::world_digest(db_path, tenant,
+                                             frozen ? starling::persistence::ReadOnlyFreeze::Frozen
+                                                    : starling::persistence::ReadOnlyFreeze::Shared);
+              }
+              return text_or_none(digest);
+          }, py::arg("db_path"), py::arg("tenant"), py::kw_only(), py::arg("frozen") = false);
+
     m.def("world_verify_tenant",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
           [](const std::string& db_path, const std::string& tenant, bool frozen) {
@@ -747,6 +761,8 @@ void bind_15_world(pybind11::module_& m) {
              }),
              py::kw_only(), py::arg("lease_ms") = session_defaults.lease_ms,
              py::arg("idle_close_ms") = session_defaults.idle_close_ms)
+        .def_property_readonly("lease_ms", &gov::SessionTable::lease_ms)
+        .def_property_readonly("heartbeat_ms", &gov::SessionTable::heartbeat_ms)
         .def("connect", &gov::SessionTable::connect, py::arg("now_ms"), GilFree())
         .def("heartbeat", &gov::SessionTable::heartbeat, py::arg("session_id"), py::arg("now_ms"),
              GilFree())

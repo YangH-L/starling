@@ -57,6 +57,9 @@ const std::vector<ErrorInfo>& error_catalog() {
         entry("rollback_mode_unsupported", false, 400),
         entry("rollback_reopen_failed", false, 500),
         entry("world_open_failed", false, 500),
+        // Task 4.5：客户端路由的请求错误（未知方法、未知管理操作、参数形状不对），与抽取角色没绑定（看板旧码，状态沿用）。
+        entry("invalid_request", false, 400),
+        entry("llm_not_configured", false, 409),
     };
     return kCatalog;
 }

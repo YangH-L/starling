@@ -471,6 +471,10 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
     app.include_router(build_config_router(require_token))
     # /api/worlds（世界管理：列表、详情、建删、设置、关闭、快照、恢复），经引擎池；只挂在 /api 下。
     app.include_router(build_worlds_router(require_token))
+    # /api/v1/client（客户端会话、句柄、门面方法、管理操作，spec §13.1、§13.3；Task 4.5）。
+    from starling.dashboard.routes.client import build_client_router, install_client_error_handlers
+    install_client_error_handlers(app)
+    app.include_router(build_client_router(require_token))
 
     _build = Path(__file__).resolve().parents[3] / "dashboard" / "web" / "build"
     if _build.is_dir():

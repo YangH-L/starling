@@ -873,6 +873,20 @@ WorldStats world_stats(const std::string& db_path, const std::string& tenant,
 }
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+std::string world_digest(const std::string& db_path, const std::string& tenant,
+                         persistence::ReadOnlyFreeze freeze) {
+    std::error_code err;
+    if (!fs::exists(db_path, err)) { return {}; }
+    try {
+        return digest_of_file(db_path, tenant, freeze);
+    } catch (const WorldStoreError&) {
+        throw;
+    } catch (const std::exception& ex) {
+        throw WorldStoreError("snapshot_failed", db_path + ": " + ex.what());
+    }
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 void verify_world_tenant(const std::string& db_path, const std::string& tenant) {
     verify_world_tenant(db_path, tenant, persistence::ReadOnlyFreeze::Shared);
 }

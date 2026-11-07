@@ -538,7 +538,7 @@ class WorldPool:
     # ───────────────────────── 客户端句柄（给 4.5 的路由，裁定 R61） ─────────────────────────
 
     def admit_client_handle(self, world: str, session_id: str, holder: str, read_only: bool,
-                            now_ms: int) -> str:
+                            now_ms: int, *, settings: dict | None = None) -> str:
         """客户端的每一次开句柄（只读、可写都一样）都经这里，在 world 的世界锁内执行（裁定 R61），返回 handle_id。
 
         世界锁以 50 毫秒为一段轮询着取（同首次建引擎）：世界处在关闭窗口里（关闭、恢复、删除），或等锁时进了关闭窗口，或池已
@@ -555,7 +555,11 @@ class WorldPool:
              建引擎失败：撤销这个句柄（不留没有引擎的写占用），原样抛出。旧 Runtime 回收不了：world_busy，不登记。
         只读打开：不切换引擎。池里没有引擎时按看板的方式打开（此刻没人占着写入就是 decide_open_mode(rec, false)），然后登记。
 
-        会话未知或已过期：SessionTable 抛 session_expired。now_ms 必须来自池的时钟（now_ms()，裁定 R60）。"""
+        会话未知或已过期：SessionTable 抛 session_expired。now_ms 必须来自池的时钟（now_ms()，裁定 R60）。
+
+        settings（客户端 open(settings=…)，裁定 R78）：给了就在世界锁内、登记之前与该世界存着的设置比较（C++ settings_equal，
+        两边补齐默认值），不同回 world_settings_mismatch，什么都不登记。改设置（update_settings）也持世界锁，比较之后到登记之前
+        设置不会变。"""
         sessions = self._sessions
         if sessions is None:
             raise WorldSwitchError("worlds_unavailable", "the pool has no client session table")
@@ -567,6 +571,10 @@ class WorldPool:
                 engine = self._engines.get(world)
             if closing:
                 raise WorldSwitchError("world_busy", world)
+            if settings is not None:
+                rec = self._record(world)             # 持世界锁重读：比的是此刻存着的设置
+                if not _core.world_settings_equal(rec["settings"], settings):
+                    raise WorldSwitchError("world_settings_mismatch", world)
             has_writer = engine is not None and not getattr(engine, "read_only", False)
             has_engine = engine is not None
             engine = None
@@ -1294,10 +1302,11 @@ class WorldPool:
 
     def create_world(self, name: str, label: str, *, labels: dict | None = None,
                      overrides: dict | None = None,
-                     auto_snapshot: dict | None = None) -> dict:
+                     auto_snapshot: dict | None = None, seed: bool = False) -> dict:
         """建世界（C++ create_world：设置是默认世界当前设置的值拷贝，overrides 覆盖）。auto_snapshot
         {"on_session", "interval_hours"} 给出时放进 overrides 的 background.auto_snapshot（C++ 校验，
-        invalid_auto_snapshot）。不打开引擎。返回注册表记录。"""
+        invalid_auto_snapshot）。seed=True 建成种子（客户端 create_world(seed=True)，标记的规范化在 C++）。不打开引擎。
+        返回注册表记录。"""
         reg = self._require_registry()
         merged = dict(overrides or {})
         if auto_snapshot is not None:
@@ -1309,7 +1318,8 @@ class WorldPool:
         # endpoint、写在同一次持注册表锁内完成（spec §8.3）；地址不同就 endpoint_changed、什么都不写。同步默认
         # 世界设置取同一把锁，插不进中间。没给设置时照旧只继承默认世界（它由同步与 config 保持一致）。
         return reg.create(name, label, dict(labels or {}), merged or None, self._clock(),
-                          provider_endpoints=self._provider_endpoints() if merged else None)
+                          provider_endpoints=self._provider_endpoints() if merged else None,
+                          seed=bool(seed))
 
     def fork_world(self, source: str, new_name: str, *, snapshot_id: str | None = None,
                    labels: dict | None = None, retention_group: str | None = None,
@@ -1392,15 +1402,32 @@ class WorldPool:
             self._refuse_leaked(rec["db_path"])
             reg.remove(world)
 
-    def take_snapshot(self, world: str, note: str) -> dict:
-        """手动快照（C++ take_snapshot，作用于整个世界；vector_backend 取该世界的设置，是否支持由 C++ 判）。
+    def take_snapshot(self, world: str, note: str, *, kind: str = "manual") -> dict:
+        """手动快照（C++ take_snapshot，作用于整个世界；vector_backend 取该世界的设置，是否支持由 C++ 判）。kind 是 "manual"
+        （看板）或 "held"（客户端 snapshot，spec §7.1：不参与保留份数，只能显式删）；reason 与 kind 同名，配对由 C++ 校验。
         持世界锁：C++ 要求按世界串行化快照、恢复、修剪。"""
         reg = self._require_registry()
         backend = self._vector_backend(world)
         with self._world_lock(world):
-            out = _core.world_take_snapshot(reg, world, "manual", "manual", note,
+            out = _core.world_take_snapshot(reg, world, kind, kind, note,
                                             vector_backend=backend)
         return out["snapshot"]
+
+    def world_digest(self, world: str) -> str | None:
+        """世界的 library 摘要，给客户端 list_worlds(with_digest=True)（spec §13.3）。持一份不建引擎、不算活动的租约（列表的
+        现读，R80；恢复与关闭等它归还）：开着的世界取引擎的 digest()；关着的世界由 C++ world_digest 只读打开库算，冻结按此刻的
+        记录与写占用由 C++ 判（ctx.frozen，裁定 R36、R41），不写任何文件。库缺 0038 的表时 None。正在关闭、恢复时 world_busy。
+
+        关着的世界不会在算的途中被客户端接手写入：第一个可写句柄的 admit 在关闭窗口里排干全部租约（含这一份），所以要么在这里
+        算完之后才建可写引擎，要么已经建好（这里就走引擎）。"""
+        with self.lease(world, build=False, touch=False) as engine:
+            if engine is not None:
+                try:
+                    return engine.digest()
+                finally:
+                    engine = None
+            ctx = self.context(world)
+            return _core.world_digest(ctx.db_path, ctx.tenant, frozen=ctx.frozen)
 
     def delete_snapshot(self, world: str, snapshot_id: str) -> None:
         reg = self._require_registry()

@@ -69,6 +69,13 @@ public:
     // lease_ms <= 0 或 idle_close_ms < 0 抛 std::invalid_argument。
     explicit SessionTable(SessionConfig cfg);
 
+    // 会话租约（connect 的应答带给客户端）。
+    [[nodiscard]] std::int64_t lease_ms() const noexcept { return cfg_.lease_ms; }
+    // 客户端该隔多久发一次心跳：租约的三分之一，至少 1 毫秒（spec §11：30 秒租约、10 秒心跳）。
+    [[nodiscard]] std::int64_t heartbeat_ms() const noexcept {
+        return cfg_.lease_ms / 3 > 0 ? cfg_.lease_ms / 3 : 1;
+    }
+
     // 返回新的 session_id。
     std::string connect(std::int64_t now_ms);
     // 续约。未知、已断开或已过期的会话抛 session_expired。

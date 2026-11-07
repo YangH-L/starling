@@ -51,6 +51,18 @@ bool is_lower_hex(const std::string& text) {
     });
 }
 
+// connect 的应答带租约与心跳间隔（Task 4.5）：心跳间隔是租约的三分之一（spec §11：30 秒租约、10 秒心跳）。
+TEST(SessionTable, LeaseAndHeartbeatIntervals) {
+    const SessionTable defaults(SessionConfig{});
+    EXPECT_EQ(defaults.lease_ms(), kLease);
+    EXPECT_EQ(defaults.heartbeat_ms(), 10000);
+    const SessionTable custom(SessionConfig{.lease_ms = 900, .idle_close_ms = 0});
+    EXPECT_EQ(custom.lease_ms(), 900);
+    EXPECT_EQ(custom.heartbeat_ms(), 300);
+    const SessionTable tiny(SessionConfig{.lease_ms = 2, .idle_close_ms = 0});
+    EXPECT_EQ(tiny.heartbeat_ms(), 1);              // 至少 1 毫秒
+}
+
 // 30 s 不心跳就过期（边界：距上次心跳 >= lease_ms 即过期）；过期后 heartbeat 抛 session_expired。
 TEST(SessionTable, ConnectHeartbeatExpire) {
     SessionTable table(SessionConfig{});
