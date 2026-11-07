@@ -128,12 +128,15 @@ class RemoteMemory:
                 body["timeout_s"] = server_wait
             # The HTTP request may take as long as the service-side wait, plus the usual request budget.
             http_timeout = None if server_wait is None else server_wait + self._client.timeout_s
+            busy = False
             try:
                 self._client._post("/close", body, timeout_s=http_timeout)
             except errors.StarlingClientError as exc:
                 if exc.code != "world_busy":
                     raise
-                raise TimeoutError("call(s) still in flight on the service; the handle stays open") from None
+                busy = True
+            if busy:   # 块外再抛：TimeoutError 不挂服务端错误的链（F5）
+                raise TimeoutError("call(s) still in flight on the service; the handle stays open")
             with self._cond:
                 self._closed = True
         finally:

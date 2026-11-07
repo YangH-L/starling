@@ -72,14 +72,28 @@ URL_SECRET = "10.9.8.7:4242/secret-path"
 TOKEN_SECRET = "secret-tok"
 
 
+def _chain(exc):
+    """exc 与它 __cause__ / __context__ 两条链上的全部异常（去重，防环）。"""
+    seen, todo = [], [exc]
+    while todo:
+        item = todo.pop()
+        if item is None or any(item is other for other in seen):
+            continue
+        seen.append(item)
+        todo += [item.__cause__, item.__context__]
+    return seen
+
+
 def _assert_clean(exc):
+    """需求 5.5（修复轮 1 F5）：url 与 token 不出现在异常本身，也不出现在 __cause__ / __context__ 链上的任何一个异常里
+    （`from None` 只是不打印 __context__，调用方仍能读到它）。"""
     import traceback
 
-    assert exc.__cause__ is None
-    assert exc.__suppress_context__ is True
-    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    for s in (str(exc), repr(exc), text):
-        assert URL_SECRET not in s and TOKEN_SECRET not in s
+    assert exc.__cause__ is None and exc.__context__ is None
+    for item in _chain(exc):
+        text = "".join(traceback.format_exception(type(item), item, item.__traceback__))
+        for s in (str(item), repr(item), text, repr(item.args)):
+            assert URL_SECRET not in s and TOKEN_SECRET not in s, type(item).__name__
 
 
 @pytest.mark.parametrize(

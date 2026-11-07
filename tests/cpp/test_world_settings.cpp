@@ -426,6 +426,35 @@ TEST(WorldSettings, SettingsEqualComparesAfterFillingDefaults) {
     EXPECT_FALSE(settings_equal(stored_json, settings_to_json(other)));
 }
 
+// 修复轮 1 F6：引用 provider 的 endpoint（provider_name 非空）的 base_url 是服务端从 provider 表补进来的，客户端看不到
+// （info 去掉了地址），比较时不看它；model 等其他字段照比。客户端显式给的 endpoint（provider_name 为空）的 base_url 是客户端
+// 自己写的，照比。
+TEST(WorldSettings, SettingsEqualIgnoresTheInheritedBaseUrlOnly) {
+    WorldSettings stored;
+    stored.extraction = make_endpoint("x");           // provider_name "prov-x"、base_url "http://x"
+    const std::string stored_json = settings_to_json(stored);
+    WorldSettings no_url = stored;
+    no_url.extraction->base_url.clear();
+    EXPECT_TRUE(settings_equal(stored_json, settings_to_json(no_url)));
+    WorldSettings other_url = stored;
+    other_url.extraction->base_url = "http://elsewhere";
+    EXPECT_TRUE(settings_equal(stored_json, settings_to_json(other_url)));
+    WorldSettings other_model = no_url;
+    other_model.extraction->model = "model-y";
+    EXPECT_FALSE(settings_equal(stored_json, settings_to_json(other_model)));
+    WorldSettings other_provider = no_url;
+    other_provider.extraction->provider_name = "prov-y";
+    EXPECT_FALSE(settings_equal(stored_json, settings_to_json(other_provider)));
+
+    WorldSettings explicit_ep;
+    explicit_ep.embedding = make_endpoint("e");
+    explicit_ep.embedding->provider_name.clear();     // 客户端显式给的端点
+    const std::string explicit_json = settings_to_json(explicit_ep);
+    WorldSettings explicit_other = explicit_ep;
+    explicit_other.embedding->base_url = "http://elsewhere";
+    EXPECT_FALSE(settings_equal(explicit_json, settings_to_json(explicit_other)));
+}
+
 TEST(WorldSettings, SettingsEqualRejectsInvalidGivenSettings) {
     EXPECT_EQ(error_code([] { (void)settings_equal("{}", R"({"api_key": "k"})"); }),
               "invalid_settings");

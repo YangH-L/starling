@@ -488,3 +488,27 @@ def test_facade_call_lease_touches_the_world(svc, monkeypatch):
     monkeypatch.setattr(pool, "_touch", lambda world: (touched.append(world), real(world)))
     _ok(_call(client, handle, "next_seq"))
     assert touched == ["w1"]
+
+
+# ───────────────────────── 修复轮 1 F6：继承了端点的世界，open(settings=…) 用得上 ─────────────────────────
+
+def test_open_with_settings_seen_by_the_client_matches_an_inherited_endpoint(svc):
+    """F6：世界继承了 provider p1 的抽取端点，存着的设置里有 base_url（服务端从 provider 表补进来），info 不给它。客户端用它看得到的
+    设置（info.default_settings 加上建世界时的 overrides）去 open，视为相同；只改 model 是 mismatch；只改 base_url 视为相同。"""
+    client, _clock = svc
+    overrides = {"background": {"ingest": False}}
+    _ok(client.post(f"{API}/admin/create_world", json={"name": "r1", "settings": overrides}))
+    info = _ok(client.post(f"{API}/info", json={}))
+    assert "base_url" not in info["default_settings"]["extraction"]
+    stored = client.app.state.pool.record("r1")["settings"]
+    assert stored["extraction"]["base_url"] == SECRET_URL            # 存着的确实带地址
+    seen = json.loads(json.dumps(info["default_settings"]))
+    seen["background"]["ingest"] = False
+    sid = _connect(client)
+    _ok(_open(client, sid, world="r1", read_only=True, settings=seen))
+    other_url = json.loads(json.dumps(seen))
+    other_url["extraction"]["base_url"] = "http://elsewhere/v1"
+    _ok(_open(client, sid, world="r1", read_only=True, settings=other_url))
+    other_model = json.loads(json.dumps(seen))
+    other_model["extraction"]["model"] = "m2"
+    _err(_open(client, sid, world="r1", read_only=True, settings=other_model), "world_settings_mismatch")

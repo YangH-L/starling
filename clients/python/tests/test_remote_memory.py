@@ -97,10 +97,18 @@ def svc():
 
 
 def _assert_clean(exc):
-    assert exc.__cause__ is None
-    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    for item in (str(exc), repr(exc), text):
-        assert URL_SECRET not in item and TOKEN_SECRET not in item
+    """url 与 token 不出现在异常及其 __cause__ / __context__ 两条链上（需求 5.5，修复轮 1 F5）。"""
+    assert exc.__cause__ is None and exc.__context__ is None
+    seen, todo = [], [exc]
+    while todo:
+        item = todo.pop()
+        if item is None or any(item is other for other in seen):
+            continue
+        seen.append(item)
+        todo += [item.__cause__, item.__context__]
+        text = "".join(traceback.format_exception(type(item), item, item.__traceback__))
+        for shown in (str(item), repr(item), text, repr(item.args)):
+            assert URL_SECRET not in shown and TOKEN_SECRET not in shown
 
 
 # ───────────────────────── signatures (spec §13.3, copied verbatim) ─────────────────────────

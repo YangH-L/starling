@@ -73,6 +73,8 @@ std::string settings_to_json(const WorldSettings& settings);
 // 两份设置是否相同（裁定 R78，客户端 open(settings=…) 用）：两边各经 settings_from_json 补齐默认值后逐字段比较，所以键序、
 // 缺省的键与显式给出的默认值都不影响结果。stored_json 是注册表里存着的设置（不是按打开方式算的生效设置）。任一边非法时抛
 // settings_from_json 的错误（invalid_settings 等）。
+// 例外（修复轮 1 F6）：引用 provider 的 endpoint（provider_name 非空）不比 base_url。那是服务端从 provider 表补进来的地址，
+// info() 不给客户端，客户端没法给出同一个值；provider_name、model 等其余字段照比。provider_name 为空的 endpoint 照比地址。
 [[nodiscard]] bool settings_equal(const std::string& stored_json, const std::string& given_json);
 
 // overrides 是部分设置（JSON 对象，只含要覆盖的顶层键与子键）；没给的叶子从 base 复制。

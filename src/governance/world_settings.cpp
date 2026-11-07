@@ -315,9 +315,25 @@ std::string settings_to_json(const WorldSettings& settings) {
     return root.dump();
 }
 
+namespace {
+
+// 修复轮 1 F6：引用 provider 的 endpoint 的 base_url 是从 provider 表补进来的、客户端看不到的那一项，比较前清掉。
+// 客户端显式给的 endpoint（provider_name 为空）的地址是客户端自己写的，留着照比。
+WorldSettings without_inherited_addresses(WorldSettings settings) {
+    for (auto* endpoint : {&settings.extraction, &settings.embedding, &settings.chat, &settings.consolidation}) {
+        if (endpoint->has_value() && !(*endpoint)->provider_name.empty()) {
+            (*endpoint)->base_url.clear();
+        }
+    }
+    return settings;
+}
+
+}  // namespace
+
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 bool settings_equal(const std::string& stored_json, const std::string& given_json) {
-    return settings_from_json(stored_json) == settings_from_json(given_json);
+    return without_inherited_addresses(settings_from_json(stored_json)) ==
+           without_inherited_addresses(settings_from_json(given_json));
 }
 
 WorldSettings merge_settings(const WorldSettings& base, const std::string& overrides_json,
