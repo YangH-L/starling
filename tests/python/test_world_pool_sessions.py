@@ -814,3 +814,42 @@ def test_idle_close_interval_is_a_service_option(tmp_path):
     args = serve._parser().parse_args(["--data-dir", str(tmp_path), "--port", "0",
                                        "--idle-close-interval", "5"])
     assert args.idle_close_interval == 5.0
+
+
+# ═════════════════════════ 修复轮：池自己的租约不算活动（R80） ═════════════════════════
+
+def test_pool_internal_leases_do_not_keep_an_idle_world_open(tmp_path, monkeypatch):
+    """统计刷新（短间隔跑着）、列表现读计数（live_stats、schema_behind(open_only)）、world_changed 去抖都不 touch：空闲的非默认
+    世界到了时限照样被关。看板请求取的租约（缺省 touch）让它继续开着。"""
+    pool, sessions, clock = _idle_pool(tmp_path)
+    try:
+        pool.create_world("w2", "")
+        for name in ("w1", "w2"):
+            with pool.lease(name):
+                pass
+        rounds = {"n": 0}
+        real_refresh = pool.refresh_stats
+
+        def _counting_refresh():
+            real_refresh()
+            rounds["n"] += 1
+        monkeypatch.setattr(pool, "refresh_stats", _counting_refresh)
+        pool.on_world_changed = lambda _world, _stats: None
+        pool.start_background(stats_interval_s=0.02, scheduler_first_delay_s=3600.0,
+                              idle_close_interval_s=0)
+        clock.now += 1_001                                   # 两个世界都过了空闲时限
+        seen = rounds["n"]
+        deadline = time.monotonic() + 5
+        while rounds["n"] < seen + 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert rounds["n"] >= seen + 3, "the stats thread must have run while the worlds were idle"
+        for name in ("w1", "w2"):
+            assert pool.live_stats(name) is not None
+            assert pool.schema_behind(name, open_only=True) in (True, False)
+            pool._emit_change(name)
+        with pool.lease("w2", build=False):                  # 看板请求：算活动
+            pass
+        assert pool.idle_close_round() == ["w1"]
+        assert "w2" in pool.open_worlds()
+    finally:
+        pool.close_all()

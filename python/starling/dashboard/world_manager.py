@@ -429,8 +429,12 @@ class WorldPool:
 
     # ───────────────────────── 租约 ─────────────────────────
 
-    def lease(self, world: str, *, build: bool = True) -> EngineLease:
+    def lease(self, world: str, *, build: bool = True, touch: bool = True) -> EngineLease:
         """发 world 的一份租约（见模块文档）。
+
+        touch（裁定 R50、R80）：这份租约算不算世界的一次活动（SessionTable.touch_world，空闲关闭按它计时）。看板请求与客户端
+        请求取的租约用缺省 True；池自己的租约（统计刷新、列表现读计数、world_changed 去抖、关停排水、空闲轮）一律传 False，
+        否则每 30 秒一轮的统计刷新会让每个开着的世界永远到不了空闲时限。
 
         world 不存在 → WorldSwitchError("world_not_found")；正在关闭、恢复、删除，或池已关停 →
         WorldSwitchError("world_busy")。build=False 且世界没开着时 lease.engine 为 None（只读检视
@@ -453,7 +457,8 @@ class WorldPool:
             elif engine is not None and lost:
                 self._retry_lost_workers(world)
             lease.engine = engine
-            self._touch(world)                        # 裁定 R50：看板每次按世界取租约都算一次活动
+            if touch:
+                self._touch(world)                    # 裁定 R50、R80：只有看板、客户端请求的租约算活动
         except BaseException:
             engine = None
             lease.release()
@@ -799,7 +804,7 @@ class WorldPool:
         """开着的世界：{"holders", "statements", "last_write_at"}（C++ world_stats，持一份不建引擎的
         租约读库）；关着的返回 None（用注册表的缓存列）。正在关闭时同样 None。"""
         try:
-            lease = self.lease(world, build=False)
+            lease = self.lease(world, build=False, touch=False)   # 列表与去抖的现读：不算活动（R80）
         except WorldSwitchError as exc:
             if exc.code == "world_busy":
                 return None
@@ -818,7 +823,8 @@ class WorldPool:
         取引擎打开时记下的值，不碰它的连接。关着的世界：open_only 时返回 None（列表不打开库，裁定 R17）；否则持
         一份不建引擎的租约，短暂只读打开库（不迁移、不改日志模式）读一次。库不在或读不出时 None。"""
         try:
-            lease = self.lease(world, build=False)
+            # 列表行（open_only）对每个开着的世界都问一次：不算活动（R80）；详情是看板在看这个世界，算。
+            lease = self.lease(world, build=False, touch=not open_only)
         except WorldSwitchError as exc:
             if exc.code == "world_busy":
                 return None
@@ -924,7 +930,7 @@ class WorldPool:
         （关闭自己会写）。"""
         for world in self.open_worlds():
             try:
-                lease = self.lease(world, build=False)
+                lease = self.lease(world, build=False, touch=False)   # 池自己的租约：不算活动（R80）
             except WorldSwitchError:
                 continue
             with lease as engine:
@@ -1103,7 +1109,7 @@ class WorldPool:
         begin_drain 不拿引擎锁，在途的长请求挡不住它。关停路径：一个世界出错只记日志，不挡别的世界。"""
         for world in self.open_worlds():
             try:
-                with self.lease(world, build=False) as engine:
+                with self.lease(world, build=False, touch=False) as engine:   # 关停路径：不算活动
                     if engine is not None:
                         engine.begin_drain()
                     engine = None
