@@ -6,6 +6,9 @@
 
 服务子进程按模块共用（test_7 自己起、自己的数据目录）；世界名带测试编号，互不重复。每个测试开始与结束时把假端点的
 开关恢复缺省。所有等待都有上限，轮询状态而不是 sleep；子进程在夹具的 finally 里清掉。
+
+本模块不设 NO_PROXY（裁定 R97）：starling_client 连回环地址时自己不走代理（Transport 的 trust_env=False），这台机器上配了
+系统代理时，验收照样直连，所以验收也覆盖到这处。
 """
 from __future__ import annotations
 
@@ -39,24 +42,6 @@ _EXTRACT_TIMEOUT_MS = 10_000
 
 
 # ───────────────────────── 夹具 ─────────────────────────
-
-@pytest.fixture(scope="module", autouse=True)
-def _loopback_without_proxy():
-    """本模块的 HTTP 一律直连回环地址。httpx 缺省 trust_env=True，会用系统代理（macOS 的系统代理设置经
-    urllib.getproxies 读到），连 127.0.0.1 也绕一道代理：多一段延迟（GIL 用例按 200 ms 计时），服务停了也回代理的 502。
-    环境里有 NO_PROXY 时 getproxies 只看环境，于是不再用系统代理。模块结束时还原。"""
-    saved = {name: os.environ.get(name) for name in ("NO_PROXY", "no_proxy")}
-    for name, value in saved.items():
-        os.environ[name] = ",".join(filter(None, [value, "127.0.0.1", "localhost"]))
-    try:
-        yield
-    finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
 
 @pytest.fixture(scope="module")
 def fake_openai(tmp_path_factory):
@@ -507,7 +492,8 @@ def test_logs_and_errors_have_no_address_or_key(service, client, fake_openai):
     fake_openai.configure(fail_keys=["log#0"])
 
     # 直接发 HTTP，拿原始响应体。
-    with httpx.Client(base_url=service.url, timeout=30.0,
+    # 直接发 HTTP 的这两个 httpx.Client 是测试自己的工具，不是被测的客户端：trust_env=False，不经这台机器的系统代理。
+    with httpx.Client(base_url=service.url, timeout=30.0, trust_env=False,
                       headers={"Authorization": f"Bearer {service.token}"}) as raw:
         session = raw.post(f"{API}/connect", json={"protocol": 1}).json()["session_id"]
         bodies.append(raw.post(f"{API}/open", json={"session_id": session, "world": "tlog-missing",
@@ -529,7 +515,7 @@ def test_logs_and_errors_have_no_address_or_key(service, client, fake_openai):
         bodies.append(raw.post(f"{API}/call", json={"handle_id": handle, "method": "next_seq",
                                                     "args": {}}))
         raw.post(f"{API}/disconnect", json={"session_id": session})
-    with httpx.Client(base_url=service.url, timeout=30.0) as anon:
+    with httpx.Client(base_url=service.url, timeout=30.0, trust_env=False) as anon:
         bodies.append(anon.post(f"{API}/connect", json={"protocol": 1}))
     codes = {resp.json().get("code") for resp in bodies if resp.status_code >= 400}
     assert {"world_not_found", "recall_degraded", "handle_closed", "invalid_request"} <= codes, codes

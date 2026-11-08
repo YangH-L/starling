@@ -90,7 +90,8 @@ class ServiceProc:
         return f"http://127.0.0.1:{self.port}"
 
     def client(self) -> httpx.Client:
-        return httpx.Client(base_url=self.url, timeout=30.0,
+        # 测试自己的直连工具：不经这台机器的系统代理（被测的 starling_client 自己对回环地址不走代理，裁定 R97）。
+        return httpx.Client(base_url=self.url, timeout=30.0, trust_env=False,
                             headers={"Authorization": f"Bearer {self.token}"})
 
     def stderr(self) -> str:

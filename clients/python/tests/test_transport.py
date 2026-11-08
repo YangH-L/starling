@@ -173,3 +173,91 @@ def test_client_has_no_starling_core_import():
         "sys.exit(1 if bad else 0)"
     )
     assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+
+
+# ───────────────────────── 最后修复波 A2（裁定 R97）：回环地址不走代理 ─────────────────────────
+
+import contextlib
+import json as _json
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def _closed_port() -> int:
+    """一个此刻没人监听的回环端口：绑上、记下端口、立刻关掉。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@contextlib.contextmanager
+def _loopback_server():
+    """真的回环 HTTP 服务（MockTransport 不经代理逻辑，测不到这处）：每个 POST 回 {"ok": true}。"""
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = _json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_port
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
+_PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
+
+@pytest.fixture
+def dead_proxy(monkeypatch):
+    """全部代理环境变量指向一个关着的端口；NO_PROXY 清掉，免得把回环地址豁免出去。"""
+    proxy = f"http://127.0.0.1:{_closed_port()}"
+    for name in _PROXY_VARS:
+        monkeypatch.setenv(name, proxy)
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    return proxy
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_loopback_host_ignores_a_dead_proxy(dead_proxy, host):
+    with _loopback_server() as port:
+        t = Transport(f"http://{host}:{port}", "tok", 5.0)
+        try:
+            assert t._client.trust_env is False
+            assert t.post("/api/x", {}) == {"ok": True}
+        finally:
+            t.close()
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:1", "http://127.1.2.3:1", "http://[::1]:1",
+                                 "http://localhost:1", "http://LOCALHOST:1"])
+def test_every_loopback_spelling_turns_trust_env_off(url):
+    t = Transport(url, "tok", 1.0)
+    try:
+        assert t._client.trust_env is False
+    finally:
+        t.close()
+
+
+@pytest.mark.parametrize("url", ["http://10.9.8.7:4242", "http://svc.invalid", "https://example.com",
+                                 "http://128.0.0.1:1", "http://localhost.example.com:1"])
+def test_non_loopback_host_still_reads_the_environment(url):
+    t = Transport(url, "tok", 1.0)
+    try:
+        assert t._client.trust_env is True
+    finally:
+        t.close()

@@ -1,6 +1,9 @@
 """HTTP transport. Errors are mapped to starling_client.errors; messages omit url and token."""
 from __future__ import annotations
 
+import ipaddress
+from urllib.parse import urlsplit
+
 import httpx
 
 from . import errors
@@ -20,16 +23,36 @@ def _json_or(resp: httpx.Response, error_value):
     return error_value if resp.status_code >= 400 else _NOT_JSON
 
 
+def _is_loopback(url: str) -> bool:
+    """url 的主机是回环地址（127.0.0.0/8、::1、localhost）。解析不了的 url 不算（交给 httpx 照常报 invalid_config）。"""
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class Transport:
     def __init__(self, url: str, token: str, timeout_s: float = 30.0, *, _httpx_transport=None):
         self.timeout_s = float(timeout_s)
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         # 需求 5.5（修复轮 1 F5）：httpx 的异常文本带 url 或 token。在 except 块里只记下「出错了」，到块外再抛：这样新异常的
         # __context__ 是 None（`raise … from None` 只是不打印它，调用方照样读得到）。
+        # 裁定 R97（需求 5.5）：连回环地址时不读环境变量与系统代理（trust_env=False），否则每个请求连同 bearer token 都会经过用户
+        # 配的代理。非回环地址照旧读环境（用户可能要经代理连远端的服务）。
+        trust_env = not _is_loopback(url)
         client = None
         try:
             client = httpx.Client(
-                base_url=url, headers=headers, timeout=timeout_s, transport=_httpx_transport
+                base_url=url, headers=headers, timeout=timeout_s, transport=_httpx_transport,
+                trust_env=trust_env,
             )
         except (httpx.InvalidURL, UnicodeError, ValueError):
             pass
