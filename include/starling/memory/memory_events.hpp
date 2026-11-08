@@ -118,8 +118,10 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
 //   begin   第 1 段的短事务(读行、认领、占位;冲突在这里抛)+ 补齐分支(只读库,不调 LLM)+ remember_prepare(写 engram)。
 //           committed 的行直接给出 done(idempotent),之后两段都不用调。
 //   extract 只调 LLM(remember_extract_all),不碰库。needs_extraction() 为 false 时什么都不做,返回空 bundle。
-//   finish  一个事务:先重读收据行(见上面的 ③)。committed → idempotent、零写入;abandoned 或不在 → EventConflict、
-//           零写入;pending → remember_commit_all(要抽取时)与收据 UPDATE 一起提交。
+//   finish  一个事务:先重读收据行(见上面的 ③)。committed 且 text_sha256 与 begin 时相同 → idempotent、零写入;
+//           abandoned 或不在 → EventConflict、零写入;pending 且 seq 与 begin 时相同 → remember_commit_all(要抽取时)与
+//           收据 UPDATE 一起提交。committed 而 sha 不同、pending 而 seq 不同(行被删后同一个 key 又被重建)→ EventConflict、
+//           零写入(裁定 R96 M1)。
 //
 // RememberEventBegun 在三段之间原样传递,调用方不解构。begin 与 finish 必须在同一个 adapter 上调。
 struct RememberEventBegun {
@@ -128,6 +130,10 @@ struct RememberEventBegun {
     std::string key;
     RememberPrepared prepared;                 // remember_prepare 的结果(补齐时为空)
     std::optional<RememberOutcome> completed;  // 补齐分支找回的结果(有值时不抽取,finish 只写收据)
+    // begin 读到 / 写下的那一行的身份(最后修复波 A4,裁定 R96 M1):finish 重读时用它认出「还是同一行」。clear_tenant 把行删掉、
+    // 同一个 key 又被重建,重建的行与 begin 时的不是同一行:committed 时 text_sha256 可能不同,pending 时 seq 一定不同。
+    std::string text_sha256;
+    std::int64_t seq = 0;
     [[nodiscard]] bool needs_extraction() const {
         return !done && !completed && prepared.should_extract;
     }

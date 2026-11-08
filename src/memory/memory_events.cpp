@@ -387,6 +387,8 @@ RememberEventBegun remember_event_begin(persistence::SqliteAdapter& adapter,
         begun.prepared = remember_prepare(adapter, params);
     }
     begun.params = std::move(params);
+    begun.text_sha256 = row.text_sha256;   // 第 1 段读到或写下的那一行(裁定 R96 M1:finish 据此认出同一行)
+    begun.seq = row.seq;
     return begun;
 }
 
@@ -428,8 +430,17 @@ RememberOutcome remember_event_finish(persistence::SqliteAdapter& adapter,
             "remember_event: key was abandoned or removed while the write was in flight; "
             "nothing was written (key=" + std::string(key) + ")");
     }
+    // 裁定 R96 M1:行不是 begin 时那一行(clear_tenant 删掉之后同一个 key 又被重建)就不收尾。committed 时比文本摘要(重建的
+    // 那次写的是别的文本,不能把它的语句当成本次的结果);pending 时比 seq(重建的行另分配了序号,本次的 bundle 不能提交到
+    // 别人的行上,也不改写它的 failure_category)。两者都零写入,抛 EventConflict。
+    if ((row.state == "committed" && row.text_sha256 != begun.text_sha256) ||
+        (row.state == "pending" && row.seq != begun.seq)) {
+        throw EventConflict(
+            "remember_event: key was removed and recreated while the write was in flight; "
+            "nothing was written (key=" + std::string(key) + ")");
+    }
     if (row.state == "committed") {
-        // 另一个调用(同一个 key、同一段文本:begin 已比对过 text_sha256)先提交了。照 begin 的 committed 分支返回。
+        // 另一个调用(同一个 key、同一段文本:上面已比对过 text_sha256)先提交了。照 begin 的 committed 分支返回。
         RememberOutcome done;
         done.holder_id     = base.holder_id;
         done.engram_ref    = row.engram_ref;

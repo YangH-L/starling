@@ -1356,4 +1356,86 @@ TEST(MemoryEventsSplit, ExtractTouchesNoDatabase) {
     EXPECT_GT(llm.calls(), 0);
 }
 
+
+// 最后修复波 A4（裁定 R96 M1）：begin 记下 text_sha256 与 seq；finish 重读到 committed 比 sha，重读到 pending 比 seq，任一不同
+// 都抛 EventConflict、零写入。场景：A 完成 begin；clear_tenant 把行删掉；B 用同一个 key、不同的文本重建这一行。
+namespace {
+
+void clear_events(persistence::SqliteAdapter& adapter) {
+    persistence::Stmt del(adapter.connection().raw(), "DELETE FROM events WHERE tenant_id='default'");
+    del.step_done();
+}
+
+std::string receipt_of(persistence::Connection& conn, std::string_view key) {
+    persistence::Stmt q(conn.raw(),
+                        "SELECT state || '|' || text_sha256 || '|' || seq || '|' || statement_ids_json || '|' || "
+                        "COALESCE(failure_category,'') FROM events WHERE tenant_id='default' AND key=?1");
+    q.bind(key);
+    if (!q.step_row()) {
+        return {};
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    return reinterpret_cast<const char*>(sqlite3_column_text(q.raw(), 0));
+}
+
+}  // namespace
+
+TEST(MemoryEventsSplit, FinishAfterTheKeyWasRecreatedWithAnotherTextAndCommittedThrows) {
+    auto adapter = make_adapter();
+    extractor::FakeLLMAdapter llm;
+    llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+    auto begun_a = remember_event_begin(*adapter, event_params(), "k1", "bob:hi", kEpoch);
+    ASSERT_TRUE(begun_a.needs_extraction());
+    const auto extracted_a = remember_event_extract(*adapter, llm, begun_a, RememberPrompts{});
+    clear_events(*adapter);                                       // clear_tenant 把收据行删了
+    const auto winner = remember_event(*adapter, llm, event_params(), RememberPrompts{}, "k1",
+                                       "bob:something else", kEpoch);
+    ASSERT_FALSE(winner.statement_ids.empty());
+    ASSERT_EQ(event_state(adapter->connection(), "k1"), "committed");
+    const std::string receipt = receipt_of(adapter->connection(), "k1");
+    const std::string before = library_of(*adapter);
+    const int statements = row_count(adapter->connection(), "SELECT COUNT(*) FROM statements");
+    EXPECT_THROW((void)remember_event_finish(*adapter, llm, begun_a, extracted_a), EventConflict);
+    EXPECT_EQ(receipt_of(adapter->connection(), "k1"), receipt);  // B 的收据不变
+    EXPECT_EQ(row_count(adapter->connection(), "SELECT COUNT(*) FROM statements"), statements);
+    EXPECT_EQ(library_of(*adapter), before);                       // B 的语句不变、A 一条不写
+}
+
+TEST(MemoryEventsSplit, FinishAfterTheKeyWasRecreatedAndIsStillPendingThrowsWithoutTouchingIt) {
+    auto adapter = make_adapter();
+    extractor::FakeLLMAdapter llm;
+    llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+    // 先占一个序号，让 B 重建的那一行拿到与 A 不同的 seq（clear 之后 next_seq 从 0 重算，再插一行无关的 key 垫上）。
+    auto begun_a = remember_event_begin(*adapter, event_params(), "k1", "bob:hi", kEpoch);
+    const auto extracted_a = remember_event_extract(*adapter, llm, begun_a, RememberPrompts{});
+    clear_events(*adapter);
+    insert_event(adapter->connection(), "default", "pad", 0, "abandoned");
+    AlwaysFailingLLMAdapter failing;
+    const auto parked = remember_event(*adapter, failing, event_params(), RememberPrompts{}, "k1", "bob:hi",
+                                       kEpoch);                    // B 同文本、停在 pending（seq 1）
+    ASSERT_TRUE(parked.extraction_failed);
+    ASSERT_EQ(event_state(adapter->connection(), "k1"), "pending");
+    const std::string receipt = receipt_of(adapter->connection(), "k1");
+    ASSERT_NE(receipt.find("|1|"), std::string::npos) << receipt;
+    const std::string before = library_of(*adapter);
+    const int statements = row_count(adapter->connection(), "SELECT COUNT(*) FROM statements");
+    EXPECT_THROW((void)remember_event_finish(*adapter, llm, begun_a, extracted_a), EventConflict);
+    EXPECT_EQ(receipt_of(adapter->connection(), "k1"), receipt);  // failure_category 没被改写，仍是 pending
+    EXPECT_EQ(row_count(adapter->connection(), "SELECT COUNT(*) FROM statements"), statements);
+    EXPECT_EQ(library_of(*adapter), before);
+}
+
+TEST(MemoryEventsSplit, FinishOnTheSameRowItBeganStillCommits) {
+    // 对照：没被删、没被重建（sha 与 seq 都对得上）时照常提交。
+    auto adapter = make_adapter();
+    extractor::FakeLLMAdapter llm;
+    llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
+    insert_event(adapter->connection(), "default", "pad", 0, "abandoned");
+    auto begun = remember_event_begin(*adapter, event_params(), "k1", "bob:hi", kEpoch);
+    const auto extracted = remember_event_extract(*adapter, llm, begun, RememberPrompts{});
+    const auto out = remember_event_finish(*adapter, llm, begun, extracted);
+    EXPECT_EQ(out.outcome, "accepted");
+    EXPECT_EQ(event_state(adapter->connection(), "k1"), "committed");
+}
+
 }  // namespace starling::memoryops
