@@ -136,7 +136,7 @@ def test_signatures_match_the_spec():
                                                  ("interlocutor", KW, None),
                                                  ("epoch", KW, "2026-01-01T00:00:00Z")]
     assert _sig(RemoteMemory.abandon_event) == [("key", POS, None)]
-    assert _sig(RemoteMemory.content_ids) == [("ids", POS, None)]
+    assert _sig(RemoteMemory.content_ids) == [("statement_ids", POS, None)]   # 与 Memory.content_ids 同名（A9）
     for name in ("digest", "pending_events", "next_seq"):
         assert _sig(getattr(RemoteMemory, name)) == [], name
     assert _sig(RemoteMemory.embed_pending) == [("now", POS, None)]
@@ -390,3 +390,117 @@ def test_wrong_token_raises_unauthorized_without_the_token():
     assert (err.value.code, err.value.transient) == ("unauthorized", False)
     _assert_clean(err.value)
     assert E.Unauthorized is starling_client.Unauthorized
+
+
+# ───────────────────────── 最后修复波 A8（裁定 R92 M4）：close 与 Memory.close 对齐 ─────────────────────────
+
+def test_a_second_close_waits_for_the_first_instead_of_raising(svc):
+    """(a) 另一个 close() 正在进行：等它完成（这里第一个 close 等本地在途调用结束后成功），不立刻抛异常；第一个成功后第二个直接
+    返回，只向服务发一次 /close。"""
+    service, client = svc
+    mem = client.open("w1", holder="carol")
+    service.call_results["remember_event"] = REMEMBER
+    service.release_call.clear()
+    worker = threading.Thread(target=lambda: mem.remember_event("k", "t", interlocutor="bob"))
+    worker.start()
+    assert _wait_for(lambda: mem._in_flight == 1)
+    first = threading.Thread(target=lambda: mem.close(timeout=5.0))
+    first.start()
+    assert _wait_for(lambda: mem._closing)
+    box = {}
+
+    def second():
+        try:
+            mem.close(timeout=5.0)
+            box["ok"] = True
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+    other = threading.Thread(target=second)
+    other.start()
+    time.sleep(0.1)
+    assert other.is_alive() and "error" not in box               # 在等，没有立刻抛
+    service.release_call.set()
+    worker.join(5)
+    first.join(5)
+    other.join(5)
+    assert box == {"ok": True}
+    assert service.paths().count("/close") == 1
+    with pytest.raises(E.MemoryClosed):
+        mem.digest()
+
+
+def test_a_second_close_gives_up_after_its_timeout(svc):
+    """(a) 第一个 close 一直等不到在途调用结束：第二个 close 等满自己的 timeout 抛 TimeoutError（消息说另一个 close 在进行），
+    句柄状态不变；放行之后第一个照常关掉。"""
+    service, client = svc
+    mem = client.open("w1", holder="carol")
+    service.call_results["remember_event"] = REMEMBER
+    service.release_call.clear()
+    worker = threading.Thread(target=lambda: mem.remember_event("k", "t", interlocutor="bob"))
+    worker.start()
+    assert _wait_for(lambda: mem._in_flight == 1)
+    first = threading.Thread(target=lambda: mem.close(timeout=5.0))
+    first.start()
+    assert _wait_for(lambda: mem._closing)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError) as err:
+        mem.close(timeout=0.1)
+    assert time.monotonic() - started >= 0.09
+    assert "another close() is in progress" in str(err.value)
+    service.release_call.set()
+    worker.join(5)
+    first.join(5)
+    with pytest.raises(E.MemoryClosed):
+        mem.digest()
+
+
+def test_close_without_a_timeout_waits_in_bounded_segments_until_the_service_is_done(svc, monkeypatch):
+    """(b) timeout=None 一直等：每次请求带有限的 timeout_s（分段），服务回 world_busy 就再发一次，直到成功；每次的 HTTP 超时都大于
+    那一段。"""
+    from starling_client import remote_memory
+    service, client = svc
+    mem = client.open("w1", holder="carol")
+    seen = []
+    real = client._post
+
+    def scripted(path, body, *, timeout_s=None):
+        if path == "/close":
+            seen.append((body.get("timeout_s"), timeout_s))
+            if len(seen) < 3:
+                raise E.WorldError("world_busy", code="world_busy", transient=True)
+        return real(path, body, timeout_s=timeout_s)
+
+    monkeypatch.setattr(client, "_post", scripted)
+    mem.close()
+    assert len(seen) == 3
+    segment = remote_memory._CLOSE_SEGMENT_S
+    for server_wait, http_timeout in seen:
+        assert server_wait == segment
+        assert http_timeout is not None and http_timeout > server_wait
+    with pytest.raises(E.MemoryClosed):
+        mem.digest()
+
+
+def test_close_with_a_timeout_still_raises_once_the_service_stays_busy(svc):
+    """有 timeout 时照旧：服务回 world_busy → TimeoutError，句柄保持打开（与 test_close_service_side_world_busy_... 同一语义）；
+    timeout 比分段长时也只等到 timeout 为止。"""
+    service, client = svc
+    mem = client.open("w1", holder="carol")
+    service.fail["/close"] = _error("world_busy", 503, transient=True)
+    with pytest.raises(TimeoutError):
+        mem.close(timeout=0.3)
+    sent = [body["timeout_s"] for body in service.bodies("/close")]
+    assert sent and all(value <= 0.3 for value in sent)
+    del service.fail["/close"]
+    service.call_results["digest"] = "d" * 64
+    assert mem.digest() == "d" * 64
+    mem.close(timeout=0.5)
+
+
+def test_content_ids_takes_statement_ids_like_memory(svc):
+    """A9（裁定 R100 M2）：参数名与 starling.Memory.content_ids 一致，按关键字传也行；线上的 args 仍是 ids（服务端路由不变）。"""
+    service, client = svc
+    mem = client.open("w1", holder="carol")
+    service.call_results["content_ids"] = {"s1": "c" * 64}
+    assert mem.content_ids(statement_ids=["s1"]) == {"s1": "c" * 64}
+    assert service.bodies("/call")[-1]["args"] == {"ids": ["s1"]}

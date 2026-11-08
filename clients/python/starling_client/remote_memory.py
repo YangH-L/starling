@@ -8,7 +8,10 @@ Close protocol (same meaning as `Memory.close`): every call counts itself in
 and out locally; `close(timeout)` first waits for the local count to reach
 zero, then asks the service, which waits for the handle's in-flight calls on
 its side. A timeout on either side raises `TimeoutError` and the handle stays
-open: calls are accepted again and `close()` can be retried.
+open: calls are accepted again and `close()` can be retried. A second
+`close()` while one is running waits for it (up to its own timeout), and
+`timeout=None` waits as long as it takes, asking the service in bounded
+segments.
 """
 from __future__ import annotations
 
@@ -18,6 +21,10 @@ import time
 
 from . import errors
 from .types import EmbedStats, PendingEvent, RememberResult, StatementRow, from_fields
+
+# close() 每次请求服务端最多等多久（秒）。timeout=None 时按这一段反复问，直到服务端的在途调用归零；每次 HTTP 请求的超时是这一段
+# 加上客户端的请求超时，所以不会因为服务端在等而先超时（最后修复波 A8）。
+_CLOSE_SEGMENT_S = 25.0
 
 
 class RemoteMemory:
@@ -85,8 +92,10 @@ class RemoteMemory:
         when it is already committed."""
         self._call("abandon_event", key=key)
 
-    def content_ids(self, ids) -> dict[str, str]:
-        return self._call("content_ids", ids=[str(item) for item in ids])
+    def content_ids(self, statement_ids) -> dict[str, str]:
+        """Map statement ids to content ids, like `Memory.content_ids`; an id the
+        world does not hold maps to "missing"."""
+        return self._call("content_ids", ids=[str(item) for item in statement_ids])
 
     # ── the whole world ────────────────────────────────────────────────
 
@@ -106,40 +115,69 @@ class RemoteMemory:
 
     def close(self, timeout: float | None = None) -> None:
         """Wait for in-flight calls (locally, then on the service), then close the
-        handle. New calls raise `MemoryClosed` from the moment close starts.
-        `TimeoutError` means a call was still in flight after `timeout` seconds:
-        the handle stays open and accepts calls again. Idempotent once closed."""
+        handle. Same meaning as `Memory.close`:
+
+        * New calls raise `MemoryClosed` from the moment close starts.
+        * `timeout=None` waits as long as it takes. The service is asked in
+          bounded segments (each request waits at most `_CLOSE_SEGMENT_S` on the
+          service side), so no single HTTP request hits the client timeout.
+        * `TimeoutError` "... still in flight": a call was still in flight after
+          `timeout` seconds. The handle stays open and accepts calls again;
+          `close()` can be retried.
+        * `TimeoutError` "another close() is in progress": a different `close()`
+          is running and did not finish within this call's `timeout`. A second
+          `close()` waits for the first one; once that one has closed the handle,
+          the second returns. If the first gives up, the second takes over.
+        * Idempotent once closed.
+        """
         deadline = None if timeout is None else time.monotonic() + timeout
+
+        def remaining() -> float | None:
+            return None if deadline is None else max(0.0, deadline - time.monotonic())
+
         with self._cond:
-            if self._closed:
-                return
-            if self._closing:
-                raise TimeoutError("another close() is in progress")
+            while True:
+                if self._closed:
+                    return
+                if not self._closing:
+                    break
+                if not self._cond.wait_for(lambda: self._closed or not self._closing, remaining()):
+                    raise TimeoutError(f"another close() is in progress and did not finish within "
+                                       f"{timeout}s; the handle is closing or already closed")
             self._closing = True
         try:
             with self._cond:
-                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                if not self._cond.wait_for(lambda: self._in_flight == 0, remaining):
+                if not self._cond.wait_for(lambda: self._in_flight == 0, remaining()):
                     raise TimeoutError(f"{self._in_flight} call(s) still in flight after {timeout}s;"
                                        " the handle stays open")
-            server_wait = None if deadline is None else max(0.0, deadline - time.monotonic())
-            body = {"handle_id": self._handle_id}
-            if server_wait is not None:
-                body["timeout_s"] = server_wait
-            # The HTTP request may take as long as the service-side wait, plus the usual request budget.
-            http_timeout = None if server_wait is None else server_wait + self._client.timeout_s
-            busy = False
-            try:
-                self._client._post("/close", body, timeout_s=http_timeout)
-            except errors.StarlingClientError as exc:
-                if exc.code != "world_busy":
-                    raise
-                busy = True
-            if busy:   # 块外再抛：TimeoutError 不挂服务端错误的链（F5）
-                raise TimeoutError("call(s) still in flight on the service; the handle stays open")
+            self._close_on_service(deadline)
             with self._cond:
                 self._closed = True
         finally:
             with self._cond:
                 self._closing = False
                 self._cond.notify_all()
+
+    def _close_on_service(self, deadline: float | None) -> None:
+        """Ask the service to close the handle once its in-flight calls are done. Each request waits at
+        most one segment on the service side (the whole remaining time when that is shorter); `world_busy`
+        means "still in flight", so with no deadline it asks again, and past the deadline it raises
+        `TimeoutError` (the handle stays open)."""
+        while True:
+            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            server_wait = _CLOSE_SEGMENT_S if left is None else min(left, _CLOSE_SEGMENT_S)
+            # The HTTP request may take as long as the service-side wait, plus the usual request budget.
+            http_timeout = server_wait + self._client.timeout_s
+            busy = False
+            try:
+                self._client._post("/close", {"handle_id": self._handle_id, "timeout_s": server_wait},
+                                   timeout_s=http_timeout)
+            except errors.StarlingClientError as exc:
+                if exc.code != "world_busy":
+                    raise
+                busy = True
+            if not busy:
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                # 块外再抛：TimeoutError 不挂服务端错误的链（F5）
+                raise TimeoutError("call(s) still in flight on the service; the handle stays open")

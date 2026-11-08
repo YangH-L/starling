@@ -326,7 +326,7 @@ mem = client.open(world, holder=..., read_only=False, settings=None)   # 返回 
 mem.recall(query, k=..., mode="semantic", strict=True, include_volatile=True)
 mem.remember_event(key, text, interlocutor=..., epoch=...)
 mem.abandon_event(key)
-mem.content_ids(ids)
+mem.content_ids(statement_ids)
 # 作用于整个世界（D5）：
 mem.digest(); mem.pending_events(); mem.next_seq(); mem.embed_pending(now)
 mem.close(timeout=...)
