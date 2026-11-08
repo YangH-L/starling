@@ -38,7 +38,11 @@ EPOCH = "2026-01-01T00:00:00Z"
 NOW = "2026-06-01T00:00:00Z"
 API = "/api/v1/client"
 _JOIN_S = 30.0
-_EXTRACT_TIMEOUT_MS = 10_000
+# 抽取请求的超时：与假端点 hold_keys 的上限（_HOLD_CAP_S，30 s）一致（裁定 R98 F2），被挂住的请求在用例 release 之前不会先超时。
+_EXTRACT_TIMEOUT_MS = 30_000
+# 嵌入 provider 的超时与重试：服务一侧（starling.json）与进程内一侧（make_openai_embedder）写成同一组值（裁定 R98 F3）。
+_EMBED_TIMEOUT_MS = 60_000
+_EMBED_MAX_RETRIES = 0
 
 
 # ───────────────────────── 夹具 ─────────────────────────
@@ -76,7 +80,8 @@ def _write_config(data_dir, fake: FakeOpenAI) -> None:
                              "api_key": fake.api_key, "timeout_ms": _EXTRACT_TIMEOUT_MS,
                              "max_retries": 0},
             "fake-embed": {"provider": "openai", "model": "fake-embed", "base_url": fake.base_url,
-                           "api_key": fake.api_key, "dim": DIM},
+                           "api_key": fake.api_key, "dim": DIM, "timeout_ms": _EMBED_TIMEOUT_MS,
+                           "max_retries": _EMBED_MAX_RETRIES},
         },
         "roles": {"extraction": "fake-extract", "embedding": "fake-embed"},
         "source_lane_enabled": False,
@@ -339,14 +344,44 @@ def _facade_steps(mem, fake: FakeOpenAI) -> list:
     return record
 
 
-def test_6_facade_parity(tmp_path, client, fake_openai):
+def _raw_close_keeps_the_handle_open(service, fake: FakeOpenAI) -> None:
+    """裁定 R99：绕过客户端直接对 HTTP 接口做 close，钉住服务端的「close 超时、句柄保持打开」（客户端那一半由上面第 5 步钉住）。
+    hold_keys 挂住一次 call → /close 带 timeout_s=0.2 回 world_busy（状态与瞬态取自码表）→ 同一个句柄调 next_seq 回 200，不是
+    handle_closed → release。"""
+    from starling.dashboard.routes.world_scope import error_body, status_for
+    with httpx.Client(base_url=service.url, timeout=30.0, trust_env=False,
+                      headers={"Authorization": f"Bearer {service.token}"}) as raw:
+        session = raw.post(f"{API}/connect", json={"protocol": 1}).json()["session_id"]
+        handle = raw.post(f"{API}/open", json={"session_id": session, "world": "t6-raw",
+                                               "holder": HOLDER}).json()["handle_id"]
+        fake.configure(hold_keys=["raw#0"])
+        thread, box = _run_in_thread(lambda: raw.post(f"{API}/call", json={
+            "handle_id": handle, "method": "remember_event",
+            "args": {"key": "raw#0", "text": _text("bob", "Bob owns the raw module"), "interlocutor": "bob"}}))
+        try:
+            fake.wait_until(lambda state: state["held"] >= 1)
+            busy = raw.post(f"{API}/close", json={"handle_id": handle, "timeout_s": 0.2})
+            assert (busy.status_code, busy.json()) == (status_for("world_busy"), error_body("world_busy"))
+            again = raw.post(f"{API}/call", json={"handle_id": handle, "method": "next_seq", "args": {}})
+            assert again.status_code == 200, again.text                       # 不是 handle_closed
+        finally:
+            fake.release()
+        held = _join(thread, box)
+        fake.configure(hold_keys=[])
+        assert held.status_code == 200, held.text
+        assert raw.post(f"{API}/close", json={"handle_id": handle, "timeout_s": 5.0}).status_code == 200
+        raw.post(f"{API}/disconnect", json={"session_id": session})
+
+
+def test_6_facade_parity(tmp_path, service, client, fake_openai):
     """同一组调用分别走进程内 Memory 与客户端（同一个 holder、一个新世界，两边都指向同一个假端点）：规范化之后逐项相等，
     最后两边摘要相等（R76：来源前缀 dash- 与 mem- 不进摘要）。"""
     with _openai_key(fake_openai.api_key):
         llm = starling.make_openai_llm(model="fake-extract", base_url=fake_openai.base_url,
                                        timeout_ms=_EXTRACT_TIMEOUT_MS, max_retries=0)
         embedder = starling.make_openai_embedder(model="fake-embed", base_url=fake_openai.base_url,
-                                                 dim=DIM, timeout_ms=60_000, max_retries=0)
+                                                 dim=DIM, timeout_ms=_EMBED_TIMEOUT_MS,
+                                                 max_retries=_EMBED_MAX_RETRIES)
     local = starling.Memory.open(tmp_path / "local.db", agent=HOLDER, llm=llm, embedder=embedder)
     try:
         local_record = _facade_steps(local, fake_openai)
@@ -384,6 +419,9 @@ def test_6_facade_parity(tmp_path, client, fake_openai):
     assert record["next_seq after close timeout"] == ("ok", 3)       # 句柄没被标成已关；e1、e3、e5 各占一个 seq
     assert record["pending"] == []
     assert remote_digest == local_digest
+
+    client.create_world("t6-raw")
+    _raw_close_keeps_the_handle_open(service, fake_openai)
 
 
 # ───────────────────────── 第 7 条：停止与重启 ─────────────────────────

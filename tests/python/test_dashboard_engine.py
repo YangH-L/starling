@@ -577,3 +577,20 @@ def test_explicit_endpoint_without_the_service_key_refuses_embedding_and_tick_sk
         assert isinstance(eng.recall("auth"), list)          # 设上密钥之后按它重建，照常召回
     finally:
         eng.close()
+
+
+def test_embed_adapter_takes_timeout_and_max_retries_from_the_endpoint(monkeypatch):
+    """最后修复波 B4（裁定 R98 F3）：嵌入适配器与抽取一样按 endpoint 的 timeout_ms、max_retries 建（max_retries 按 is None 判，0
+    表示不重试）；没给时保持 C++ 默认。此前这两项被忽略，服务一侧的嵌入总是 60 s / 3 次重试。"""
+    import starling.dashboard.engine as engmod
+    seen = []
+
+    class _Spy:
+        def __init__(self, cfg):
+            seen.append((cfg.timeout_ms, cfg.max_retries))
+    monkeypatch.setattr(engmod._core, "OpenAIEmbeddingAdapter", _Spy)
+    base = {"api_key": "k", "base_url": "http://127.0.0.1:9/v1", "model": "e", "dim": 8}
+    engmod._build_embed_adapter({**base, "timeout_ms": 1234, "max_retries": 0})
+    engmod._build_embed_adapter(base)
+    default = _core.OpenAIEmbeddingConfig()
+    assert seen == [(1234, 0), (default.timeout_ms, default.max_retries)]

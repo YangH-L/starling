@@ -234,6 +234,11 @@ def _build_embed_adapter(emb_cfg: dict):
             cfg.base_url = emb_cfg["base_url"]
         if emb_cfg.get("dim"):
             cfg.dim = int(emb_cfg["dim"])
+        # 与 _build_chat_adapter 同一取法（最后修复波 B4）：timeout_ms 给了才设；max_retries 按 is None 判，0 表示不重试。
+        if emb_cfg.get("timeout_ms"):
+            cfg.timeout_ms = int(emb_cfg["timeout_ms"])
+        if emb_cfg.get("max_retries") is not None:
+            cfg.max_retries = int(emb_cfg["max_retries"])
         return _core.OpenAIEmbeddingAdapter(cfg)
 
 

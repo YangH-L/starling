@@ -13,6 +13,8 @@
   - hold_keys：段落 key 在其中的抽取请求挂住，直到 POST /__fake__/release（或挂满 _HOLD_CAP_S 自己放行），
     让用例确定地造出「这个写入正在途中」的窗口。
 - 鉴权：Authorization 必须是 "Bearer <api_key>"（启动时给的随机 key），否则 401 并计 auth_failures。
+- 401、500、503 的 error.message 故意带上 key 与 127.0.0.1:<port>（裁定 R98 F1）：服务若把上游错误文本转进响应体、日志或
+  failure_detail，泄漏测试就能抓到。
 - 计数（GET /__fake__/state）：chat_calls、embedding_calls、auth_failures，chat_in_flight（此刻正在处理、还没答
   的抽取请求数，GIL 用例据此判断抽取已经进入阻塞），held（此刻被 hold_keys 挂住的请求数）。
 
@@ -94,6 +96,10 @@ def _serve(dim: int, api_key: str) -> None:
     cfg = {name: (frozenset(value) if name in _KEY_SETS else value)
            for name, value in _DEFAULTS.items()}
 
+    def leaky(what: str, port: int) -> dict:
+        """错误体：message 里带 key 与地址（R98 F1）。"""
+        return {"error": {"message": f"{what}: key {api_key} at 127.0.0.1:{port}"}}
+
     def bump(name: str, delta: int = 1) -> None:
         with lock:
             state[name] += delta
@@ -143,7 +149,7 @@ def _serve(dim: int, api_key: str) -> None:
                 return
             if self.headers.get("Authorization") != f"Bearer {api_key}":
                 bump("auth_failures")
-                self._reply(401, {"error": {"message": "invalid api key"}})
+                self._reply(401, leaky("bad key", self.server.server_port))
                 return
             if path.endswith("/embeddings"):
                 self._embeddings(payload)
@@ -162,7 +168,7 @@ def _serve(dim: int, api_key: str) -> None:
             with lock:
                 fail = cfg["fail_embeddings"]
             if fail:
-                self._reply(503, {"error": {"message": "embeddings unavailable"}})
+                self._reply(503, leaky("embeddings unavailable", self.server.server_port))
                 return
             raw = payload.get("input", [])
             items = [raw] if isinstance(raw, str) else list(raw)
@@ -190,7 +196,7 @@ def _serve(dim: int, api_key: str) -> None:
             if found and content.startswith(BELIEF_PROMPT_HEAD):
                 key, speaker, utterance = found.groups()
                 if key in fail_keys:
-                    self._reply(500, {"error": {"message": "extraction failed"}})
+                    self._reply(500, leaky("extraction failed", self.server.server_port))
                     return
                 answer = belief_answer(speaker, utterance)
             elif found and content.startswith(GENERAL_FACT_PROMPT_HEAD) and found.group(1) in malformed:
