@@ -3,7 +3,7 @@
 每个检视、命令路由挂两次（create_app）：前缀 /api 指向默认世界（旧路径，现有脚本、hook、前端照旧可用），
 前缀 /api/w/{world} 指向指定世界。请求落在哪个世界只由 world_name 这一个依赖项决定，租约、只读检视都经它。
 
-世界错误统一由 install_error_handlers 注册的异常处理器转成 {"code", "transient", "detail"}（detail 等于码）（前端按 detail 显示提示）：
+世界错误统一由 install_error_handlers 注册的异常处理器转成 {"code", "transient", "detail"}（detail 等于码，前端按 detail 显示提示）：
 引擎池的 WorldSwitchError（取租约时：世界不存在、正在关闭等），以及引擎调用里抛出的 C++ WorldStoreError
 （如 endpoint_changed：继承的 provider 地址已改）。码由池或 C++ 给出，这里只查表定 HTTP 状态。
 

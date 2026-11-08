@@ -29,13 +29,10 @@ from pydantic import BaseModel, StrictBool, StrictInt
 
 from starling import _core
 from starling.dashboard.engine import endpoint_api_key
-from starling.dashboard.routes.world_scope import _STATUS as _SCOPE_STATUS, WorldHTTPError
+from starling.dashboard.routes.world_scope import WorldHTTPError, status_for
 from starling.dashboard.world_manager import WorldSwitchError
 
 logger = logging.getLogger(__name__)
-
-# 错误码 → HTTP 状态：与作用域路由共用同一张取自 C++ 错误码目录的表。
-_STATUS = _SCOPE_STATUS
 
 # 世界设置里带 provider 密钥的段（返回时每段加 key_set）。
 _ENDPOINT_SECTIONS = ("extraction", "embedding", "chat", "consolidation")
@@ -93,7 +90,7 @@ class RollbackBody(BaseModel):
     mode: str = "discard_after"
 
 
-def _fail(code: str) -> HTTPException:
+def _fail(code: str) -> WorldHTTPError:
     return WorldHTTPError(code)
 
 
@@ -106,7 +103,7 @@ async def _run(fn, *args, **kwargs):
     except HTTPException:
         raise                                   # 工作函数里已经决定好的 HTTP 错误
     except WorldSwitchError as exc:
-        if _STATUS.get(exc.code, 500) >= 500:
+        if status_for(exc.code) >= 500:
             logger.warning("worlds route: %s: %s", exc.code, exc.detail)
         raise _fail(exc.code) from exc
     except _core.WorldStoreError as exc:
@@ -495,6 +492,7 @@ def build_worlds_router(require_token) -> APIRouter:
         try:
             out = await _run(pool.rollback, name, body.snapshot_id)
         except HTTPException as exc:
+            # 接的是 HTTPException：_run 把池的错误转成 WorldHTTPError（HTTPException 的子类）再抛，原异常挂在 __cause__ 上。
             # 池报告库已替换（C++ 的 replaced 标记，裁定 R32；池在这种失败上已刷新统计、重开过引擎）：库已经换成快照的
             # 内容，别的标签页同样要知道库变了。判定来自标记，不来自错误码列表。
             if getattr(exc.__cause__, "pool_replaced", False):

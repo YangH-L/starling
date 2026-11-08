@@ -46,8 +46,11 @@ DashboardEngine.close() 不释放 C++ SQLite 句柄，只有丢掉最后一个�
 ------------------------------------------
   1. pool._lock（Lock，短）：只保护 _engines / _leases / _closing 三张表，以及只在表上做的簿记
      （_leaked、_world_locks、去抖状态、自动快照失败计数、后台线程句柄）。持有期间不做任何 I/O、
-     不建引擎、不拿别的锁（起去抖计时器的 Timer.start 只等线程起来）。_drained 是建在它上面的
+     不建引擎、不拿别的 Python 锁（起去抖计时器的 Timer.start 只等线程起来）。_drained 是建在它上面的
      Condition：等租约归零时 wait 放开 _lock，所以「等租约」从不持着 _lock。
+     例外一条边：pool._lock → SessionTable 的 C++ 互斥锁（裁定 R87 N3）。dashboard_write、_open_writable_handle 持 _lock
+     调 world_write_held / open_handle，这些调用只取会话表自己的互斥锁、做完即放，从不回调 Python，也不取池里的任何锁，
+     所以没有反向的边、不成环。
   2. pool._world_locks[name]（每个世界一把 RLock）：建引擎、关引擎、快照、恢复、删除、自动快照、
      清理归档。可能被占几秒到几十秒（VACUUM、复制快照、等租约），所以事件循环上的代码从不拿它。
      C++ 要求按世界串行化快照、恢复、修剪，持这把锁即满足。不同世界的世界锁互不相干：一个世界建引擎
@@ -607,7 +610,9 @@ class WorldPool:
                 raise WorldSwitchError(
                     "world_busy", "the read-only engine's runtime is still referenced")
             self._refuse_leaked(rec["db_path"])
-            # 关闭窗口已排干全部租约，看板写入（全程持一份租约）都已结束、窗口里也进不来；计数检查仍走同一个函数，不另开一路。
+            # 关闭窗口已排干全部租约，此前开始的看板写入（全程持一份租约）都已结束。窗口里看板写入的准入（dashboard_write）不看关闭
+            # 标志，照样能通过、在途计数加一，随后它取租约时回 world_busy、计数减一（裁定 R87 N2）；恰好落在这一瞬时，下面的计数
+            # 检查回瞬态 world_busy，客户端重试即可。被客户端占着之前不会有看板写入提交进来。计数检查仍走同一个函数，不另开一路。
             handle = self._open_writable_handle(world, session_id, holder, now_ms)
             try:
                 self._open_and_publish(world)
@@ -615,13 +620,6 @@ class WorldPool:
                 sessions.close_handle(handle)
                 raise
             return handle
-
-    def require_dashboard_writable(self, world: str) -> None:
-        """看板写入类命令的准入（裁定 R51）：C++ world_require_writable(rec, for_client_write=False,
-        held_by_other=world_write_held(world, now))。被客户端占着写入的世界 world_held（可回收世界也是 world_held，不是
-        world_read_only）；没人占着的只读打开的世界 world_read_only。只判、不计数；要占住写入请用 dashboard_write。"""
-        _core.world_require_writable(self._record(world), for_client_write=False,
-                                     held_by_other=self._write_held(world))
 
     @contextlib.contextmanager
     def dashboard_write(self, world: str):

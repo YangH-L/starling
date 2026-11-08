@@ -443,6 +443,6 @@ rise 在第 4 期之后能接上；第 6 期之后 rise 不再负责删世界。
 - **带有 rise 快照的可回收世界不会被自动清理**，rise 删了快照之后才会被清。
 - 世界名：首字符字母或数字，其余 `[A-Za-z0-9._-]`，长度 1–128，区分大小写。
 - `pending_events()` 每项多一个 `holder` 字段，rise 用对应 holder 的句柄去 `abandon_event`。
-- 同一世界内的调用串行化：同一 rollout 世界里训练位抽取时，对手位的召回要等。
+- 召回不等抽取：抽取在引擎锁外进行。同一世界里，召回和 `embed_pending` 在嵌入请求期间持引擎锁，同世界的其他调用会排队；同一个 key 重放时，可能拿到先提交那次的语句。
 - 端点配置：不给就继承服务默认世界的配置（建时复制）；给了的话密钥取服务环境变量 `OPENAI_API_KEY`。继承的 provider 地址被改过就报 `endpoint_changed`。
 - 客户端的安装方式与导入名（§13.3）。rise 的适配器从 `starling.Memory.open(path, agent=...)` 换成 `client.open(world, holder=...)`。

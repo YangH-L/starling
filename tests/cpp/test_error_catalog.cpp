@@ -46,8 +46,9 @@ constexpr Expected kSpecCodes[] = {
     {"unauthorized", false, 401}, {"not_found", false, 404}, {"internal_error", false, 500},
 };
 
-// src/governance/*.cpp 里以字面量给出的全部码：WorldStoreError("<code>" 与 WorldStoreError::after_replace("<code>"，
-// 含参数跨行的调用（正则 WorldStoreError(::after_replace)?\(\s*"([a-z_]+)"）。以变量传码的几处（unresolvable、
+// src/governance/*.cpp 里以字面量给出的全部码（30 个）：WorldStoreError("<code>" 与
+// WorldStoreError::after_replace("<code>"。要按多行匹配（正则 WorldStoreError(::after_replace)?\(\s*"([a-z_]+)"，
+// 允许括号后换行）：逐行的 grep 只得 29 个，漏掉参数换行写的 restore_digest_mismatch。以变量传码的几处（unresolvable、
 // 布局校验）只传 registry_corrupt / snapshot_failed，两者已在表内。session_table.cpp 贡献 handle_closed、
 // session_expired、world_held、world_in_use；registry_db.cpp 的 require_writable 贡献 world_held、world_read_only。
 constexpr std::string_view kThrownBySrcGovernance[] = {

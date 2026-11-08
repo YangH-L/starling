@@ -46,10 +46,15 @@ def test_catalog_status_matches_legacy_tables(legacy):
 
 
 def test_route_tables_are_built_from_catalog():
+    """状态只有一张表（world_scope），取自 C++ 码表；worlds 路由经 status_for 查它（4.1 复审 M2：不再导入私有的 _STATUS）。"""
     from starling.dashboard.routes import world_scope, worlds
     catalog = _catalog()
-    for table in (world_scope._STATUS, worlds._STATUS):
-        assert table == {code: row["http_status"] for code, row in catalog.items()}
+    assert world_scope._STATUS == {code: row["http_status"] for code, row in catalog.items()}
+    assert not hasattr(worlds, "_STATUS")
+    assert worlds.status_for is world_scope.status_for
+    for code, row in catalog.items():
+        assert worlds.status_for(code) == row["http_status"], code
+    assert worlds.status_for("no_such_code") == 500
 
 
 def _stub_factory(ctx, providers):
