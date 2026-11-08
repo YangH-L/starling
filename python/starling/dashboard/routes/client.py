@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from starling import _core
 from starling._memory_core import LLMNotConfigured, RecallDegradedError
+from starling.dashboard.engine import endpoint_api_key
 from starling.dashboard.routes.world_scope import WorldHTTPError, error_body, status_for
 from starling.dashboard.world_manager import WorldSwitchError
 from starling.extractor.config import ExtractionConfig
@@ -261,24 +262,32 @@ def _facade_call(pool, sessions, handle_id: str, method: str, raw_args) -> objec
 
 # ───────────────────────── 会话与句柄（工作线程里跑） ─────────────────────────
 
-def _public_default_settings(pool) -> dict:
-    """默认世界存着的设置（新世界从它复制，C++ 补齐默认值），去掉地址：每个 endpoint 段删掉 base_url。设置里本来就没有密钥
-    （只有 provider_name，spec §8.2）。"""
+def _public_default_settings(pool, providers: dict) -> tuple[dict, dict[str, bool]]:
+    """默认世界存着的设置（新世界从它复制，C++ 补齐默认值）去掉地址，与按角色的 key_set。
+
+    - 设置：每个 endpoint 段删掉 base_url。设置里本来就没有密钥（只有 provider_name，spec §8.2）。不加 key_set：rise 把这份
+      设置原样传回 open / create_world（R93），C++ 把 key_set 当未知键拒绝（R35），所以它放在设置之外（裁定 R101）。
+    - key_set：{角色: 调用时有没有密钥可用}，只列有 endpoint 的角色。规则是 engine.endpoint_api_key，与看板世界详情的
+      _public_settings 同一条；providers 是此刻的 provider 表，现算不缓存。只给布尔值，不给密钥。"""
     settings = _core.world_effective_settings(pool.record(pool.default_world())["settings"])
+    key_set: dict[str, bool] = {}
     for section in _ENDPOINT_SECTIONS:
         endpoint = settings.get(section)
         if isinstance(endpoint, dict):
+            key_set[section] = bool(endpoint_api_key(endpoint, providers))
             endpoint.pop("base_url", None)
-    return settings
+    return settings, key_set
 
 
-def _info(pool) -> dict:
-    """{version, commit, protocol, extraction_config, default_settings}（spec §13.4）。version 与 commit 编在 C++ 里（裁定 R88）。
-    extraction_config 是引擎生效的 ExtractionConfig：池建的每个引擎都用缺省构造（DashboardEngine 不传 extraction）。"""
+def _info(pool, providers: dict) -> dict:
+    """{version, commit, protocol, extraction_config, default_settings, key_set}（spec §13.4、§8.2）。version 与 commit 编在 C++
+    里（裁定 R88）。extraction_config 是引擎生效的 ExtractionConfig：池建的每个引擎都用缺省构造（DashboardEngine 不传
+    extraction）。key_set 见 _public_default_settings（裁定 R101）。"""
     extraction = dataclasses.asdict(ExtractionConfig())
     extraction["extra_core_predicates"] = list(extraction["extra_core_predicates"])
+    settings, key_set = _public_default_settings(pool, providers)
     return {"version": _core.__version__, "commit": _core.build_commit(), "protocol": PROTOCOL,
-            "extraction_config": extraction, "default_settings": _public_default_settings(pool)}
+            "extraction_config": extraction, "default_settings": settings, "key_set": key_set}
 
 
 def _open(pool, body: OpenBody) -> dict:
@@ -452,7 +461,7 @@ def build_client_router(require_token) -> APIRouter:
         pool, sessions = _pool(request), _sessions(request)
         if body.protocol != PROTOCOL:
             raise _fail("protocol_mismatch")
-        info = await _off_loop(_info, pool)
+        info = await _off_loop(_info, pool, request.app.state.config.providers)
         session_id = sessions.connect(pool.now_ms())
         return {"session_id": session_id, "lease_ms": sessions.lease_ms,
                 "heartbeat_ms": sessions.heartbeat_ms, "info": info}
@@ -470,7 +479,7 @@ def build_client_router(require_token) -> APIRouter:
 
     @router.post("/info")
     async def info(request: Request):
-        return await _off_loop(_info, _pool(request))
+        return await _off_loop(_info, _pool(request), request.app.state.config.providers)
 
     @router.post("/open")
     async def open_handle(request: Request, body: OpenBody):

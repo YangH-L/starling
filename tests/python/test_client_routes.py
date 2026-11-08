@@ -228,7 +228,8 @@ def _strings(value):
 def test_info_has_no_key_or_address(svc):
     client, _clock = svc
     info = _ok(client.post(f"{API}/info", json={}))
-    assert set(info) == {"version", "commit", "protocol", "extraction_config", "default_settings"}
+    assert set(info) == {"version", "commit", "protocol", "extraction_config", "default_settings",
+                         "key_set"}                                  # key_set：裁定 R101
     assert info["commit"] == _core.build_commit()
     assert info["version"] == _core.__version__ and info["protocol"] == 1
     assert info["extraction_config"]["belief_prompt"]
@@ -685,3 +686,63 @@ def test_wrong_or_missing_token_is_the_catalog_unauthorized_body(tmp_path):
         ok = client.post(f"{API}/connect", json={"protocol": 1},
                          headers={"Authorization": "Bearer tok-secret-0451"})
         assert ok.status_code == 200
+
+
+# ───────────────────────── 最后修复波 A10（裁定 R101，spec §8.2）：info.key_set 按角色给出 ─────────────────────────
+
+def test_info_key_set_is_per_role_and_carries_no_key_or_address(tmp_path, monkeypatch):
+    """info 在 default_settings 旁边多一个 key_set: {role: bool}，四个角色（有 endpoint 的才出现）。规则是 engine.endpoint_api_key
+    （与看板世界详情的 _public_settings 同一条）：继承 provider 的按该 provider 此刻的密钥，现算不缓存。default_settings 不带
+    key_set。遍历 info 的 JSON：没有密钥、没有地址。"""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    other_url = "http://10.9.8.8:4343/other-path"
+    providers = {"p1": {"provider": "openai", "model": "m1", "base_url": SECRET_URL, "api_key": SECRET_KEY},
+                 "p2": {"provider": "openai", "model": "e1", "base_url": other_url, "dim": 8},
+                 "p3": {"provider": "openai", "model": "j1", "base_url": other_url}}
+    app = create_app(_cfg(tmp_path, providers=providers,
+                          roles={"extraction": "p1", "embedding": "p2", "chat": "p1", "consolidation": "p3"}),
+                     engine_factory=_stub_factory, idle_close_interval_s=0)
+    with TestClient(app) as client:
+        info = _ok(client.post(f"{API}/info", json={}))
+        assert info["key_set"] == {"extraction": True, "embedding": False, "chat": True, "consolidation": False}
+        assert all("key_set" not in section for section in info["default_settings"].values()
+                   if isinstance(section, dict))
+        for text in _strings(info):
+            for secret in (SECRET_URL, SECRET_KEY, other_url, "10.9.8.7", "10.9.8.8"):
+                assert secret not in text, (secret, text)
+        assert {"base_url", "api_key"}.isdisjoint(set(_strings(info)))
+        providers["p2"]["api_key"] = "sk-later-2"             # 加上密钥：下一次 info 就是 True
+        providers["p3"]["api_key"] = "sk-later-3"
+        providers["p1"].pop("api_key")                        # 删掉密钥：下一次 info 就是 False
+        again = _ok(client.post(f"{API}/info", json={}))["key_set"]
+        assert again == {"extraction": False, "embedding": True, "chat": False, "consolidation": True}
+        assert "sk-later" not in json.dumps(_ok(client.post(f"{API}/info", json={})))
+
+
+def test_info_key_set_leaves_out_unbound_roles(tmp_path):
+    """没有 endpoint 的角色不出现在 key_set 里（这里只绑了抽取；chat 没绑时回退到抽取的 provider，C++ 设置里也是它）。"""
+    providers = {"p1": {"provider": "openai", "model": "m1", "base_url": SECRET_URL, "api_key": SECRET_KEY}}
+    app = create_app(_cfg(tmp_path, providers=providers, roles={"extraction": "p1"}),
+                     engine_factory=_stub_factory, idle_close_interval_s=0)
+    with TestClient(app) as client:
+        info = _ok(client.post(f"{API}/info", json={}))
+        bound = {role for role in ("extraction", "embedding", "chat", "consolidation")
+                 if isinstance(info["default_settings"].get(role), dict)}
+        assert set(info["key_set"]) == bound and "embedding" not in bound and "consolidation" not in bound
+        assert all(info["key_set"].values())
+
+
+def test_info_default_settings_round_trip_through_open_unchanged(svc):
+    """R93 的往返（R101 钉住）：info()["default_settings"] 原样传给 open(settings=...) 回 200，可写、只读都一样；key_set 不在
+    default_settings 里，所以 R35 对客户端设置里 key_set 的拒绝不受影响。"""
+    client, _clock = svc
+    info = _ok(client.post(f"{API}/info", json={}))
+    assert "key_set" in info
+    settings = info["default_settings"]
+    sid = _connect(client)
+    _ok(client.post(f"{API}/admin/create_world", json={"name": "rt", "settings": settings}))
+    _ok(_open(client, sid, world="rt", read_only=True, settings=settings))
+    _ok(_open(client, sid, world="rt", settings=settings))
+    with_key_set = json.loads(json.dumps(settings))
+    with_key_set["extraction"]["key_set"] = True
+    _err(_open(client, _connect(client), world="rt", read_only=True, settings=with_key_set), "invalid_settings")

@@ -197,7 +197,7 @@ rise 同时把对应关系改成「一个模拟世界一个 Starling 世界，�
 - 复制而不是引用：之后改默认世界的设置，已有世界不变（D8）。
 - 只读世界的 `background` 强制全关，调用方给了也忽略，并在返回里说明。
 - 打开已有世界时调用方再给设置：与存储的不同就报 `world_settings_mismatch`，不静默覆盖（rise 把这份配置写进记忆运行时身份）。改设置走单独的管理接口。
-- `info()` 与世界详情报出实际生效的设置，不含密钥，只给 `key_set: bool`。
+- `info()` 与世界详情报出实际生效的设置，不含密钥。`info()` 在 `default_settings` 旁边按角色给出 `key_set: {role: bool}`（只列有端点的角色，`default_settings` 本身不带它，原样传回 `open(settings=...)` 不会被拒，裁定 R101）；世界详情照旧，每个端点段带一个 `key_set: bool`。
 
 ### 8.3 密钥
 
@@ -319,7 +319,7 @@ starling-serve --data-dir D --host 127.0.0.1 --port P [--token-file F]
 
 ```python
 client = starling_client.connect(url, token=..., timeout_s=...)   # 握手时核对协议版本
-client.info()            # {version, commit, protocol, extraction_config, default_settings(不含密钥)}
+client.info()            # {version, commit, protocol, extraction_config, default_settings(不含密钥), key_set}
 
 mem = client.open(world, holder=..., read_only=False, settings=None)   # 返回 RemoteMemory
 # 以句柄的 holder 身份：

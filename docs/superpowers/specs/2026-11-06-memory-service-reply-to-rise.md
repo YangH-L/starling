@@ -111,7 +111,7 @@ mem = client.open(world, holder=holder, settings=settings)   # 原来是 starlin
 - 两次返回的都是先提交那次的 `statement_ids`，被顶替那次自己抽到的结果会丢掉（裁定 R95）；
 - 被顶替的原请求在服务端仍会跑完，期间占着句柄的在途计数，`close(timeout)` 要等它结束。
 
-**设置。** 写法是取 `info()["default_settings"]`，合并 rise 的 overrides，再把整份传给 `create_world(settings=...)` 和 `open(settings=...)`。`open` 比较的是整份设置（两边补齐默认值之后），不是子集，不同就抛 `WorldError("world_settings_mismatch")`（裁定 R93）。继承来的端点地址不参与比较（服务端填进去的，`info` 不给）。
+**设置。** 写法是取 `info()["default_settings"]`，合并 rise 的 overrides，再把整份传给 `create_world(settings=...)` 和 `open(settings=...)`。`open` 比较的是整份设置（两边补齐默认值之后），不是子集，不同就抛 `WorldError("world_settings_mismatch")`（裁定 R93）。继承来的端点地址不参与比较（服务端填进去的，`info` 不给）。`info()["key_set"]` 是 `default_settings` 旁边的一个独立字段，`{角色: bool}`，说明每个绑了端点的角色调用时有没有密钥可用（继承 provider 的看该 provider 此刻的密钥，显式端点看服务进程的 `OPENAI_API_KEY`），只给布尔值、不给密钥；它不在 `default_settings` 里，所以照上面的写法把 `default_settings` 原样传回不会因为它被拒（裁定 R101）。
 
 部署世界要显式关掉后台：`{"background": {"tick_interval_s": 0, "ingest": False, "auto_snapshot": {"on_session": False, "interval_hours": 0}}}`。没给的项从默认世界复制，默认世界的后台是开着的（tick 30 s、摄入开、按时间 24 小时快照），不关的话世界会自己写，摘要会漂移。可回收世界（`reclaimable=True`）不受这条影响，它从不跑后台任务；嵌入由 rise 调 `embed_pending` 驱动（裁定 R68）。
 
