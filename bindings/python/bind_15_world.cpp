@@ -21,7 +21,9 @@
 #include <thread>
 #include <vector>
 
+#include "starling/governance/error_catalog.hpp"
 #include "starling/governance/registry_db.hpp"
+#include "starling/governance/session_table.hpp"
 #include "starling/governance/world_settings.hpp"
 #include "starling/governance/world_store.hpp"
 #include "starling/persistence/connection.hpp"
@@ -207,6 +209,17 @@ void bind_15_world(pybind11::module_& m) {
         return pos == std::string::npos ? text : text.substr(0, pos);
     }, py::arg("exc"));
 
+    // 错误码目录（spec §13.2）：[{code, transient, http_status}]，顺序固定。
+    m.def("error_catalog", [] {
+        py::list out;
+        for (const auto& info : gov::error_catalog()) {
+            py::dict item("code"_a = std::string(info.code), "transient"_a = info.transient,
+                          "http_status"_a = info.http_status);
+            out.append(std::move(item));
+        }
+        return out;
+    });
+
     m.def("world_is_valid_name", &gov::is_valid_world_name, py::arg("name"));
 
     // ---- 注册表 ----
@@ -369,6 +382,15 @@ void bind_15_world(pybind11::module_& m) {
               gov::require_endpoint_unchanged(*parsed.extraction, now_at, role);
           }, py::arg("world_endpoint"), py::arg("current"), py::arg("role"));
 
+    // 裁定 R100 I1：endpoint 同上（settings 里一个 endpoint 段的 dict），key_present 是服务进程环境里有没有 OPENAI_API_KEY
+    // （调用方只传布尔值，不传密钥）。provider_name 为空且 key_present 为假时抛 endpoint_key_missing，规则在 C++
+    // require_endpoint_key。
+    m.def("world_require_endpoint_key",
+          [](const py::dict& endpoint, bool key_present, const std::string& role) {
+              const auto parsed = gov::settings_from_json(from_py(py::dict("extraction"_a = endpoint)));
+              gov::require_endpoint_key(*parsed.extraction, key_present, role);
+          }, py::arg("endpoint"), py::arg("key_present"), py::arg("role"));
+
     // 嵌入 endpoint 从 before 换成 after（各为设置里 embedding 段的 dict，None = 没绑定）时要不要重嵌入（裁定 R58）。
     // 解析走 settings_from_json（字段规则同一份），规则在 C++ embedding_needs_reembed。
     m.def("world_embedding_needs_reembed",
@@ -410,6 +432,15 @@ void bind_15_world(pybind11::module_& m) {
         return to_py(normalized);
     }, py::arg("settings"), py::kw_only(), py::arg("record") = py::none());
 
+    // 客户端 open(settings=…) 的比较（裁定 R78）：stored 是注册表里存着的设置 dict，given 是客户端给的（可能不完整）。两边各经
+    // C++ settings_from_json 补齐默认值再比（settings_equal）；任一边非法时抛 WorldStoreError（invalid_settings 等）。
+    m.def("world_settings_equal", [](const py::dict& stored, const py::dict& given) {
+        const std::string stored_text = from_py(stored);
+        const std::string given_text = from_py(given);
+        const py::gil_scoped_release release;
+        return gov::settings_equal(stored_text, given_text);
+    }, py::arg("stored"), py::arg("given"));
+
     m.def("world_ingest_partition", &gov::ingest_partition, py::arg("is_default"),
           py::arg("tenant"), py::arg("dir_id"));
 
@@ -433,6 +464,20 @@ void bind_15_world(pybind11::module_& m) {
 
     // 租户不变式（spec §2.1）：只读扫一遍库，有别的租户的行抛 world_tenant_mismatch。
     // 2.6GB 的生产库约 90ms，释放 GIL。库文件不存在时直接通过。
+    // 关着的世界的 library 摘要（Task 4.5，list_worlds(with_digest=True)）：只读打开，不写文件；frozen 传
+    // world_read_only_frozen(record, held)（裁定 R36、R41）。库不在或缺 0038 的表时 None。读不出时 snapshot_failed。
+    m.def("world_digest",
+          [](const std::string& db_path, const std::string& tenant, bool frozen) {
+              std::string digest;
+              {
+                  const py::gil_scoped_release release;
+                  digest = gov::world_digest(db_path, tenant,
+                                             frozen ? starling::persistence::ReadOnlyFreeze::Frozen
+                                                    : starling::persistence::ReadOnlyFreeze::Shared);
+              }
+              return text_or_none(digest);
+          }, py::arg("db_path"), py::arg("tenant"), py::kw_only(), py::arg("frozen") = false);
+
     m.def("world_verify_tenant",
           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
           [](const std::string& db_path, const std::string& tenant, bool frozen) {
@@ -631,11 +676,14 @@ void bind_15_world(pybind11::module_& m) {
                                                                                            : "rw";
           }, py::arg("record"), py::arg("for_client_write") = false);
 
-    // 已登记世界的只读连接能不能冻结（裁定 R36，C++ read_only_freeze_for）：record 同 world_decide_open_mode。
-    // True 只在只读打开的世界（只读、种子、可回收）上；Python 把它传给 read_only_uri / open_read_only / world_stats 等的
-    // frozen，自己不判。
+    // 已登记世界的只读连接能不能冻结（裁定 R36、R41、R49 (c)，C++ read_only_freeze_for）：record 同
+    // world_decide_open_mode。True 只在只读打开的世界（只读、种子、可回收）上、且 held_for_write 为 False 时；
+    // held_for_write 传 SessionTable.world_write_held(world, now)（客户端写入期间一律 False）。Python 把结果传给
+    // read_only_uri / open_read_only / world_stats 等的 frozen，自己不判。
+    // 不释放 GIL（审查 M3）：判定是亚微秒级的纯函数（三个 bool），没有 I/O、不加锁、不会阻塞；spec §12 要求释放的是
+    // 会阻塞的调用。读 record 的三个键本身要持 GIL，释放再取回只会更慢。
     m.def("world_read_only_frozen",
-          [](const py::dict& record) {
+          [](const py::dict& record, bool held_for_write) {
               const auto flag = [&record](const char* key) {
                   return record.attr("get")(key, false).cast<bool>();
               };
@@ -643,8 +691,9 @@ void bind_15_world(pybind11::module_& m) {
               rec.seed = flag("seed");
               rec.read_only = flag("read_only");
               rec.reclaimable = flag("reclaimable");
-              return gov::read_only_freeze_for(rec) == starling::persistence::ReadOnlyFreeze::Frozen;
-          }, py::arg("record"));
+              return gov::read_only_freeze_for(rec, held_for_write) ==
+                     starling::persistence::ReadOnlyFreeze::Frozen;
+          }, py::arg("record"), py::arg("held_for_write") = false);
 
     // ---- 分叉、种子与升级种子（spec §6.1、§6.2） ----
     // 规则、校验与错误码全在 C++（world_store.hpp fork_world / upgrade_seed）。opts 见 fork_options_in。
@@ -699,6 +748,78 @@ void bind_15_world(pybind11::module_& m) {
               }
               return fork_out(result);
           }, py::arg("registry"), py::arg("source"), py::arg("new_name"), py::arg("now"));
+
+    // ---- 会话、句柄、写占用、空闲判定与写入准入（spec §11，Task 4.2；本期新增的都在这个区块，裁定 R44） ----
+    // 状态机与规则全在 C++（session_table.hpp、registry_db.hpp require_writable），这里只转发。now_ms 由调用方传
+    // （单调时钟的毫秒），C++ 不读墙钟。SessionTable 的每个方法释放 GIL（spec §12）。错误：world_held /
+    // session_expired / handle_closed / world_read_only 抛 WorldStoreError（带 code）；参数错误抛 ValueError；
+    // 没有配对 call_enter 的 call_exit 抛 RuntimeError（std::logic_error）。
+    py::class_<gov::HandleInfo>(m, "HandleInfo")
+        .def_readonly("session_id", &gov::HandleInfo::session_id)
+        .def_readonly("world", &gov::HandleInfo::world)
+        .def_readonly("holder", &gov::HandleInfo::holder)
+        .def_readonly("read_only", &gov::HandleInfo::read_only);
+
+    using GilFree = py::call_guard<py::gil_scoped_release>;
+    const gov::SessionConfig session_defaults;
+    py::class_<gov::SessionTable>(m, "SessionTable")
+        // 构造只建空表，不做 I/O；pybind11 的工厂构造要在持 GIL 时登记实例，所以这里不释放。
+        .def(py::init([](std::int64_t lease_ms, std::int64_t idle_close_ms) {
+                 return std::make_unique<gov::SessionTable>(
+                     gov::SessionConfig{.lease_ms = lease_ms, .idle_close_ms = idle_close_ms});
+             }),
+             py::kw_only(), py::arg("lease_ms") = session_defaults.lease_ms,
+             py::arg("idle_close_ms") = session_defaults.idle_close_ms)
+        .def_property_readonly("lease_ms", &gov::SessionTable::lease_ms)
+        .def_property_readonly("heartbeat_ms", &gov::SessionTable::heartbeat_ms)
+        .def("connect", &gov::SessionTable::connect, py::arg("now_ms"), GilFree())
+        .def("heartbeat", &gov::SessionTable::heartbeat, py::arg("session_id"), py::arg("now_ms"),
+             GilFree())
+        .def("disconnect", &gov::SessionTable::disconnect, py::arg("session_id"), GilFree())
+        .def("open_handle", &gov::SessionTable::open_handle, py::arg("session_id"),
+             py::arg("world"), py::arg("holder"), py::arg("read_only"), py::arg("now_ms"),
+             GilFree())
+        .def("close_handle", &gov::SessionTable::close_handle, py::arg("handle_id"), GilFree())
+        .def("resolve", &gov::SessionTable::resolve, py::arg("handle_id"), py::arg("now_ms"),
+             GilFree())
+        .def("call_enter", &gov::SessionTable::call_enter, py::arg("handle_id"), py::arg("now_ms"),
+             GilFree())
+        .def("call_exit", &gov::SessionTable::call_exit, py::arg("handle_id"), py::arg("now_ms"),
+             GilFree())
+        .def("in_flight", &gov::SessionTable::in_flight, py::arg("handle_id"), GilFree())
+        .def("expire", &gov::SessionTable::expire, py::arg("now_ms"), GilFree())
+        .def("touch_world", &gov::SessionTable::touch_world, py::arg("world"), py::arg("now_ms"),
+             GilFree())
+        .def("world_has_live_handles", &gov::SessionTable::world_has_live_handles,
+             py::arg("world"), py::arg("now_ms"), GilFree())
+        .def("world_write_held", &gov::SessionTable::world_write_held, py::arg("world"),
+             py::arg("now_ms"), GilFree())
+        .def("world_write_held_by_other", &gov::SessionTable::world_write_held_by_other,
+             py::arg("world"), py::arg("session_id"), py::arg("now_ms"), GilFree())
+        .def("may_close_world", &gov::SessionTable::may_close_world, py::arg("world"),
+             py::arg("is_default"), py::arg("now_ms"), GilFree())
+        // 裁定 R54、R60：删世界之前、在世界锁内的关闭窗口里调；还有活句柄或在途调用时抛 WorldStoreError（world_in_use），
+        // 这时不要删世界。
+        .def("forget_world", &gov::SessionTable::forget_world, py::arg("world"), py::arg("now_ms"),
+             GilFree());
+
+    // 写入准入（裁定 R51，C++ require_writable）：record 同 world_decide_open_mode（另读 name，只用于错误文本）。
+    // held_by_other 传 SessionTable.world_write_held_by_other(world, session_id, now)（看板传 ""）。
+    // 通过返回 None；不通过抛 WorldStoreError（world_held 优先于 world_read_only）。
+    m.def("world_require_writable",
+          [](const py::dict& record, bool for_client_write, bool held_by_other) {
+              const auto flag = [&record](const char* key) {
+                  return record.attr("get")(key, false).cast<bool>();
+              };
+              gov::WorldRecord rec;
+              rec.name = record.attr("get")("name", "").cast<std::string>();
+              rec.seed = flag("seed");
+              rec.read_only = flag("read_only");
+              rec.reclaimable = flag("reclaimable");
+              const py::gil_scoped_release release;
+              gov::require_writable(rec, for_client_write, held_by_other);
+          }, py::arg("record"), py::arg("for_client_write") = false,
+          py::arg("held_by_other") = false);
 }
 
 }  // namespace starling::bindings

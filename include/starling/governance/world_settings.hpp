@@ -70,6 +70,13 @@ WorldSettings settings_from_json(const std::string& text);
 // 序列化：可选字段（max_retries / enable_thinking / 四个 endpoint）未设置时不写出。
 std::string settings_to_json(const WorldSettings& settings);
 
+// 两份设置是否相同（裁定 R78，客户端 open(settings=…) 用）：两边各经 settings_from_json 补齐默认值后逐字段比较，所以键序、
+// 缺省的键与显式给出的默认值都不影响结果。stored_json 是注册表里存着的设置（不是按打开方式算的生效设置）。任一边非法时抛
+// settings_from_json 的错误（invalid_settings 等）。
+// 例外（修复轮 1 F6）：引用 provider 的 endpoint（provider_name 非空）不比 base_url。那是服务端从 provider 表补进来的地址，
+// info() 不给客户端，客户端没法给出同一个值；provider_name、model 等其余字段照比。provider_name 为空的 endpoint 照比地址。
+[[nodiscard]] bool settings_equal(const std::string& stored_json, const std::string& given_json);
+
 // overrides 是部分设置（JSON 对象，只含要覆盖的顶层键与子键）；没给的叶子从 base 复制。
 // 合并本身删不掉键，所以要「解绑一个角色」「清空阈值」时 overrides 给 null（规则同 settings_from_json）：
 // {"extraction": null} 删掉 base 里的 extraction，{"gist_thresholds": null} 把阈值重置为 {}。
@@ -95,6 +102,13 @@ WorldSettings replace_sections(const WorldSettings& base, const std::string& sec
 void require_endpoint_unchanged(const EndpointSettings& world_endpoint,
                                 const std::optional<ProviderEndpoint>& current,
                                 std::string_view role);
+
+// 裁定 R100 I1（spec §8.3）：客户端显式给的端点（provider_name 为空）调用时用服务进程的 OPENAI_API_KEY；key_present 为假
+// （服务环境里没有这个密钥）就抛 endpoint_key_missing。显式端点永远不退回占位（嵌入不用占位向量、抽取不当成「没绑定」）。
+// provider_name 非空（继承 provider，密钥取 provider 表）永不抛：没有密钥时由调用方照旧按没绑定处理（抽取
+// llm_not_configured，看板没配 provider 的默认世界用占位嵌入）。只收「密钥在不在」这个布尔值，不收密钥本身。role 只用于
+// 消息，消息不带地址（裁定 R54）。
+void require_endpoint_key(const EndpointSettings& endpoint, bool key_present, std::string_view role);
 
 // 嵌入 endpoint 从 before 换成 after 时，世界里已有的向量是否作废、要重嵌入（裁定 R58）。向量的空间由嵌入的模型与维度决定，
 // 与地址、密钥、种类无关，所以：after 为空（角色解绑，例如 provider 被删掉）→ false，向量留着（召回降级到重新绑定为止）；

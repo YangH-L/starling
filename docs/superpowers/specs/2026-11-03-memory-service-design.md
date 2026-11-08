@@ -197,7 +197,7 @@ rise 同时把对应关系改成「一个模拟世界一个 Starling 世界，�
 - 复制而不是引用：之后改默认世界的设置，已有世界不变（D8）。
 - 只读世界的 `background` 强制全关，调用方给了也忽略，并在返回里说明。
 - 打开已有世界时调用方再给设置：与存储的不同就报 `world_settings_mismatch`，不静默覆盖（rise 把这份配置写进记忆运行时身份）。改设置走单独的管理接口。
-- `info()` 与世界详情报出实际生效的设置，不含密钥，只给 `key_set: bool`。
+- `info()` 与世界详情报出实际生效的设置，不含密钥。`info()` 在 `default_settings` 旁边按角色给出 `key_set: {role: bool}`（只列有端点的角色，`default_settings` 本身不带它，原样传回 `open(settings=...)` 不会被拒，裁定 R101）；世界详情照旧，每个端点段带一个 `key_set: bool`。
 
 ### 8.3 密钥
 
@@ -247,7 +247,7 @@ starling-serve --data-dir D --host 127.0.0.1 --port P [--token-file F]
 - 打开的触发：客户端 `open`、看板点进一个世界、管理操作需要。
 - 关闭的触发：客户端显式 `close_world`；或 C++ 的空闲判定（没有活句柄、没有在途调用、超过空闲时限，默认 10 分钟，§11）说可以关。默认世界不因空闲关闭。
 - 引擎之间没有共享锁。一个世界在等抽取或嵌入的 HTTP 响应时，其他世界照常读写（GIL 见 §12）。
-- 同一世界内的调用由引擎锁串行化（需求 5.2）。所以同一世界里 holder A 抽取时，holder B 的召回要等。rise 的 rollout 一条一条顺序跑，可以接受；把 `remember_event` 拆成「锁外抽取、锁内提交」（像今天看板的 `remember` 那样）留作以后的优化。
+- 同一世界内的写入由引擎锁串行化（需求 5.2）。`remember_event` 分三段（C++ `remember_event_begin` / `remember_event_extract` / `remember_event_finish`，与看板的 `remember` 同一种写法）：begin（读收据行、占位、补齐、写 engram）与 finish（提交语句与收据）在引擎锁内，抽取在锁外。所以同一世界里 holder A 抽取时，holder B 的召回不用等。同一个 key 的并发调用（例如客户端超时后的重放）由 finish 在事务里重读收据行收敛：行已 committed 就返回 idempotent、不写；行已 abandoned 或被清空就抛 `event_conflict`、不写；仍 pending 才把语句与收据一起提交。
 - 今天 `WorldManager` 的「切换窗口 + 租约归零才换引擎」那一套缩小到单个世界：恢复、关闭、删除一个世界时，只等这个世界的租约归零。
 
 ## 11. 句柄、租约与会话
@@ -319,14 +319,14 @@ starling-serve --data-dir D --host 127.0.0.1 --port P [--token-file F]
 
 ```python
 client = starling_client.connect(url, token=..., timeout_s=...)   # 握手时核对协议版本
-client.info()            # {version, commit, protocol, extraction_config, default_settings(不含密钥)}
+client.info()            # {version, commit, protocol, extraction_config, default_settings(不含密钥), key_set}
 
 mem = client.open(world, holder=..., read_only=False, settings=None)   # 返回 RemoteMemory
 # 以句柄的 holder 身份：
 mem.recall(query, k=..., mode="semantic", strict=True, include_volatile=True)
 mem.remember_event(key, text, interlocutor=..., epoch=...)
 mem.abandon_event(key)
-mem.content_ids(ids)
+mem.content_ids(statement_ids)
 # 作用于整个世界（D5）：
 mem.digest(); mem.pending_events(); mem.next_seq(); mem.embed_pending(now)
 mem.close(timeout=...)
@@ -443,6 +443,6 @@ rise 在第 4 期之后能接上；第 6 期之后 rise 不再负责删世界。
 - **带有 rise 快照的可回收世界不会被自动清理**，rise 删了快照之后才会被清。
 - 世界名：首字符字母或数字，其余 `[A-Za-z0-9._-]`，长度 1–128，区分大小写。
 - `pending_events()` 每项多一个 `holder` 字段，rise 用对应 holder 的句柄去 `abandon_event`。
-- 同一世界内的调用串行化：同一 rollout 世界里训练位抽取时，对手位的召回要等。
+- 召回不等抽取：抽取在引擎锁外进行。同一世界里，召回和 `embed_pending` 在嵌入请求期间持引擎锁，同世界的其他调用会排队；同一个 key 重放时，可能拿到先提交那次的语句。
 - 端点配置：不给就继承服务默认世界的配置（建时复制）；给了的话密钥取服务环境变量 `OPENAI_API_KEY`。继承的 provider 地址被改过就报 `endpoint_changed`。
 - 客户端的安装方式与导入名（§13.3）。rise 的适配器从 `starling.Memory.open(path, agent=...)` 换成 `client.open(world, holder=...)`。

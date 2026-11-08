@@ -23,7 +23,7 @@ from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from starling.dashboard import queries
-from starling.dashboard.routes.world_scope import world_name
+from starling.dashboard.routes.world_scope import WorldHTTPError, world_name
 
 
 async def _world_db(request: Request, world: str = Depends(world_name)):
@@ -43,7 +43,7 @@ async def _world_db(request: Request, world: str = Depends(world_name)):
     try:
         ctx = pool.context(world)
         if not os.path.exists(ctx.db_path):
-            raise HTTPException(status_code=409, detail="world_not_initialized")
+            raise WorldHTTPError("world_not_initialized")
         yield ctx
     finally:
         lease.release()
@@ -217,7 +217,7 @@ def build_inspect_router(require_token) -> APIRouter:
     async def statement(statement_id: str, c=Depends(_world_db)):
         row = queries.statement_by_id(c.db_path, c.tenant, statement_id, frozen=c.frozen)
         if row is None:
-            raise HTTPException(status_code=404, detail="not_found")
+            raise WorldHTTPError("not_found")
         return row
 
     @router.get("/statement_search")
@@ -232,7 +232,7 @@ def build_inspect_router(require_token) -> APIRouter:
         tree = queries.provenance(c.db_path, c.tenant, statement_id,
                                   max_depth=max(1, min(max_depth, 12)), frozen=c.frozen)
         if tree is None:
-            raise HTTPException(status_code=404, detail="not_found")
+            raise WorldHTTPError("not_found")
         return tree
 
     @router.get("/cascade_preview/{statement_id}")
@@ -243,7 +243,7 @@ def build_inspect_router(require_token) -> APIRouter:
             queries.cascade_preview, c.db_path, c.tenant, statement_id,
             max_depth=max(1, min(max_depth, 12)), frozen=c.frozen))
         if preview is None:
-            raise HTTPException(status_code=404, detail="not_found")
+            raise WorldHTTPError("not_found")
         return preview
 
     @router.get("/runtime_health")

@@ -191,6 +191,9 @@ target_sources(starling_core PRIVATE
     src/governance/registry_db.cpp
     src/governance/registry_import.cpp
     src/governance/world_settings.cpp
+    src/governance/error_catalog.cpp
+    src/governance/session_table.cpp
+    src/build_info.cpp
 )
 target_compile_options(starling_core PRIVATE ${STARLING_WARNING_FLAGS})
 if(TARGET SQLite3::SQLite3)
@@ -249,6 +252,22 @@ file(WRITE "${STARLING_MIGRATIONS_INC}"
     "};\n"
     "}\n")
 target_include_directories(starling_core PRIVATE "${CMAKE_BINARY_DIR}/generated")
+
+# 构建信息（spec §13.4，裁定 R88）：每次构建都取一次 git 提交，写进 generated/starling/build_commit.inc（不变不重写），
+# src/build_info.cpp 包含它。配置时先生成一份，首次构建的依赖扫描就能找到它。
+find_package(Git QUIET)
+set(STARLING_BUILD_COMMIT_INC "${CMAKE_BINARY_DIR}/generated/starling/build_commit.inc")
+set(_starling_build_info_cmd
+    "${CMAKE_COMMAND}" "-DSTARLING_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+    "-DSTARLING_BUILD_INFO_OUT=${STARLING_BUILD_COMMIT_INC}" "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+    -P "${PROJECT_SOURCE_DIR}/cmake/StarlingBuildInfo.cmake")
+execute_process(COMMAND ${_starling_build_info_cmd})
+add_custom_target(starling_build_info ALL
+    COMMAND ${_starling_build_info_cmd}
+    BYPRODUCTS "${STARLING_BUILD_COMMIT_INC}"
+    COMMENT "Recording the git commit in build_commit.inc"
+    VERBATIM)
+add_dependencies(starling_core starling_build_info)
 
 # Testing-only translation unit lives in its own target so prod can omit it.
 # Links starling_core because mark_consolidated drives the same OutboxWriter +

@@ -79,6 +79,22 @@ starling::extractor::TokenSink make_token_sink(const py::object& on_token) {
     return sink;
 }
 
+// remember_event 一族返回给 Python 的 dict(与 memory_remember_event 的键一致)。持 GIL 时调用。
+py::dict remember_outcome_dict(const starling::memoryops::RememberOutcome& result) {
+    using namespace pybind11::literals;
+    return py::dict("engram_ref"_a = result.engram_ref,
+                    "statement_ids"_a = result.statement_ids,
+                    "outcome"_a = result.outcome,
+                    "extraction_failed"_a = result.extraction_failed,
+                    "failure_category"_a = result.failure_category,
+                    "failure_detail"_a = result.failure_detail,
+                    "catalog_version"_a = result.catalog_version,
+                    "source_preserved"_a = result.source_preserved,
+                    "structured_claims_persisted"_a = result.structured_claims_persisted,
+                    "accepted_by_predicate"_a = result.accepted_by_predicate,
+                    "rejected_by_predicate"_a = result.rejected_by_predicate);
+}
+
 }  // namespace
 
 void bind_13_memory_ops(pybind11::module_& m) {
@@ -772,6 +788,74 @@ void bind_13_memory_ops(pybind11::module_& m) {
           py::arg("tenant_id"), py::arg("holder_id"), py::arg("interlocutor"),
           py::arg("adapter_name"), py::arg("source_prefix"), py::arg("key"),
           py::arg("text"), py::arg("epoch_iso"),
+          py::arg("policy") = starling::extractor::ValidationPolicy{});
+
+    // remember_event 的三段(修复轮 1,F1):服务端只在 begin 与 finish 持引擎锁,extract(纯 LLM)在锁外。
+    // RememberEventBegun 是不透明句柄,只在三段之间传递;done 不为 None 时(committed 重入)后两段不用调。
+    // 三个调用都释放 GIL;Python 对象在释放块之外构造。
+    py::class_<starling::memoryops::RememberEventBegun>(m, "RememberEventBegun")
+        .def_property_readonly("done", [](const starling::memoryops::RememberEventBegun& begun) {
+            return begun.done ? py::object(remember_outcome_dict(*begun.done)) : py::object(py::none());
+        })
+        .def_property_readonly("needs_extraction",
+                               &starling::memoryops::RememberEventBegun::needs_extraction);
+
+    m.def("memory_remember_event_begin",
+          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+          [](starling::persistence::SqliteAdapter& adapter,
+             const std::string& tenant_id, const std::string& holder_id,
+             const std::string& interlocutor, const std::string& adapter_name,
+             const std::string& source_prefix, const std::string& key,
+             const std::string& text, const std::string& epoch_iso) {
+              starling::memoryops::RememberParams base;
+              base.tenant_id     = tenant_id;
+              base.holder_id     = holder_id;
+              base.interlocutor  = interlocutor;
+              base.adapter_name  = adapter_name;
+              base.source_prefix = source_prefix;
+              const py::gil_scoped_release release;
+              return starling::memoryops::remember_event_begin(adapter, base, key, text, epoch_iso);
+          },
+          py::arg("adapter"), py::arg("tenant_id"), py::arg("holder_id"), py::arg("interlocutor"),
+          py::arg("adapter_name"), py::arg("source_prefix"), py::arg("key"), py::arg("text"),
+          py::arg("epoch_iso"));
+
+    m.def("memory_remember_event_extract",
+          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+          [](starling::persistence::SqliteAdapter& adapter,
+             starling::extractor::LLMAdapter& llm,
+             const starling::memoryops::RememberEventBegun& begun,
+             const std::string& belief_prompt,
+             const std::string& episodic_prompt,
+             const std::string& general_fact_prompt,
+             const starling::extractor::ValidationPolicy& policy) {
+              const starling::memoryops::RememberPrompts prompts{
+                  .belief = belief_prompt,
+                  .episodic = episodic_prompt,
+                  .general_fact = general_fact_prompt,
+              };
+              const py::gil_scoped_release release;
+              return starling::memoryops::remember_event_extract(adapter, llm, begun, prompts, policy);
+          },
+          py::arg("adapter"), py::arg("llm"), py::arg("begun"), py::arg("belief_prompt"),
+          py::arg("episodic_prompt"), py::arg("general_fact_prompt"),
+          py::arg("policy") = starling::extractor::ValidationPolicy{});
+
+    m.def("memory_remember_event_finish",
+          [](starling::persistence::SqliteAdapter& adapter,
+             starling::extractor::LLMAdapter& llm,
+             const starling::memoryops::RememberEventBegun& begun,
+             const starling::memoryops::RememberLlmBundle& extracted,
+             const starling::extractor::ValidationPolicy& policy) {
+              starling::memoryops::RememberOutcome result;
+              {
+                  const py::gil_scoped_release release;
+                  result = starling::memoryops::remember_event_finish(adapter, llm, begun, extracted,
+                                                                      policy);
+              }
+              return remember_outcome_dict(result);
+          },
+          py::arg("adapter"), py::arg("llm"), py::arg("begun"), py::arg("extracted"),
           py::arg("policy") = starling::extractor::ValidationPolicy{});
 
     // 放弃一个 key(events 表,迁移 0038):一个短本地事务,无网络;C++ 调用期间释放 GIL。

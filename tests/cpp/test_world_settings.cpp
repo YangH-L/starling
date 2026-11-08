@@ -352,6 +352,29 @@ TEST(WorldSettings, EndpointChangedWhenTheProviderWasDeleted) {
               "endpoint_changed");
 }
 
+// 裁定 R100 I1（spec §8.3）：显式端点（provider_name 为空）没有服务密钥 → endpoint_key_missing；有密钥，或继承 provider 的
+// 端点（不论有没有密钥）都不抛。消息点名角色、不带地址。
+TEST(WorldSettings, EndpointKeyMissingOnlyForAnExplicitEndpointWithoutTheServiceKey) {
+    EndpointSettings explicit_ep;
+    explicit_ep.provider = "openai";
+    explicit_ep.base_url = "http://client.example/v1";
+    EXPECT_EQ(error_code([&] { require_endpoint_key(explicit_ep, false, "embedding"); }),
+              "endpoint_key_missing");
+    EXPECT_NO_THROW(require_endpoint_key(explicit_ep, true, "embedding"));
+    EndpointSettings inherited = explicit_ep;
+    inherited.provider_name = "p";
+    EXPECT_NO_THROW(require_endpoint_key(inherited, false, "extraction"));
+    EXPECT_NO_THROW(require_endpoint_key(inherited, true, "extraction"));
+    try {
+        require_endpoint_key(explicit_ep, false, "extraction");
+        ADD_FAILURE() << "no throw";
+    } catch (const WorldStoreError& err) {
+        const std::string text = err.what();
+        EXPECT_EQ(text.find("example"), std::string::npos) << text;
+        EXPECT_NE(text.find("extraction"), std::string::npos) << text;
+    }
+}
+
 // 裁定 R58：向量只在嵌入的模型或维度变了时作废；只换地址、种类不重嵌入；解绑不重嵌入。
 TEST(WorldSettings, EmbeddingNeedsReembedOnlyWhenModelOrDimChanges) {
     EndpointSettings before;
@@ -405,6 +428,60 @@ TEST(WorldSettings, IngestPartition) {
     // 与 Python quote(safe='') 逐字节一致
     EXPECT_EQ(ingest_partition(true, "租户", "x"), "tenant-%E7%A7%9F%E6%88%B7");
     EXPECT_EQ(ingest_partition(true, "a b~._-\xC3\xA9/", "x"), "tenant-a%20b~._-%C3%A9%2F");
+}
+
+// 裁定 R78：open(settings=…) 的比较。两边先经 settings_from_json 补齐默认值再比，所以键序、缺省的键、显式给出的默认值
+// 都不影响结果；比的是存着的设置（调用方传注册表里的 settings_json），不是生效的。
+TEST(WorldSettings, SettingsEqualComparesAfterFillingDefaults) {
+    WorldSettings stored;
+    stored.extraction = make_endpoint("x");
+    stored.gist_thresholds = {{"min_holders", 3.0}};
+    const std::string stored_json = settings_to_json(stored);
+    EXPECT_TRUE(settings_equal(stored_json, stored_json));
+    EXPECT_TRUE(settings_equal("{}", "{}"));
+    EXPECT_TRUE(settings_equal("{}", R"({"vector_backend": "sqlite", "background": {"ingest": true}})"));
+    EXPECT_TRUE(settings_equal(R"({"source_lane": {"dim": 1024, "enabled": true}})",
+                               R"({"source_lane": {"enabled": true, "dim": 1024}})"));
+    EXPECT_FALSE(settings_equal("{}", R"({"background": {"ingest": false}})"));
+    EXPECT_FALSE(settings_equal(stored_json, "{}"));
+    WorldSettings other = stored;
+    other.extraction->model = "model-y";
+    EXPECT_FALSE(settings_equal(stored_json, settings_to_json(other)));
+}
+
+// 修复轮 1 F6：引用 provider 的 endpoint（provider_name 非空）的 base_url 是服务端从 provider 表补进来的，客户端看不到
+// （info 去掉了地址），比较时不看它；model 等其他字段照比。客户端显式给的 endpoint（provider_name 为空）的 base_url 是客户端
+// 自己写的，照比。
+TEST(WorldSettings, SettingsEqualIgnoresTheInheritedBaseUrlOnly) {
+    WorldSettings stored;
+    stored.extraction = make_endpoint("x");           // provider_name "prov-x"、base_url "http://x"
+    const std::string stored_json = settings_to_json(stored);
+    WorldSettings no_url = stored;
+    no_url.extraction->base_url.clear();
+    EXPECT_TRUE(settings_equal(stored_json, settings_to_json(no_url)));
+    WorldSettings other_url = stored;
+    other_url.extraction->base_url = "http://elsewhere";
+    EXPECT_TRUE(settings_equal(stored_json, settings_to_json(other_url)));
+    WorldSettings other_model = no_url;
+    other_model.extraction->model = "model-y";
+    EXPECT_FALSE(settings_equal(stored_json, settings_to_json(other_model)));
+    WorldSettings other_provider = no_url;
+    other_provider.extraction->provider_name = "prov-y";
+    EXPECT_FALSE(settings_equal(stored_json, settings_to_json(other_provider)));
+
+    WorldSettings explicit_ep;
+    explicit_ep.embedding = make_endpoint("e");
+    explicit_ep.embedding->provider_name.clear();     // 客户端显式给的端点
+    const std::string explicit_json = settings_to_json(explicit_ep);
+    WorldSettings explicit_other = explicit_ep;
+    explicit_other.embedding->base_url = "http://elsewhere";
+    EXPECT_FALSE(settings_equal(explicit_json, settings_to_json(explicit_other)));
+}
+
+TEST(WorldSettings, SettingsEqualRejectsInvalidGivenSettings) {
+    EXPECT_EQ(error_code([] { (void)settings_equal("{}", R"({"api_key": "k"})"); }),
+              "invalid_settings");
+    EXPECT_EQ(error_code([] { (void)settings_equal("{}", "not json"); }), "invalid_settings");
 }
 
 }  // namespace

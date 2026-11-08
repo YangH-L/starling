@@ -1,0 +1,2 @@
+include build_info_hook.py
+exclude starling_client/_build_info.py

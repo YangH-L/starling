@@ -49,13 +49,23 @@ enum class OpenMode : std::uint8_t { ReadWrite, ReadOnly };
 // 看板打开一个世界（for_client_write=false）：read_only（含种子）或 reclaimable（rollout 世界、验证分叉）
 // → ReadOnly，不跑迁移、不起后台线程、拒绝写入；其余（部署世界、用户建的世界、默认世界）→ ReadWrite。
 // 客户端为写入而打开（for_client_write=true，第 4 期的会话句柄用）：可回收世界正是 rise 写入的地方，
-// 只有 read_only → ReadOnly。第 4 期在这里加「被别的会话占用写入」一维。
+// 只有 read_only → ReadOnly。纯函数，只回答「引擎怎么打开」，不看会话占用；「被别的会话占用写入」那一维
+// 在 require_writable（裁定 R51）。
 [[nodiscard]] OpenMode decide_open_mode(const WorldRecord& rec, bool for_client_write);
 
-// 已登记世界的只读连接能不能冻结（裁定 R36）：decide_open_mode(rec, false) 为 ReadOnly（只读世界、种子、可回收
-// 世界）时 Frozen，因为看板从不对它开写连接；其余（可写世界，不论此刻开没开着、持没持世界锁）一律 Shared。
-// Python 经 _core.world_read_only_frozen(record) 取这个判定，自己不算。
-[[nodiscard]] persistence::ReadOnlyFreeze read_only_freeze_for(const WorldRecord& rec);
+// 写入准入（spec §11，裁定 R51）：held_by_other（这个世界被别的客户端会话占用写入，取自
+// SessionTable::world_write_held_by_other）为真时抛 world_held；否则 decide_open_mode(rec, for_client_write) 为
+// ReadOnly 时抛 world_read_only；都不是就通过。看板写入（for_client_write=false）写一个被客户端占用的世界
+// 得到 world_held，不论它是不是可回收世界。两个客户端抢同一个世界的写入由 SessionTable::open_handle 抛 world_held。
+void require_writable(const WorldRecord& rec, bool for_client_write, bool held_by_other);
+
+// 已登记世界的只读连接能不能冻结（裁定 R36、R41、R49 (c)）：decide_open_mode(rec, false) 为 ReadOnly（只读世界、
+// 种子、可回收世界）且 !held_for_write 时 Frozen，因为这时没有写连接；其余一律 Shared。held_for_write 是「此刻
+// 有客户端会话持有这个世界的活可写句柄」（SessionTable::world_write_held）：可回收世界在客户端写入期间不能用
+// immutable 连接，否则读到撕裂的数据；种子不该有写者，传 true 时同样保守地给 Shared。
+// Python 经 _core.world_read_only_frozen(record, held_for_write) 取这个判定，自己不算。
+[[nodiscard]] persistence::ReadOnlyFreeze read_only_freeze_for(const WorldRecord& rec,
+                                                              bool held_for_write = false);
 
 // 一个世界看板打开时实际生效的设置（裁定 R33，R22 M4）：settings_from_json(rec.settings_json) 补齐默认值；
 // decide_open_mode(rec, false) 为 ReadOnly（只读世界、种子、可回收世界）时 background 全关（与 merge_settings 的只读

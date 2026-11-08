@@ -310,7 +310,8 @@ def test_routes_non_domain_exception_is_json_500_internal_error(tmp_path, monkey
     with caplog.at_level("ERROR"):
         r = client.post("/api/worlds/default/snapshots", json={})
     assert r.status_code == 500 and r.headers["content-type"].startswith("application/json")
-    assert r.json() == {"detail": "internal_error"}            # 不把异常文本（含路径）泄给客户端
+    # 不把异常文本（含路径）泄给客户端；最后修复波 A6：码表的错误体，detail 不变。
+    assert r.json() == {"code": "internal_error", "transient": False, "detail": "internal_error"}
     assert "disk exploded" in caplog.text                       # 服务端日志里有
     app.state.pool.close_all()
 
@@ -539,7 +540,7 @@ def test_first_open_refuses_a_world_with_foreign_tenant_rows(tmp_path):
     for method, path, body in (("post", "/api/w/sim-1/tick", {}),
                                ("post", "/api/w/sim-1/remember", {"text": "x"})):
         r = client.request(method, path, json=body)
-        assert (r.status_code, r.json()) == (409, {"detail": "world_tenant_mismatch"}), path
+        assert (r.status_code, r.json()) == (409, {"code": "world_tenant_mismatch", "transient": False, "detail": "world_tenant_mismatch"}), path
     assert built == [] and "sim-1" not in pool.open_worlds()
     assert client.post("/api/tick", json={}).status_code == 200      # 默认世界照常
     pool.close_all()

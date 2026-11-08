@@ -97,7 +97,7 @@ def test_unknown_world_404(client):
                                ("post", "/api/w/nope/tick", {})):
         resp = client.request(method, path, json=body)
         assert resp.status_code == 404, (path, resp.text)
-        assert resp.json() == {"detail": "world_not_found"}
+        assert resp.json() == {"code": "world_not_found", "transient": False, "detail": "world_not_found"}
     assert "nope" not in pool.open_worlds()
 
 
@@ -133,9 +133,9 @@ def test_world_errors_map_to_http_codes(client, monkeypatch):
     try:
         for path in ("/api/w/w1/statements", "/api/w/w1/runtime_health"):
             resp = client.get(path)
-            assert (resp.status_code, resp.json()) == (503, {"detail": "world_busy"}), path
+            assert (resp.status_code, resp.json()) == (503, {"code": "world_busy", "transient": True, "detail": "world_busy"}), path
         resp = client.post("/api/w/w1/remember", json={"text": "x"})
-        assert (resp.status_code, resp.json()) == (503, {"detail": "world_busy"})
+        assert (resp.status_code, resp.json()) == (503, {"code": "world_busy", "transient": True, "detail": "world_busy"})
     finally:
         with pool._lock:
             pool._closing.discard("w1")
@@ -149,7 +149,7 @@ def test_world_errors_map_to_http_codes(client, monkeypatch):
 
     monkeypatch.setattr(DashboardEngine, "_require_endpoint_unchanged", changed)
     resp = client.post("/api/w/w1/remember", json={"text": "x"})
-    assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"})
+    assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"})
 
 
 def test_new_world_reads_as_empty_right_after_creation(client):
@@ -172,7 +172,9 @@ def test_inspecting_a_world_whose_database_is_missing(client):
     rec = pool.create_world("gone", "")
     os.remove(rec["db_path"])
     resp = client.get("/api/w/gone/statements")
-    assert (resp.status_code, resp.json()) == (409, {"detail": "world_not_initialized"})
+    # 最后修复波 A6（裁定 R48）：码表的错误体，detail 不变（前端读 detail）。
+    assert (resp.status_code, resp.json()) == (409, {"code": "world_not_initialized", "transient": False,
+                                                     "detail": "world_not_initialized"})
     assert "gone" not in pool.open_worlds()
     assert not os.path.exists(rec["db_path"])
 
@@ -432,7 +434,7 @@ def test_list_worlds_filters_and_pages(client):
     # 分页参数由 C++ 校验（limit 1–500、offset >= 0）。
     for params in ({"limit": 0}, {"limit": 501}, {"offset": -1}):
         resp = client.get("/api/worlds", params=params)
-        assert (resp.status_code, resp.json()) == (400, {"detail": "invalid_world_query"}), params
+        assert (resp.status_code, resp.json()) == (400, {"code": "invalid_world_query", "transient": False, "detail": "invalid_world_query"}), params
     # 行里有 open / holders / last_write_at；开着的世界取现读的计数。
     _remember(client, "/api/w/r1-0")
     rows = {w["name"]: w for w in client.get("/api/worlds",
@@ -491,12 +493,12 @@ def test_settings_put_rejects_key_set_anywhere(client):
     for body in ({"key_set": True}, {"extraction": {"model": "m", "key_set": False}},
                  {"gist_thresholds": {"key_set": 1}}):
         resp = client.put("/api/worlds/w1/settings", json=body)
-        assert (resp.status_code, resp.json()) == (400, {"detail": "invalid_settings"}), body
+        assert (resp.status_code, resp.json()) == (400, {"code": "invalid_settings", "transient": False, "detail": "invalid_settings"}), body
     resp = client.put("/api/worlds/w1/settings", json={"nope": 1})          # C++ 拒未知键
-    assert (resp.status_code, resp.json()) == (400, {"detail": "invalid_settings"})
+    assert (resp.status_code, resp.json()) == (400, {"code": "invalid_settings", "transient": False, "detail": "invalid_settings"})
     assert client.get("/api/worlds/w1").json()["settings"] == before
     resp = client.put("/api/worlds/nope/settings", json={})
-    assert (resp.status_code, resp.json()) == (404, {"detail": "world_not_found"})
+    assert (resp.status_code, resp.json()) == (404, {"code": "world_not_found", "transient": False, "detail": "world_not_found"})
 
 
 def test_settings_put_on_an_open_world_rebuilds_its_adapters(client, monkeypatch):
@@ -547,7 +549,7 @@ def test_settings_put_on_the_default_world_takes_only_background(client):
     for body in ({"extraction": {"model": "m2"}}, {"gist_thresholds": {"min_holders": 2}},
                  {"background": {"tick_interval_s": 5.0}, "source_lane": {"k_source": 3}}):
         resp = client.put("/api/worlds/default/settings", json=body)
-        assert (resp.status_code, resp.json()) == (400, {"detail": "invalid_settings"}), body
+        assert (resp.status_code, resp.json()) == (400, {"code": "invalid_settings", "transient": False, "detail": "invalid_settings"}), body
     assert client.get("/api/worlds/default").json()["settings"] == before
 
 
@@ -567,9 +569,9 @@ def test_close_world_route(client):
     assert _statement_ids(client, "/api/w/w1") == written["statement_ids"]
     assert client.post("/api/worlds/w1/close").json() == {"closed": "w1"}   # 没开着：照样 200
     resp = client.post("/api/worlds/default/close")
-    assert (resp.status_code, resp.json()) == (409, {"detail": "world_protected"})
+    assert (resp.status_code, resp.json()) == (409, {"code": "world_protected", "transient": False, "detail": "world_protected"})
     resp = client.post("/api/worlds/nope/close")
-    assert (resp.status_code, resp.json()) == (404, {"detail": "world_not_found"})
+    assert (resp.status_code, resp.json()) == (404, {"code": "world_not_found", "transient": False, "detail": "world_not_found"})
     _remember(client, "/api/w/w1", "Carol owns billing")
     assert "w1" in pool.open_worlds()
 
@@ -583,7 +585,7 @@ def test_world_detail_reports_sizes_and_effective_settings(client):
     assert detail["statements"] == 1 and detail["open"] is True
     assert detail["settings"]["vector_backend"] == "sqlite"
     resp = client.get("/api/worlds/nope")
-    assert (resp.status_code, resp.json()) == (404, {"detail": "world_not_found"})
+    assert (resp.status_code, resp.json()) == (404, {"code": "world_not_found", "transient": False, "detail": "world_not_found"})
 
 
 def test_create_world_with_labels_settings_and_legacy_auto_snapshot(client):
@@ -601,7 +603,7 @@ def test_create_world_with_labels_settings_and_legacy_auto_snapshot(client):
     for body in ({"name": "w2", "settings": {"key_set": True}},
                  {"name": "w2", "settings": {"bogus": 1}}):
         resp = client.post("/api/worlds", json=body)
-        assert (resp.status_code, resp.json()) == (400, {"detail": "invalid_settings"}), body
+        assert (resp.status_code, resp.json()) == (400, {"code": "invalid_settings", "transient": False, "detail": "invalid_settings"}), body
     assert client.get("/api/worlds/w2").status_code == 404
 
 
@@ -620,7 +622,7 @@ def test_first_build_of_a_world_with_foreign_tenant_rows_is_refused(client):
     con.commit()
     con.close()
     resp = client.post("/api/w/w1/remember", json={"text": "x"})
-    assert (resp.status_code, resp.json()) == (409, {"detail": "world_tenant_mismatch"})
+    assert (resp.status_code, resp.json()) == (409, {"code": "world_tenant_mismatch", "transient": False, "detail": "world_tenant_mismatch"})
     assert "w1" not in pool.open_worlds() and pool._leaked == []
     # 检视（只读、不建引擎）照常；默认世界不核对（与旧的启动时一致）。
     assert client.get("/api/w/w1/statements").status_code == 200
@@ -679,7 +681,7 @@ def test_put_settings_cannot_redirect_an_inherited_endpoint(tmp_path, monkeypatc
                      {"chat": {"provider_name": "p", "base_url": "http://evil.example",
                                "provider": "openai", "model": "m"}}):
             resp = client.put("/api/worlds/w1/settings", json=body)
-            assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), body
+            assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"}), body
         assert pool.registry.get("w1")["settings"] == before
         assert built == [], "用存着的密钥建了指向新地址的适配器"
         assert _vector_rows(db) == vectors
@@ -707,13 +709,13 @@ def test_fork_with_settings_cannot_point_an_inherited_endpoint_elsewhere(tmp_pat
         for body in ({"new_name": "f1", "settings": {"embedding": {"base_url": "http://evil.example"}}},
                      {"new_name": "f1", "settings": {"extraction": {"base_url": "http://evil.example"}}}):
             resp = client.post("/api/worlds/w1/fork", json=body)
-            assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), body
+            assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"}), body
         assert client.get("/api/worlds/f1").status_code == 404
         assert set(os.listdir(worlds_root)) == dirs
         pool.close_world("w1")                                       # 关着的来源走 world_fork，同样核对
         resp = client.post("/api/worlds/w1/fork", json={
             "new_name": "f1", "settings": {"embedding": {"base_url": "http://evil.example"}}})
-        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"})
+        assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"})
         assert set(os.listdir(worlds_root)) == dirs
         resp = client.post("/api/worlds/w1/fork", json={"new_name": "f1",
                                                         "settings": {"source_lane": {"k_source": 9}}})
@@ -729,7 +731,7 @@ def test_create_world_cannot_point_an_inherited_endpoint_elsewhere(tmp_path, mon
                      {"name": "w1", "settings": {"extraction": {"base_url": "http://evil.example"}},
                       "auto_snapshot": {"on_session": True, "interval_hours": 0}}):
             resp = client.post("/api/worlds", json=body)
-            assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), body
+            assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"}), body
         assert client.get("/api/worlds/w1").status_code == 404
         assert [w["name"] for w in client.get("/api/worlds").json()["worlds"]] == ["default"]
         resp = client.post("/api/worlds", json={"name": "w1",
@@ -1016,7 +1018,7 @@ def test_create_racing_a_config_bind_never_stores_a_provider_name_at_the_client_
             pool._registry = reg
         # 插入点是确定的（同步一定落在 C++ 合并之前），所以结果也是确定的：叶合并叠出 provider_name=p、
         # base_url=客户端地址，C++ 在同一次持锁内核对出来，拒绝。
-        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), resp.text
+        assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"}), resp.text
         assert client.get("/api/worlds/w1").status_code == 404
         assert all(b != ("http://evil.example", "sk-secret-123") for b in built)
 
@@ -1125,7 +1127,7 @@ def test_converse_with_a_provider_still_checks_the_worlds_own_endpoints(tmp_path
         cfg.providers["p"]["base_url"] = "http://h2.example"      # p 挪了；w2 记的还是 h.example
         for body in ({"message": "hi"}, {"message": "hi", "provider": "q"}):
             r = client.post("/api/w/w2/converse", json=body)
-            assert (r.status_code, r.json()) == (409, {"detail": "endpoint_changed"}), body
+            assert (r.status_code, r.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"}), body
             frame = _ws_converse(client, {**body, "world": "w2"})
             assert frame == {"type": "error", "error": "endpoint_changed"}, (body, frame)
         assert used == [], "回合末的抽取用到了建在 p 旧地址的适配器"
@@ -1204,7 +1206,7 @@ def test_kind_change_with_an_empty_base_url_refuses_the_inherited_endpoint(tmp_p
         assert client.app.state.config.providers["p"]["base_url"] == ""
         built.clear()                                   # 默认世界的热换已在上面完成
         resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 2"})
-        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), resp.text
+        assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"}), resp.text
         assert all(key != "sk-new" for _kind, _url, key in built), built
         # 默认世界跟着 config 走：按新种类、新密钥照常写。
         assert client.post("/api/remember", json={"text": "Carol owns billing"}).status_code == 200
@@ -1300,7 +1302,7 @@ def test_config_save_racing_a_key_rotation_rebuild_never_pairs_the_old_kind_with
         assert all(key != "sk-new" for _kind, _url, key in built), built
         assert all(build == ("openai", "http://h.example", "sk-mid") for build in built), built
         resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 3"})
-        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"}), resp.text
+        assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"}), resp.text
         assert all(key != "sk-new" for _kind, _url, key in built), built
 
 
@@ -1339,7 +1341,7 @@ def test_reconfirm_endpoints_repairs_a_world_after_a_provider_address_change(tmp
         resp = client.post("/api/config", json={"providers": {"p": {"base_url": "http://h2.example"}}})
         assert resp.status_code == 200, resp.text
         resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 2"})
-        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"})
+        assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"})
         built.clear()
         resp = client.post("/api/worlds/w1/settings/reconfirm")
         assert resp.status_code == 200, resp.text
@@ -1355,9 +1357,9 @@ def test_reconfirm_endpoints_repairs_a_world_after_a_provider_address_change(tmp
         assert resp.status_code == 200, resp.text
         assert built and all(url == "http://h2.example" for _kind, url, _key in built), built
         resp = client.post("/api/worlds/default/settings/reconfirm")
-        assert (resp.status_code, resp.json()) == (400, {"detail": "invalid_settings"})
+        assert (resp.status_code, resp.json()) == (400, {"code": "invalid_settings", "transient": False, "detail": "invalid_settings"})
         resp = client.post("/api/worlds/nope/settings/reconfirm")
-        assert (resp.status_code, resp.json()) == (404, {"detail": "world_not_found"})
+        assert (resp.status_code, resp.json()) == (404, {"code": "world_not_found", "transient": False, "detail": "world_not_found"})
 
 
 def test_reconfirm_unbinds_a_role_whose_provider_was_deleted(tmp_path, monkeypatch):
@@ -1371,7 +1373,7 @@ def test_reconfirm_unbinds_a_role_whose_provider_was_deleted(tmp_path, monkeypat
         assert client.post("/api/w/w1/remember", json={"text": "Bob owns auth"}).status_code == 200
         assert client.delete("/api/config/provider/p").status_code == 200
         resp = client.post("/api/w/w1/remember", json={"text": "Bob owns auth 2"})
-        assert (resp.status_code, resp.json()) == (409, {"detail": "endpoint_changed"})
+        assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_changed", "transient": False, "detail": "endpoint_changed"})
         assert _pool(client).registry.get("w1")["settings"]["extraction"]["provider_name"] == "p"
         resp = client.post("/api/worlds/w1/settings/reconfirm")
         assert resp.status_code == 200, resp.text

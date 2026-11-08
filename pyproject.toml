@@ -11,6 +11,9 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 
+[project.scripts]
+starling-serve = "starling.service.serve:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-mock>=3.12", "jsonschema>=4.26"]
 dashboard = [

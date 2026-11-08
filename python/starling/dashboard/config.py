@@ -43,6 +43,9 @@ _SERIALIZABLE = (
     "source_lane_model", "source_lane_dim", "source_lane_k_source",
     "source_lane_chunk_byte_budget",
 )
+# starling-serve 不从 D/starling.json 取的键（load_service）：路径都在 D 之下，token 与监听地址来自命令行。
+_SERVICE_IGNORED = frozenset({"db_path", "ingest_spool_path", "vector_store_path", "token", "host",
+                              "port"})
 
 
 @dataclass
@@ -83,6 +86,10 @@ class DashboardConfig:
     source_lane_k_source: int = 30                # 500K 扫描选定（k/预算耦合）
     source_lane_chunk_byte_budget: int = 32000
     config_path: str = ""  # not serialized; where load()/save() persist
+    # 以下两项不序列化，只由 load_service 设（starling-serve，spec §10.1）：data_root 非空时就是数据目录 D
+    # （data_dir 不再看 STARLING_DATA_DIR）；persist_token 为 False 时 save() 不写 token。
+    data_root: str = ""
+    persist_token: bool = True
 
     # ----- role → provider resolution -----
     def resolve_role(self, role: str) -> dict | None:
@@ -147,17 +154,46 @@ class DashboardConfig:
             cfg.save()
         return cfg
 
+    @classmethod
+    def load_service(cls, data_dir: str, token: str) -> "DashboardConfig":
+        """starling-serve 的配置（spec §10.1）：所有路径都在数据目录 D 之下，不读 ~/.starling、不看环境变量里的路径。
+
+        默认值 → D/starling.json（可以没有；旧格式照常迁移）→ 没有抽取 provider 时从 OPENAI_* 补一个（与 load 同一条
+        规则）。文件里的路径键（db_path、ingest_spool_path、vector_store_path）与 token、host、port 不用：默认世界的库是
+        D/dashboard.db，摄入目录 D/ingest-spool，zvec 的向量目录 D/vectors；token 由调用方给（--token-file 或
+        STARLING_SERVICE_TOKEN），save() 从不写它；host、port 取命令行。STARLING_DASH_* 环境变量一律不看。"""
+        root = Path(data_dir)
+        cfg = cls(db_path=str(root / "dashboard.db"))
+        path = root / "starling.json"
+        cfg.config_path = str(path)
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for key in _SERIALIZABLE:
+                if key not in _SERVICE_IGNORED and key in data and data[key] is not None:
+                    setattr(cfg, key, data[key])
+            _migrate_legacy_model_config(cfg, data)
+        _seed_openai_extraction(cfg)
+        cfg.ingest_spool_path = str(root / "ingest-spool")
+        cfg.vector_store_path = str(root / "vectors") if cfg.vector_backend == "zvec" else ""
+        cfg.token = token
+        cfg.data_root = str(root)
+        cfg.persist_token = False
+        return cfg
+
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in _SERIALIZABLE}
 
     def save(self, path: str | None = None) -> None:
         p = Path(path or self.config_path or _DEFAULT_CONFIG).expanduser()
         p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        data = self.to_dict()
+        if not self.persist_token:
+            data.pop("token", None)          # starling-serve：token 不落盘（spec §10.1）
         fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".starling-", suffix=".tmp")
         try:
             os.chmod(fd, 0o600)  # set perms before any secret bytes are written
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(json.dumps(self.to_dict(), indent=2, ensure_ascii=False))
+                f.write(json.dumps(data, indent=2, ensure_ascii=False))
             os.replace(tmp, p)   # atomic replace; never leaves a partial file
         except BaseException:
             try:
@@ -205,6 +241,8 @@ class DashboardConfig:
         db_path = self.db_path
         if not db_path or db_path == ":memory:" or not os.path.dirname(db_path):
             return ""
+        if self.data_root:
+            return self.data_root            # starling-serve 的 D（load_service）
         env = os.environ.get("STARLING_DATA_DIR")
         if env:
             return str(Path(env).expanduser())
@@ -321,6 +359,13 @@ def _env_overlay(cfg: DashboardConfig) -> None:
     if e("STARLING_DASH_INGEST_SPOOL"): cfg.ingest_spool_path = e("STARLING_DASH_INGEST_SPOOL")
     if e("STARLING_DASH_CORS_ORIGINS"):
         cfg.cors_origins = [o.strip() for o in e("STARLING_DASH_CORS_ORIGINS").split(",") if o.strip()]
+    _seed_openai_extraction(cfg)
+
+
+def _seed_openai_extraction(cfg: DashboardConfig) -> None:
+    """没有抽取 provider、但设了 OPENAI_API_KEY：从 OPENAI_* 补一个 provider "default" 并绑到抽取（load 与
+    load_service 共用这条规则）。"""
+    e = os.environ.get
     if cfg.resolve_role("extraction") is None and e("OPENAI_API_KEY"):
         cfg.providers["default"] = {
             "provider": "openai",

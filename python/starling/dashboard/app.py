@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import logging
 import os
@@ -9,11 +10,12 @@ import threading
 import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Callable
 
 from anyio import to_thread
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from starling import _core
 from starling.dashboard.auth import make_require_token
@@ -81,8 +83,72 @@ def _open_pool(config: DashboardConfig, engine_factory) -> WorldPool:
     return pool
 
 
+class _NotReadyGate:
+    """就绪之前（spec §10.1：注册表打开、默认世界引擎建好之前）所有 HTTP 请求回 503 worlds_unavailable（瞬态，码表里
+    已有），WebSocket 先 accept 再以 1013 关闭。就绪之后原样放行。纯 ASGI 中间件：lifespan 消息不经这里拦。"""
+
+    def __init__(self, app, *, state) -> None:
+        self.app = app
+        self._state = state
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket") or self._state.ready:
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            # 先 accept 再以 1013（Try Again Later）关闭（裁定 R83 M3）：握手前的 close 在 ASGI 里是拒绝握手（HTTP 403），客户端
+            # 看不到关闭码。先收下 connect 消息。
+            message = await receive()
+            if message["type"] == "websocket.connect":
+                await send({"type": "websocket.accept"})
+                await send({"type": "websocket.close", "code": 1013})
+            return
+        from starling.dashboard.routes.world_scope import error_body, status_for
+        await JSONResponse(error_body("worlds_unavailable"),
+                           status_code=status_for("worlds_unavailable"))(scope, receive, send)
+
+
+def _start_pool(pool: WorldPool, mgr, loop, idle_close_interval_s: float | None = None) -> None:
+    """池起来之后、服务请求之前的那一段（工作线程里调用）。池的线程（后台 tick、统计去抖计时器）→ 事件循环的桥：tick 的
+    消息形状与手动 /api/tick 一致，前端无需区分自动/手动；world_changed 每个世界每秒至多一条（池里去抖）。
+
+    默认世界的引擎在此即建，不论 tick_interval_s（裁定 R33，与改之前的生产启动一致）：库与 schema 从启动起就在（检视路由
+    只读打开库），摄入从启动起就在收本机 hook 投递的会话。只取一下租约，不留引擎的引用。然后每个开着的世界按自己的
+    settings.background 起线程（tick 只在 tick_interval_s > 0 时起，摄入按 background.ingest），此后新打开的世界也起；
+    再起按时间的自动快照调度与 30 秒统计刷新（有注册表时）。"""
+    pool.on_tick = mgr.bridge(loop, "tick")
+    pool.on_world_changed = mgr.bridge(loop, "world_changed")
+    pool.lease(pool.default_world()).release()
+    if idle_close_interval_s is None:
+        pool.start_background()
+    else:
+        pool.start_background(idle_close_interval_s=idle_close_interval_s)
+
+
+def _attach_sessions(app: FastAPI, pool: WorldPool) -> None:
+    """建客户端会话表（C++ SessionTable，spec §11）并注入池（setter，池建好之后、服务请求之前），挂到 app.state.sessions。
+    租约与空闲时限取 C++ 的缺省值（30 秒、10 分钟）。"""
+    sessions = _core.SessionTable()
+    pool.attach_sessions(sessions)
+    app.state.sessions = sessions
+
+
+def _stop_pool(pool: WorldPool) -> None:
+    """D-P2-6 关停顺序：先让每个开着的世界进 DRAINING（写门转为拒绝；在 lifespan 的 yield 之后做，不用信号处理器，后者与
+    uvicorn 自己的关停竞争），再停摄入（在途的 remember 不再被取走），再停 tick（stop_background 对每个世界 quiesce：先摄入、
+    后 tick），最后关掉全部世界、释放 C++ 写连接。事件循环随 lifespan 结束，池的线程不能再往它投广播。"""
+    pool.begin_drain()
+    pool.stop_background()
+    pool.close_all()
+    pool.on_tick = None
+    pool.on_world_changed = None
+
+
 def create_app(config: DashboardConfig, *, engine: object | None = None,
-               engine_factory: EngineFactory | None = None) -> FastAPI:
+               engine_factory: EngineFactory | None = None, deferred_open: bool = False,
+               on_ready: Callable[[], None] | None = None,
+               on_open_failed: Callable[[BaseException], None] | None = None,
+               idle_close_interval_s: float | None = None) -> FastAPI:
     """Build the dashboard app.
 
     世界由引擎池（app.state.pool，WorldPool）按需打开，每个世界一个引擎；没有「活动世界」。检视与命令
@@ -91,54 +157,84 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
     `engine`（DashboardEngine）：作为默认世界的引擎预先放进池（测试与嵌入式调用方用），必须打开的是默认
     世界的库与租户，否则 ValueError。为 None 时池按需建（lifespan 在 tick_interval_s > 0 时即建）。
     `engine_factory(ctx, providers)`：池建引擎用的工厂，缺省 DashboardEngine(ctx, providers)。
+
+    `deferred_open`（starling-serve，spec §10.1）：注册表与默认世界引擎不在这里开，而在 lifespan 启动后的一个工作线程里开，
+    lifespan 本身立刻让出，服务器随即开始接受连接；开好之前 app.state.ready 为 False、app.state.pool 为 None，所有 API（含
+    /health）回 503 worlds_unavailable（_NotReadyGate）。开好之后调 on_ready()；开的途中出错调 on_open_failed(exc)（之后照旧
+    一律 503）。不能与 engine 同用。缺省 False：与之前一样在这里开池，app.state.ready 从一开始就是 True。
+    `idle_close_interval_s`：空闲关闭的轮询间隔（秒，spec §10.3）；None 取池的缺省 30 秒，0 不起空闲关闭线程。
     """
     config.validate_bind()
     # 左脑 lane 的开关一致性在启动时就拒绝，而不是等到第一次摄入才发现。
     config.validate_source_lane()
-    pool = _open_pool(config, engine_factory)
-    if engine is not None:
-        default = pool.default_world()
-        _require_engine_matches(engine, pool.context(default))
-        pool.seed_engine(default, engine)
+    if deferred_open and engine is not None:
+        raise ValueError("deferred_open cannot take an injected engine")
+    pool = None
+    if not deferred_open:
+        pool = _open_pool(config, engine_factory)
+        if engine is not None:
+            default = pool.default_world()
+            _require_engine_matches(engine, pool.context(default))
+            pool.seed_engine(default, engine)
+
+    def _open_deferred(app: FastAPI, loop) -> None:
+        """工作线程里：开注册表与池、建默认世界引擎、起后台线程，然后才发布池、置 ready。"""
+        opened = _open_pool(config, engine_factory)
+        try:
+            _attach_sessions(app, opened)
+            _start_pool(opened, app.state.ws_manager, loop, idle_close_interval_s)
+        except BaseException:
+            _stop_pool(opened)
+            raise
+        app.state.pool = opened
+        app.state.ready = True
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # 池的线程（后台 tick、统计去抖计时器）→ 事件循环的桥。tick 的消息形状与手动 /api/tick 一致，
-        # 前端无需区分自动/手动；world_changed 每个世界每秒至多一条（池里去抖）。
+        # lifespan 只在 ASGI 服务器 / `with TestClient` 下运行；直接构造 TestClient(app) 的测试不建引擎、不起线程，也没有
+        # 会话表（app.state.sessions 为 None，池按没人占着写入处理）。建引擎（首次打开取世界锁）在工作线程里做，同 lease_off_loop。
         loop = asyncio.get_running_loop()
-        mgr = app.state.ws_manager
-        pool.on_tick = mgr.bridge(loop, "tick")
-        pool.on_world_changed = mgr.bridge(loop, "world_changed")
-        # 默认世界的引擎在此即建，不论 tick_interval_s（裁定 R33，与改之前的生产启动一致）：库与 schema
-        # 从启动起就在（检视路由只读打开库），摄入从启动起就在收本机 hook 投递的会话。lifespan 只在 ASGI
-        # 服务器 / `with TestClient` 下运行；直接构造 TestClient(app) 的测试不建引擎、不起线程。
-        # 只取一下租约：lifespan 在 yield 处挂起期间局部变量一直活着，不能留着引擎的引用。建引擎（首次
-        # 打开取世界锁）在工作线程里做，同 lease_off_loop。
-        default = pool.default_world()
-        await to_thread.run_sync(lambda: pool.lease(default).release())
-        # 每个开着的世界按自己的 settings.background 起线程：tick 只在 tick_interval_s > 0 时起，摄入按
-        # background.ingest（与 tick 无关：关掉维护 tick 不连带禁掉摄入）；此后新打开的世界也起。再起按
-        # 时间的自动快照调度与 30 秒统计刷新（有注册表时）。
-        pool.start_background()
+        if not deferred_open:
+            _attach_sessions(app, pool)
+            await to_thread.run_sync(_start_pool, pool, app.state.ws_manager, loop,
+                                     idle_close_interval_s)
+            yield
+            _stop_pool(pool)
+            return
+        opening = asyncio.ensure_future(to_thread.run_sync(_open_deferred, app, loop))
+
+        def _opened(task: asyncio.Future) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error("starling service failed to open its worlds: %s: %s",
+                             type(exc).__name__, exc)
+                if on_open_failed is not None:
+                    on_open_failed(exc)
+            elif on_ready is not None:
+                on_ready()
+        opening.add_done_callback(_opened)
         yield
-        # D-P2-6 关停顺序：先让每个开着的世界进 DRAINING（写门转为拒绝；在 yield 之后做，不用信号处理器，
-        # 后者与 uvicorn 自己的关停竞争），再停摄入（在途的 remember 不再被取走），再停 tick
-        # （stop_background 对每个世界 quiesce：先摄入、后 tick），最后关掉全部世界、释放 C++ 写连接。
-        pool.begin_drain()
-        pool.stop_background()
-        pool.close_all()
-        # 事件循环随 lifespan 结束；池的线程不能再往它投广播。
-        pool.on_tick = None
-        pool.on_world_changed = None
+        # 关停：开池的线程还在跑就等它跑完（工作线程取消不了），再按同样的顺序关。
+        with contextlib.suppress(BaseException):
+            await asyncio.shield(opening)
+        opened = app.state.pool
+        if opened is not None:
+            _stop_pool(opened)
 
     app = FastAPI(title="Starling Dashboard", version="0.1.0", lifespan=lifespan)
     app.state.config = config
     app.state.pool = pool
+    app.state.sessions = None        # lifespan 里建（_attach_sessions）
+    app.state.ready = not deferred_open
     # 写配置的路由（POST /api/config、DELETE /api/config/provider）彼此串行（见 routes/config.py）。线程锁，
     # 只在工作线程里取：事件循环上的锁（asyncio / anyio）不能跨事件循环唤醒等待者，而不进 lifespan 的
     # TestClient 每个请求各起一个事件循环。
     app.state.config_lock = threading.Lock()
 
+    # 先加就绪闸门、再加 CORS：后加的在外层，503 也带上 CORS 头。
+    app.add_middleware(_NotReadyGate, state=app.state)
     if config.cors_origins:
         app.add_middleware(
             CORSMiddleware,
@@ -244,19 +340,42 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
         # （裁定 R32：首次打开要等世界锁，事件循环不等），在工作线程里、引擎用完的那一刻归还（见
         # run_blocking），协程被取消也不会提前放走仍在跑的这一轮。
         world = world or pool.default_world()          # 缺省或空串：默认世界
+        # 回合末要写入：整一轮算一次看板写入（裁定 R51、R82）。pool.dashboard_write 在同一次持池锁内过 C++ 准入（客户端占着写入
+        # world_held，只读打开的世界 world_read_only）并计数；计数与租约一起在工作线程里、引擎用完的那一刻归还（end_turn）。
+        write = pool.dashboard_write(world)
         try:
-            lease = await lease_off_loop(pool, world)
+            write.__enter__()
         except WorldSwitchError as exc:
             await ws.send_json({"type": "error", "error": exc.code})
             await ws.close()
             return
+        except _core.WorldStoreError as exc:
+            await ws.send_json({"type": "error", "error": _core.world_store_error_code(exc)})
+            await ws.close()
+            return
+        try:
+            lease = await lease_off_loop(pool, world)
+        except BaseException as exc:
+            write.__exit__(None, None, None)
+            if isinstance(exc, WorldSwitchError):
+                await ws.send_json({"type": "error", "error": exc.code})
+                await ws.close()
+                return
+            raise
+
+        def end_turn() -> None:
+            """归还本轮的租约与看板写入计数（只调一次）。"""
+            try:
+                lease.release()
+            finally:
+                write.__exit__(None, None, None)
         try:
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue = asyncio.Queue()
             done = object()
             box: dict = {}
         except BaseException:
-            lease.release()
+            end_turn()
             raise
 
         def on_token(delta: str) -> None:
@@ -286,13 +405,13 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
                     box["error"] = "converse_failed"
             finally:
                 del engine
-                lease.release()
+                end_turn()
                 loop.call_soon_threadsafe(queue.put_nowait, done)
 
         try:
             loop.run_in_executor(None, run_blocking)
         except BaseException:
-            lease.release()
+            end_turn()
             raise
 
         # Drain deltas until the worker signals done. call_soon_threadsafe
@@ -352,6 +471,10 @@ def create_app(config: DashboardConfig, *, engine: object | None = None,
     app.include_router(build_config_router(require_token))
     # /api/worlds（世界管理：列表、详情、建删、设置、关闭、快照、恢复），经引擎池；只挂在 /api 下。
     app.include_router(build_worlds_router(require_token))
+    # /api/v1/client（客户端会话、句柄、门面方法、管理操作，spec §13.1、§13.3；Task 4.5）。
+    from starling.dashboard.routes.client import build_client_router, install_client_error_handlers
+    install_client_error_handlers(app)
+    app.include_router(build_client_router(require_token))
 
     _build = Path(__file__).resolve().parents[3] / "dashboard" / "web" / "build"
     if _build.is_dir():

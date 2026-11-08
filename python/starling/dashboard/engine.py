@@ -234,6 +234,11 @@ def _build_embed_adapter(emb_cfg: dict):
             cfg.base_url = emb_cfg["base_url"]
         if emb_cfg.get("dim"):
             cfg.dim = int(emb_cfg["dim"])
+        # 与 _build_chat_adapter 同一取法（最后修复波 B4）：timeout_ms 给了才设；max_retries 按 is None 判，0 表示不重试。
+        if emb_cfg.get("timeout_ms"):
+            cfg.timeout_ms = int(emb_cfg["timeout_ms"])
+        if emb_cfg.get("max_retries") is not None:
+            cfg.max_retries = int(emb_cfg["max_retries"])
         return _core.OpenAIEmbeddingAdapter(cfg)
 
 
@@ -288,6 +293,8 @@ _ROLE_ATTR = {"extraction": "llm", "chat": "chat_llm", "consolidation": "consoli
 _REFUSED_ENDPOINT = {"refused_at_open": True}
 # _key_stale 的 snap 缺省值：自己拍一份快照。
 _FRESH = object()
+# tick 里嵌入端点被拒时只跳过嵌入阶段的码（裁定 R54；R100 I1 加 endpoint_key_missing）。
+_EMBEDDING_REFUSALS = ("endpoint_changed", "endpoint_key_missing")
 # NORM-gist 阈值里绑定层要整数的几项（ReplayScheduler.run_sleep / run_idle 的签名）。世界设置把阈值
 # 存成 double（C++ map<string,double>），所以 4.0 要还原成 4 才能传进去。
 _INT_GIST_KEYS = ("min_holders", "min_replay_count", "entity_gist_enabled")
@@ -335,6 +342,7 @@ class DashboardEngine:
         # 的状态。只在 tick（持 self._lock）里写；后台循环按两者是否不同决定记不记一次日志。
         self.embedding_refused = False
         self._embedding_refusal_logged = False
+        self._embedding_refusal_code = "endpoint_changed"
         # 裁定 R41：每个角色的适配器是按哪个 endpoint 建的（建与重建时记下；None = 不是从设置建的，例如测试
         # 直接 eng.llm = fake，或角色没有 endpoint）。用到适配器之前核对的是这个，不是 _settings 里的：设置
         # 被换了却没重建适配器时，按旧 endpoint 建的适配器（带着密钥指着旧地址）不能被新设置的核对放行。
@@ -497,6 +505,15 @@ class DashboardEngine:
         current = provider_endpoint(prov) if prov is not None else None
         _core.world_require_endpoint_unchanged(ep, current, role)
 
+    def _require_endpoint_key(self, role: str, ep: dict | None, prov) -> None:
+        """裁定 R100 I1（spec §8.3）：用到 role 的世界适配器之前调（持 self._lock）。客户端显式给的端点（provider_name 为空）
+        要用服务进程的 OPENAI_API_KEY，环境里没有就抛 endpoint_key_missing：显式端点不退回占位嵌入，也不当成「抽取没绑定」。
+        判定在 C++ world_require_endpoint_key，这里只传「密钥在不在」。没有 endpoint 的角色、继承 provider 的端点（C++ 不判，
+        没有密钥时照旧按没绑定处理）、不是从设置建的适配器（测试直接装的替身不在 _built_endpoints 里，它不用服务密钥）都放行。"""
+        if not ep or role not in self._built_endpoints:
+            return
+        _core.world_require_endpoint_key(ep, bool(endpoint_key_from(ep, prov)), role)
+
     def _source_endpoint(self, role: str) -> dict | None:
         """role 的适配器此刻该按哪个 endpoint 建：_settings[role]；chat 没绑定时回退到抽取的（与构造时一致）。"""
         if role == "chat":
@@ -587,6 +604,7 @@ class DashboardEngine:
         attr = _ROLE_ATTR[role]
         ep = self._source_endpoint(role)
         prov = self._provider_snapshot(ep)
+        self._require_endpoint_key(role, ep, prov)           # 裁定 R100 I1：显式端点缺服务密钥 → endpoint_key_missing
         stale = role in self._built_endpoints and self._built_endpoints[role] != ep
         # 密钥指纹变了（裁定 R52）也要走一遍：没有适配器、provider 刚加上密钥时，按新密钥建出来。
         if stale or getattr(self._core, attr) is not None or self._key_stale(role, prov):
@@ -598,6 +616,8 @@ class DashboardEngine:
         请求，不核对；但设置已换成另一个 endpoint 时照样按新设置核对并重建（裁定 R41）。快照只拍一份（裁定 R57）。"""
         ep = self._settings.get("embedding")
         prov = self._provider_snapshot(ep)
+        # 裁定 R100 I1：显式端点没有服务密钥时 endpoint_key_missing，不拿占位向量去嵌入或召回。占位只留给没有嵌入端点的世界。
+        self._require_endpoint_key("embedding", ep, prov)
         stale = ("embedding" in self._built_endpoints
                  and self._built_endpoints["embedding"] != ep)
         if self._embedder_live or stale or self._key_stale("embedding", prov):
@@ -884,7 +904,14 @@ class DashboardEngine:
         returned as a warning string so the save can surface it (silent success
         with broken embeddings is worse than a clear heads-up)."""
         # 裁定 R38：在删任何向量之前核对嵌入的继承地址；改了就抛 endpoint_changed，一行不删。
-        self._require_embedding_unchanged()
+        # 裁定 R100 I1：显式端点缺服务密钥时不重嵌入（不清向量、不拿占位向量重写），与其他「跳过」一样回提示，不让改设置失败。
+        try:
+            self._require_embedding_unchanged()
+        except _core.WorldStoreError as exc:
+            if _core.world_store_error_code(exc) != "endpoint_key_missing":
+                raise
+            return ("re-embed skipped: the embedding endpoint needs the service's OPENAI_API_KEY "
+                    "(endpoint_key_missing); vectors NOT cleared")
         if self.read_only:
             # 只读世界（spec §6.3）：库只读打开，向量一行不删；换上的嵌入只用于查询。
             return "re-embed skipped: the world is opened read-only; vectors NOT cleared"
@@ -1105,11 +1132,72 @@ class DashboardEngine:
                                      now=now, provider=provider)
 
     def recall(self, query: str, *, perspective="first_person", k=10, mode="semantic",
-               holder=None) -> list:
+               holder=None, strict: bool = False, include_volatile: bool = False) -> list:
+        """strict / include_volatile 原样转发给 MemoryCore.recall（裁定 R77）：看板路由用缺省 False，客户端门面按 spec §13.3
+        的缺省 True 传进来。strict=True 且查询词嵌入失败时 RecallDegradedError。"""
         with self._lock, self._read_only_rejections():
             self._require_embedding_unchanged()   # 语义召回要嵌入查询词
             return self._core.recall(query, perspective=perspective, k=k, mode=mode,
-                                     holder=holder)
+                                     holder=holder, strict=strict,
+                                     include_volatile=include_volatile)
+
+    # ── 客户端门面（第 4 期 Task 4.5，裁定 R76）：按句柄的 holder 调 MemoryCore；状态机、规范化都在 C++ ─────────────
+
+    def remember_event(self, key: str, text: str, *, holder: str, interlocutor=None,
+                       epoch: str = "2026-01-01T00:00:00Z") -> dict:
+        """按 key 写一次，事件与语句记在 holder 名下（C++ memoryops::remember_event 的三段，修复轮 1 F1）。同看板的 remember：
+        ① begin（读行、认领、占位、补齐、写 engram）与 ③ finish（commit 与收据）持引擎锁，② 抽取（纯 LLM，几十秒起）在锁外，
+        同一世界的读、tick 不排在它后面。抽取适配器在 ① 锁内取好（_prepare_role：核对继承来的地址），作为局部变量带到锁外，
+        同 _converse_phased。锁外期间行被放弃或清空时 ③ 抛 EventConflict（C++ 的 state='pending' 围栏）。只读引擎 world_read_only。"""
+        self._require_writable()
+        with self._lock:                                    # ① 短：读行 + 写 engram
+            extraction = self._prepare_role("extraction")
+            if extraction is None:                          # 与 Memory 一致：写 pending 行之前 fail-fast
+                raise LLMNotConfigured(
+                    "remember_event requires an llm adapter (bind the extraction role)")
+            begun = self._core.remember_event_begin(key, text, holder=holder,
+                                                    interlocutor=interlocutor, epoch=epoch)
+        if begun.done is not None:                          # committed 重入：不抽取、不写
+            return begun.done
+        extracted = self._core.remember_event_extract(begun, extraction)   # ② 锁外 LLM（不必抽取时 C++ 直接返回）
+        with self._lock:                                    # ③ 短：commit + 收据
+            out = self._core.remember_event_finish(begun, extracted, extraction)
+        self._notify_commit()
+        return out
+
+    def abandon_event(self, key: str, *, holder: str) -> None:
+        """把 holder 名下 key 的 pending 事件改成 abandoned（C++ memoryops::abandon_event）。只读引擎 world_read_only。"""
+        self._require_writable()
+        with self._lock:
+            self._core.abandon_event(key, holder=holder)
+        self._notify_commit()
+
+    def content_ids(self, statement_ids) -> dict:
+        with self._lock, self._read_only_rejections():
+            return self._core.content_ids(list(statement_ids))
+
+    def digest(self) -> str:
+        with self._lock, self._read_only_rejections():
+            return self._core.digest()
+
+    def pending_events(self) -> list[dict]:
+        with self._lock, self._read_only_rejections():
+            return self._core.pending_events()
+
+    def next_seq(self) -> int:
+        with self._lock, self._read_only_rejections():
+            return self._core.next_seq()
+
+    def embed_pending(self, now: str) -> dict:
+        """只跑嵌入阶段直到积压清空（C++ memoryops::embed_pending）。先核对嵌入端点（endpoint_changed 照抛：调用方显式要嵌入，
+        不像 tick 那样只跳过）。写向量，只读引擎 world_read_only。"""
+        self._require_writable()
+        with self._lock:
+            self._require_embedding_unchanged()
+            out = self._core.embed_pending(now)
+        if out.get("embedded"):
+            self._notify_commit()
+        return out
 
     def tick(self, now: str) -> dict:
         """后台维护一轮。嵌入阶段走 embedding 端点，先核对继承来的地址（占位嵌入不核对）。核对不过
@@ -1126,14 +1214,17 @@ class DashboardEngine:
         return stats
 
     def _embedding_usable(self) -> bool:
-        """持 self._lock。嵌入端点此刻能不能用：_require_embedding_unchanged 抛 endpoint_changed → False，其余照常
-        抛出。结果记在 embedding_refused。"""
+        """持 self._lock。嵌入端点此刻能不能用：_require_embedding_unchanged 抛 endpoint_changed 或 endpoint_key_missing
+        （裁定 R100 I1：显式端点缺服务密钥，与 endpoint_changed 同样只跳过嵌入阶段，其余维护照常）→ False，其余照常抛出。
+        结果记在 embedding_refused，码记在 _embedding_refusal_code（后台循环的日志点名它）。"""
         try:
             self._require_embedding_unchanged()
         except _core.WorldStoreError as exc:
-            if _core.world_store_error_code(exc) != "endpoint_changed":
+            code = _core.world_store_error_code(exc)
+            if code not in _EMBEDDING_REFUSALS:
                 raise
             self.embedding_refused = True
+            self._embedding_refusal_code = code
             return False
         self.embedding_refused = False
         return True
@@ -1145,7 +1236,11 @@ class DashboardEngine:
         if refused == self._embedding_refusal_logged:
             return
         self._embedding_refusal_logged = refused
-        if refused:
+        if refused and self._embedding_refusal_code == "endpoint_key_missing":
+            logger.warning("world %s: embedding endpoint has no service key (endpoint_key_missing); "
+                           "background embedding is paused until OPENAI_API_KEY is set for the "
+                           "service, other maintenance continues", self._ctx.name)
+        elif refused:
             logger.warning("world %s: embedding endpoint changed (endpoint_changed); background "
                            "embedding is paused until the endpoint is re-confirmed, other "
                            "maintenance continues", self._ctx.name)

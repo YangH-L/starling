@@ -29,26 +29,10 @@ from pydantic import BaseModel, StrictBool, StrictInt
 
 from starling import _core
 from starling.dashboard.engine import endpoint_api_key
+from starling.dashboard.routes.world_scope import WorldHTTPError, status_for
 from starling.dashboard.world_manager import WorldSwitchError
 
 logger = logging.getLogger(__name__)
-
-# 错误码 → HTTP 状态。未登记的码按 500。
-_STATUS = {
-    "invalid_world_name": 400, "confirm_mismatch": 400, "rollback_mode_unsupported": 400,
-    "invalid_auto_snapshot": 400, "invalid_settings": 400, "invalid_labels": 400,
-    "invalid_world_query": 400,
-    "world_not_found": 404, "snapshot_not_found": 404,
-    "world_exists": 409, "world_protected": 409, "labels_immutable": 409,
-    "snapshot_unsupported_backend": 409, "invalid_retention": 409, "endpoint_changed": 409,
-    "world_tenant_mismatch": 409, "snapshot_corrupt": 409, "world_in_use": 409,
-    "insufficient_disk": 507, "world_busy": 503, "worlds_unavailable": 503,
-    "world_open_failed": 500, "snapshot_failed": 500, "registry_corrupt": 500,
-    "rollback_reopen_failed": 500,
-    # 第 3 期（spec §6、§13.2）。
-    "world_read_only": 409, "world_schema_behind": 409, "world_not_seed": 409,
-    "fork_digest_mismatch": 500, "restore_digest_mismatch": 500,
-}
 
 # 世界设置里带 provider 密钥的段（返回时每段加 key_set）。
 _ENDPOINT_SECTIONS = ("extraction", "embedding", "chat", "consolidation")
@@ -106,8 +90,8 @@ class RollbackBody(BaseModel):
     mode: str = "discard_after"
 
 
-def _fail(code: str) -> HTTPException:
-    return HTTPException(status_code=_STATUS.get(code, 500), detail=code)
+def _fail(code: str) -> WorldHTTPError:
+    return WorldHTTPError(code)
 
 
 async def _run(fn, *args, **kwargs):
@@ -119,7 +103,7 @@ async def _run(fn, *args, **kwargs):
     except HTTPException:
         raise                                   # 工作函数里已经决定好的 HTTP 错误
     except WorldSwitchError as exc:
-        if _STATUS.get(exc.code, 500) >= 500:
+        if status_for(exc.code) >= 500:
             logger.warning("worlds route: %s: %s", exc.code, exc.detail)
         raise _fail(exc.code) from exc
     except _core.WorldStoreError as exc:
@@ -128,7 +112,7 @@ async def _run(fn, *args, **kwargs):
         # 不兜住的话 Starlette 回的是纯文本 500，前端按 JSON detail 解析会炸。异常文本可能
         # 带服务器路径，只进日志，不回给客户端。
         logger.exception("worlds route failed")
-        raise HTTPException(status_code=500, detail="internal_error") from exc
+        raise _fail("internal_error") from exc
 
 
 def _pool(request: Request):
@@ -508,6 +492,7 @@ def build_worlds_router(require_token) -> APIRouter:
         try:
             out = await _run(pool.rollback, name, body.snapshot_id)
         except HTTPException as exc:
+            # 接的是 HTTPException：_run 把池的错误转成 WorldHTTPError（HTTPException 的子类）再抛，原异常挂在 __cause__ 上。
             # 池报告库已替换（C++ 的 replaced 标记，裁定 R32；池在这种失败上已刷新统计、重开过引擎）：库已经换成快照的
             # 内容，别的标签页同样要知道库变了。判定来自标记，不来自错误码列表。
             if getattr(exc.__cause__, "pool_replaced", False):

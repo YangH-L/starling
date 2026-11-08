@@ -234,6 +234,12 @@ struct WorldStats {
 [[nodiscard]] WorldStats world_stats(const std::string& db_path, const std::string& tenant,
                                      persistence::ReadOnlyFreeze freeze);
 
+// 一个世界库里该租户的 library 摘要（memoryops::digest），只读打开 db_path（freeze 同 world_stats，裁定 R36），不写任何文件。
+// 库文件不存在、或缺 statements / statement_vectors / events 之一（0038 之前的库）时返回空串（裁定 R10）。库读不出时抛
+// snapshot_failed。客户端 list_worlds(with_digest=True) 给关着的世界用（Task 4.5）。
+[[nodiscard]] std::string world_digest(const std::string& db_path, const std::string& tenant,
+                                       persistence::ReadOnlyFreeze freeze);
+
 // 租户不变式（spec §2.1）：一个世界库里只允许有该世界自己的租户。只读打开 db_path，
 // 逐个检查带 tenant_id 列的表，发现 tenant_id 非空且不等于 tenant 的行就抛
 // world_tenant_mismatch（detail 点名第一张违规的表）。库文件不存在（新世界，首次激活）

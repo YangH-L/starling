@@ -56,4 +56,99 @@ holder 不能为空：对空 holder 调 `remember_event` 或 `abandon_event` 抛
 
 还没做的：恢复时世界还有句柄开着返回 `world_held`，属于第 4 期的写占用（裁定 R25）。看板正在只读查看一个 rollout 世界时客户端来写，第 4 期会先等看板的检视连接关掉、关掉只读的那份，再以可写方式打开（裁定 R30、R37），rise 不用为此做什么。
 
-（第 4–6 期的答复在各期合并时补充。）
+## 第 4 期（服务进程与客户端）
+
+这一期加了服务进程 `starling-serve` 和纯 Python 客户端 `starling-client`。rise 从进程内的 `starling.Memory.open(path, agent=...)` 换成连服务：`client.open(world, holder=...)`。下面按 rise 要改的顺序写。
+
+**安装。** 客户端只依赖标准库和 `httpx`，不依赖 C++ 扩展：
+
+```
+starling-client @ git+https://github.com/ruijieguo/starling.git@<commit>#subdirectory=clients/python
+```
+
+客户端与服务用同一个提交。`client.info()["commit"]` 来自 C++ 编进 `_core` 的构建常量（裁定 R88），rise 拿它和自己钉住的提交比对，不一致就别跑。`info()` 同时给出 `version`、`protocol` 和生效的 `extraction_config`，rise 写进记忆运行时身份。客户端与服务的 `protocol` 不同时，`connect` 抛 `ProtocolMismatch`。
+
+**起服务。**
+
+```
+starling-serve --data-dir D --host 127.0.0.1 --port P --token-file F
+```
+
+token 也可以放在环境变量 `STARLING_SERVICE_TOKEN` 里；没有 `--token` 参数（命令行参数 `ps` 看得到）。所有文件都在 D 之下（`D/starling.json`、`D/registry.db`、`D/worlds/` 等），服务不读 `~/.starling`。
+
+- 先监听、后就绪：stdout 先打印 `starling-serve listening on http://HOST:PORT`，开好注册表和默认世界之后再打印 `starling-serve ready`。就绪之前 `/health` 和其余接口一律回 503 `worlds_unavailable`。
+- 同一个 D 起第二个实例：stderr 打印 `data_dir_in_use`，退出码 3。
+- SIGTERM：不再接新连接，在途请求最多等 30 s（`--drain-timeout`），然后关闭各世界、退出码 0。开注册表或默认世界失败时退出码 1。
+- 客户端连回环地址（127.0.0.0/8、`::1`、`localhost`）时不走环境变量和系统代理（裁定 R97）：本机配了代理，bearer token 也不会经过它。连非回环地址时照常读代理设置。
+
+**迁移：`Memory` 换成 `RemoteMemory`。**
+
+```python
+import starling_client
+
+client = starling_client.connect(url, token=token, timeout_s=30.0)
+settings = dict(client.info()["default_settings"])   # 见下面「设置」
+# ……合并 rise 自己的 overrides……
+mem = client.open(world, holder=holder, settings=settings)   # 原来是 starling.Memory.open(path, agent=holder)
+```
+
+| 进程内 `Memory` | `RemoteMemory` | 不同之处 |
+|---|---|---|
+| `recall(query, *, k=10, mode="semantic", strict=False, include_volatile=False, perspective=..., holder=...)` | `recall(query, *, k=10, mode="semantic", strict=True, include_volatile=True)` | 缺省 `strict`、`include_volatile` 为 True（spec §13.3）；holder 是句柄的，不能按调用改；没有 `perspective` |
+| `remember_event(key, text, *, interlocutor, epoch=...)` → `RememberResult` | 同 | 无 |
+| `abandon_event(key)` | 同 | 无 |
+| `content_ids(statement_ids)` | 同 | 无（裁定 R100 M2 已对齐参数名） |
+| `digest()`、`pending_events()`、`next_seq()`、`embed_pending(now)` | 同 | 作用于整个世界（D5）；`pending_events` 每项带 `holder` |
+| `close(timeout=None)` | 同 | 语义一致：超时抛 `TimeoutError`、句柄保持打开；另一个 `close()` 在进行时等它；`timeout=None` 一直等 |
+
+`recall` 每项是 dict：`content_id`、`score`、`row`；`row` 是只读的 `StatementRow`，字段与进程内的相同（整行序列化过来）。`RememberResult`、`PendingEvent`、`EmbedStats` 是同字段的 dataclass。
+
+不开句柄也能做的管理操作在 `client` 上：`create_world`、`fork`、`upgrade_seed`、`snapshot`（held 快照，返回 `snapshot_id` 与 `digest`）、`restore`（返回恢复后的摘要）、`delete_snapshot`、`digest(world)`、`pending_events(world)`、`close_world`、`list_worlds(labels=..., page=..., page_size=..., with_digest=...)`。
+
+**判断写入成功。** 条件是 `outcome in {"accepted", "idempotent"}` 并且 `extraction_failed is False`，不能只看 `outcome == "accepted"`。客户端超时后按同一个 key 重放时：
+
+- 两次调用都可能返回 `idempotent`（第一次的 begin 已经写好了 engram，重放那次的 prepare 把它当成证据重入）；
+- 两次返回的都是先提交那次的 `statement_ids`，被顶替那次自己抽到的结果会丢掉（裁定 R95）；
+- 被顶替的原请求在服务端仍会跑完，期间占着句柄的在途计数，`close(timeout)` 要等它结束。
+
+**设置。** 写法是取 `info()["default_settings"]`，合并 rise 的 overrides，再把整份传给 `create_world(settings=...)` 和 `open(settings=...)`。`open` 比较的是整份设置（两边补齐默认值之后），不是子集，不同就抛 `WorldError("world_settings_mismatch")`（裁定 R93）。继承来的端点地址不参与比较（服务端填进去的，`info` 不给）。`info()["key_set"]` 是 `default_settings` 旁边的一个独立字段，`{角色: bool}`，说明每个绑了端点的角色调用时有没有密钥可用（继承 provider 的看该 provider 此刻的密钥，显式端点看服务进程的 `OPENAI_API_KEY`），只给布尔值、不给密钥；它不在 `default_settings` 里，所以照上面的写法把 `default_settings` 原样传回不会因为它被拒（裁定 R101）。
+
+部署世界要显式关掉后台：`{"background": {"tick_interval_s": 0, "ingest": False, "auto_snapshot": {"on_session": False, "interval_hours": 0}}}`。没给的项从默认世界复制，默认世界的后台是开着的（tick 30 s、摄入开、按时间 24 小时快照），不关的话世界会自己写，摘要会漂移。可回收世界（`reclaimable=True`）不受这条影响，它从不跑后台任务；嵌入由 rise 调 `embed_pending` 驱动（裁定 R68）。
+
+端点：不给就继承服务默认世界的配置（建世界时复制）。客户端显式给了端点（没有 `provider_name`）时，密钥取服务进程的环境变量 `OPENAI_API_KEY`；服务环境里没有它，抽取、`embed_pending`、召回都抛 `WorldError("endpoint_key_missing")`，不会退回占位向量（裁定 R100 I1）。继承的 provider 地址后来被改了，调用报 `endpoint_changed`，密钥不会发到新地址。
+
+**`recall(mode="completion")`** 必须显式传 `strict=False, include_volatile=False`。客户端缺省是 True/True，不传就回 400 `invalid_request`，与进程内 `Memory.recall` 对这两个组合抛 `ValueError` 对应（裁定 R93）。
+
+**并发。**
+
+- 抽取在引擎锁外进行：同一世界里一次 `remember_event` 正在抽取时，别的句柄的 `recall` 不等它（裁定 R92）。
+- `recall` 和 `embed_pending` 在嵌入请求期间持引擎锁，同一世界的其他调用会排在它后面。
+- 不同世界之间互不影响：一个世界的抽取或嵌入不挡另一个世界的调用（验收 §12，测得 1–2 ms）。
+
+**错误与异常。** 错误体统一是 `{"code", "transient", "detail"}`，`code` 和 `transient` 来自 C++ 错误码目录；`detail` 不带端点地址和密钥。客户端所有异常都有 `code` 和 `transient` 两个属性。
+
+| code | 客户端异常 | 说明 |
+|---|---|---|
+| `event_conflict` | `EventConflict` | 同 `Memory` |
+| `event_not_found` | `EventNotFound`（`KeyError` 的子类） | 只在 `abandon_event` 上出现 |
+| `recall_degraded` | `RecallDegradedError` | 瞬态 |
+| `handle_closed` | `MemoryClosed`（`RuntimeError` 的子类） | |
+| `session_expired` | `SessionExpired` | 租约过期。客户端不自动重开句柄：重开会掩盖「过期期间别的会话可能占了这个世界」，由 rise 决定要不要重新 `connect` |
+| `world_busy` | `ServiceError`（503），`transient=True` | 关闭、恢复、分叉途中或写入准入冲突。由调用方重试，客户端不自动重试。例外：`close(timeout)` 收到它时抛 `TimeoutError`、句柄保持打开 |
+| `world_held` | `WorldError` | 别的会话占着写入；恢复时还有活句柄 |
+| `endpoint_key_missing` | `WorldError` | 见上面「端点」 |
+| `endpoint_changed` | `WorldError` | 继承的 provider 地址改了 |
+| `invalid_request` | `WorldError` | 参数形状不对、未知方法、`completion` 配 `strict`；400，非瞬态 |
+| `llm_not_configured` | `WorldError` | 世界没有绑定抽取角色；在写 pending 行之前就拒绝 |
+| `unauthorized` | `Unauthorized` | token 错或没带；401，非瞬态 |
+| 其他 4xx | `WorldError` | `world_not_found`、`world_read_only`、`world_settings_mismatch` 等 |
+| 其他 5xx | `ServiceError` | 按体里的 `transient`（`worlds_unavailable` 瞬态；`internal_error`、`world_open_failed` 非瞬态） |
+
+传输层另有 `ServiceUnavailable`（连不上，瞬态）、`ServiceTimeout`（瞬态）和 `ProtocolMismatch`。
+
+**已知限制。**
+
+- 空 key 照常接受，与进程内 `Memory` 一致（裁定 R95）；rise 的 key 都是提案或轮次 id，不会是空串。
+- 空闲关闭时限（10 分钟）、会话租约（30 s）、心跳间隔（10 s）这几项暂不可配置，留到第 5 期。
+
+（第 5、6 期的答复在各期合并时补充。）

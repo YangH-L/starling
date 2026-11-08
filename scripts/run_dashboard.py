@@ -14,9 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-import uvicorn
-
-from starling.dashboard import DashboardConfig, create_app
+from starling.dashboard import DashboardConfig
+from starling.service import serve
 
 _WEB = Path(__file__).resolve().parents[1] / "dashboard" / "web"
 
@@ -43,13 +42,13 @@ def main() -> None:
     cfg = DashboardConfig.load(args.config)
     cfg.validate_bind()
     _ensure_build(args.no_build)
-    # 引擎由引擎池按世界建：lifespan 启动时即建默认世界的引擎（tick_interval_s > 0 时，默认 30 秒），
-    # 库与 schema 从启动起就在；其余世界在第一次被写入时打开。注册表在 cfg.data_dir（环境变量
-    # STARLING_DATA_DIR，没设就是默认世界库文件所在的目录）。
-    app = create_app(cfg)
+    # 与 starling-serve 走同一个入口（spec §10.1）：配置、token、库、端口照旧来自 starling.json（token 没有时 load 生成并写回），
+    # 注册表在 cfg.data_dir（环境变量 STARLING_DATA_DIR，没设就是默认世界库文件所在的目录，即 ~/.starling）。入口另加：
+    # 数据目录锁（D/.lock，第二个进程退出码 3）、默认世界引擎建好之前 API 回 503、SIGTERM 后在途请求最多等 30 秒。
+    data_dir = cfg.data_dir or str(Path.home() / ".starling")
     shown = cfg.host if cfg.host not in ("0.0.0.0", "::") else "127.0.0.1"
     print(f"\nDashboard ready → http://{shown}:{cfg.port}/#token={cfg.token}\n", flush=True)
-    uvicorn.run(app, host=cfg.host, port=cfg.port)
+    sys.exit(serve.run(data_dir, token_from_config=True, config=cfg))
 
 
 if __name__ == "__main__":

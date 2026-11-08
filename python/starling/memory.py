@@ -451,6 +451,13 @@ class Memory:
         `epoch` is the clock origin — the engram's `created_at` is `epoch` plus
         the event's `seq` seconds, so a retry keeps the timestamp it first got.
 
+        Two calls with the same key and text may overlap (for example a retry
+        sent while the first call is still extracting): the one that finishes
+        second sees the committed receipt and returns it as `idempotent` with the
+        first one's statement ids, writing nothing of its own. If the key is
+        abandoned (or the tenant cleared) while a call is extracting, that call
+        raises `EventConflict` and writes no statements.
+
         Raises `EventConflict` when the key already records a different text,
         when it was abandoned, or when a still-pending event is retried with a
         different `interlocutor` than the one it was first recorded with (the

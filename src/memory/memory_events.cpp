@@ -223,9 +223,10 @@ void require_pending_row_updated(persistence::Connection& conn, std::string_view
     if (sqlite3_changes(conn.raw()) != 0) {
         return;
     }
+    // 调用方都在同一个事务里先读到了 pending(remember_event_finish):抛出时事务回滚,语句与收据都不写。
     throw EventConflict(
         "remember_event: key was abandoned or removed while the write was in flight; "
-        "statements may already be stored (key=" + std::string(key) + ")");
+        "nothing was written (key=" + std::string(key) + ")");
 }
 
 }  // namespace
@@ -259,14 +260,13 @@ std::vector<PendingEventRow> pending_events(persistence::Connection& conn,
     return rows;
 }
 
-RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
-                               extractor::LLMAdapter& llm,
-                               const RememberParams& base,
-                               const RememberPrompts& prompts,
-                               std::string_view key,
-                               std::string_view text,
-                               std::string_view epoch_iso,
-                               const extractor::ValidationPolicy& policy) {
+RememberEventBegun remember_event_begin(persistence::SqliteAdapter& adapter,
+                                        const RememberParams& base,
+                                        std::string_view key,
+                                        std::string_view text,
+                                        std::string_view epoch_iso) {
+    RememberEventBegun begun;
+    begun.key = std::string(key);
     require_holder(base.holder_id, "remember_event");   // 零 DB 读写
     governance::require_write_admission(adapter);   // 门前抛 = 零 DB 写
     auto& conn = adapter.connection();
@@ -300,7 +300,8 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
                 done.source_preserved = !row.engram_ref.empty();
                 done.structured_claims_persisted = !done.statement_ids.empty();
                 txn.commit();
-                return done;
+                begun.done = std::move(done);
+                return begun;
             }
             // state == "pending":重试,用行里原来的 seq、原文与说话对象,不另分配序号。
             // interlocutor 决定抽取出的语句落在哪个 scope_parties 下,而 key 的契约是
@@ -348,7 +349,6 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
     params.created_at_iso8601 = add_seconds_to_iso(epoch_iso, row.seq);
 
     RememberOutcome result;
-    bool completed_from_engram = false;
     // 补齐分支(只在重试已有 pending 行时走):② 落了语句、③ 没写成。按来源身份找回
     // 上次的 engram,挂在它上面、holder 相同的语句就是上次抽取的成果——直接拿来用,不再
     // 抽取一次。不按 content_hash 找:同一段话写进几个 holder 名下就有几个 engram,内容
@@ -378,63 +378,156 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
             result.outcome       = "idempotent";
             result.source_preserved = true;
             result.structured_claims_persisted = true;
-            completed_from_engram = true;
+            begun.completed = std::move(result);
             break;
         }
     }
-    if (!completed_from_engram) {
-        // remember_all 抛异常时行留 pending(不 catch),异常原样上抛。
-        result = remember_all(adapter, llm, params, prompts, policy);
+    // 补齐不成(或不是重试):照 remember_all 的第一步写 engram;抽取与 commit 留给 extract / finish。
+    if (!begun.completed) {
+        begun.prepared = remember_prepare(adapter, params);
+    }
+    begun.params = std::move(params);
+    begun.text_sha256 = row.text_sha256;   // 第 1 段读到或写下的那一行(裁定 R96 M1:finish 据此认出同一行)
+    begun.seq = row.seq;
+    return begun;
+}
+
+RememberLlmBundle remember_event_extract(persistence::SqliteAdapter& adapter,
+                                         extractor::LLMAdapter& llm,
+                                         const RememberEventBegun& begun,
+                                         const RememberPrompts& prompts,
+                                         const extractor::ValidationPolicy& policy) {
+    if (!begun.needs_extraction()) {
+        return {};
+    }
+    return remember_extract_all(adapter, llm, begun.params, prompts, policy);
+}
+
+RememberOutcome remember_event_finish(persistence::SqliteAdapter& adapter,
+                                      extractor::LLMAdapter& llm,
+                                      const RememberEventBegun& begun,
+                                      const RememberLlmBundle& extracted,
+                                      const extractor::ValidationPolicy& policy) {
+    if (begun.done) {
+        return *begun.done;
+    }
+    auto& conn = adapter.connection();
+    const RememberParams& base = begun.params;           // tenant_id / holder_id 与调用方给的相同
+    const std::string_view key = begun.key;
+
+    // ── 第 3 段:一个事务。先重读收据行,再决定提交还是放弃(修复轮 2 N1)。 ──
+    // begin 与 finish 之间(引擎锁外的抽取)同一个 key 可能被别的调用改过:
+    //   - 客户端超时后按 key 重放,重放的那次先跑完、行已 committed;
+    //   - abandon_event 把行改成终态,或 clear_tenant 把行删掉。
+    // 先提交语句、再用 AND state='pending' 围栏写收据,会在前一种情形留下孤儿语句并回 EventConflict,在后一种情形把语句留在
+    // 一个已放弃的 key 下面。所以这里在同一个事务里先读行:committed → 返回行里存的结果,bundle 不提交;abandoned 或行不在
+    // → 零写入,抛 EventConflict;仍 pending → 提交语句与收据。remember_commit_all 自己的 TransactionGuard 嵌在这里成了
+    // SAVEPOINT,写后泵的各订阅者本来就各在一个 SAVEPOINT 里(subscriber_pump.cpp run_isolated),都不需要在外层提交之后才跑。
+    persistence::TransactionGuard txn(conn);
+    const EventRow row = read_event(conn, base.tenant_id, base.holder_id, key);
+    if (!row.found || row.state == "abandoned") {
+        throw EventConflict(
+            "remember_event: key was abandoned or removed while the write was in flight; "
+            "nothing was written (key=" + std::string(key) + ")");
+    }
+    // 裁定 R96 M1:认出行不是 begin 时那一行(clear_tenant 删掉之后同一个 key 又被重建)就不收尾,零写入,抛 EventConflict。
+    // committed 时比文本摘要(重建的那次写的是别的文本,不能把它的语句当成本次的结果),这项比对可靠;pending 时比 seq,只在
+    // 重建的行拿到了别的序号时认得出:清空之后 seq 从 0 重新编号,重建是清空后第一条写入时两边 seq 相同,比不出来(裁定 R102,
+    // 见 RememberEventBegun 的注释)。
+    if ((row.state == "committed" && row.text_sha256 != begun.text_sha256) ||
+        (row.state == "pending" && row.seq != begun.seq)) {
+        throw EventConflict(
+            "remember_event: key was removed and recreated while the write was in flight; "
+            "nothing was written (key=" + std::string(key) + ")");
+    }
+    if (row.state == "committed") {
+        // 另一个调用(同一个 key、同一段文本:上面已比对过 text_sha256)先提交了。照 begin 的 committed 分支返回。
+        RememberOutcome done;
+        done.holder_id     = base.holder_id;
+        done.engram_ref    = row.engram_ref;
+        done.statement_ids = parse_statement_ids(row.statement_ids_json);
+        done.outcome       = "idempotent";
+        done.source_preserved = !row.engram_ref.empty();
+        done.structured_claims_persisted = !done.statement_ids.empty();
+        txn.commit();                                    // 只读:提交与回滚等价
+        return done;
     }
 
-    // ── 第 3 段:短事务,收尾写收据行。 ──
+    RememberOutcome result;
+    if (begun.completed) {
+        result = *begun.completed;
+    } else if (!begun.prepared.should_extract) {
+        // 与 remember_all 的短路一致:no_store / rejected 不抽取、不 commit。
+        result = {.holder_id = base.holder_id,
+                  .engram_ref = begun.prepared.engram_ref,
+                  .statement_ids = {},
+                  .outcome = begun.prepared.outcome,
+                  .extraction_failed = false,};
+    } else {
+        // 抛异常时整个事务回滚(语句与收据一起),行留 pending,异常原样上抛。
+        result = remember_commit_all(adapter, llm, base, begun.prepared, extracted, policy);
+    }
+
     // 只有「证据真入库了」且「抽取没失败」才算提交。只看 extraction_failed 不够:
     // no_store / rejected 在 remember_commit 之前就早退,source_missing 返回默认构造的
     // RememberOutcome,三者的 extraction_failed 都是 false(这个标记的含义只是「证据已
     // 入库但抽取 LLM 失败」,见 memory_ops.hpp 的注释)。若据此标 committed,这个 key
     // 以后每次调用都回 idempotent + 空语句,记忆静默丢失(设计源 §9 禁止)。stored 的
     // 判据与 memory_ops.cpp 里 converse_commit 算 remember_ok 的那一处一致。
-    // 两条 UPDATE 都带 AND state='pending' 并查受影响行数(require_pending_row_updated):
-    // 第 2 段在事务外,期间这行可能已被 abandon_event 改成终态、或被 clear_tenant 删掉,
-    // 无围栏时本段会把 'abandoned' 覆写回 'committed',复活一个已判终局的 key。
+    // 两条 UPDATE 仍带 AND state='pending' 并查受影响行数(require_pending_row_updated)。上面已在本事务里读到 pending,
+    // BEGIN IMMEDIATE 持着写锁,这道围栏在这里只是兜底:绝不把 'abandoned' 覆写回 'committed'。
     const bool stored = (result.outcome == "accepted" || result.outcome == "idempotent");
-    {
-        persistence::TransactionGuard txn(conn);
-        if (!stored || result.extraction_failed) {
-            // 行留 pending:下次调用照原 seq 重试,不另分配序号。本支不因失败而抛——留着
-            // pending 行才让 rise 看得见(pending_events 带 failure_category,门②据此记 T2
-            // 失败);只有行已不是 pending(被放弃或删了)才抛。
-            const std::string category = result.extraction_failed
-                ? result.failure_category : ("not_stored:" + result.outcome);
-            // 返回值也带上这个原因:未入库时 remember_all 的 failure_category 是空的
-            // (那条路径不填),只记进行里会让调用方拿到一个空原因——又是一种静默。
-            // 行里记什么就返回什么,与抽取失败那一支的既有不变式一致。
-            if (result.failure_category.empty()) {
-                result.failure_category = category;
-            }
-            persistence::Stmt upd(conn.raw(),
-                                  "UPDATE events SET failure_category=?1, "
-                                  "engram_ref=COALESCE(NULLIF(?2,''), engram_ref) "
-                                  "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
-                                  "AND state='pending'");
-            upd.bind(category, result.engram_ref, base.tenant_id, base.holder_id, key);
-            upd.step_done();
-            require_pending_row_updated(conn, key);
-        } else {
-            persistence::Stmt upd(conn.raw(),
-                                  "UPDATE events SET state='committed', engram_ref=?1, "
-                                  "statement_ids_json=?2, failure_category='' "
-                                  "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
-                                  "AND state='pending'");
-            upd.bind(result.engram_ref,
-                     nlohmann::json(result.statement_ids).dump(),
-                     base.tenant_id, base.holder_id, key);
-            upd.step_done();
-            require_pending_row_updated(conn, key);
+    if (!stored || result.extraction_failed) {
+        // 行留 pending:下次调用照原 seq 重试,不另分配序号。本支不因失败而抛——留着
+        // pending 行才让 rise 看得见(pending_events 带 failure_category,门②据此记 T2
+        // 失败);只有行已不是 pending(被放弃或删了)才抛。
+        const std::string category = result.extraction_failed
+            ? result.failure_category : ("not_stored:" + result.outcome);
+        // 返回值也带上这个原因:未入库时 remember_all 的 failure_category 是空的
+        // (那条路径不填),只记进行里会让调用方拿到一个空原因——又是一种静默。
+        // 行里记什么就返回什么,与抽取失败那一支的既有不变式一致。
+        if (result.failure_category.empty()) {
+            result.failure_category = category;
         }
-        txn.commit();
+        persistence::Stmt upd(conn.raw(),
+                              "UPDATE events SET failure_category=?1, "
+                              "engram_ref=COALESCE(NULLIF(?2,''), engram_ref) "
+                              "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
+                              "AND state='pending'");
+        upd.bind(category, result.engram_ref, base.tenant_id, base.holder_id, key);
+        upd.step_done();
+        require_pending_row_updated(conn, key);
+    } else {
+        persistence::Stmt upd(conn.raw(),
+                              "UPDATE events SET state='committed', engram_ref=?1, "
+                              "statement_ids_json=?2, failure_category='' "
+                              "WHERE tenant_id=?3 AND holder_id=?4 AND key=?5 "
+                              "AND state='pending'");
+        upd.bind(result.engram_ref,
+                 nlohmann::json(result.statement_ids).dump(),
+                 base.tenant_id, base.holder_id, key);
+        upd.step_done();
+        require_pending_row_updated(conn, key);
     }
+    txn.commit();
     return result;
+}
+
+RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
+                               extractor::LLMAdapter& llm,
+                               const RememberParams& base,
+                               const RememberPrompts& prompts,
+                               std::string_view key,
+                               std::string_view text,
+                               std::string_view epoch_iso,
+                               const extractor::ValidationPolicy& policy) {
+    // 三段依次调(单一语义源):Memory 门面与服务端的分相调用走的是同一套代码。
+    const auto begun = remember_event_begin(adapter, base, key, text, epoch_iso);
+    if (begun.done) {
+        return *begun.done;
+    }
+    const auto extracted = remember_event_extract(adapter, llm, begun, prompts, policy);
+    return remember_event_finish(adapter, llm, begun, extracted, policy);
 }
 
 void abandon_event(persistence::SqliteAdapter& adapter,
