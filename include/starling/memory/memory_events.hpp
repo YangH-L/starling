@@ -120,8 +120,8 @@ RememberOutcome remember_event(persistence::SqliteAdapter& adapter,
 //   extract 只调 LLM(remember_extract_all),不碰库。needs_extraction() 为 false 时什么都不做,返回空 bundle。
 //   finish  一个事务:先重读收据行(见上面的 ③)。committed 且 text_sha256 与 begin 时相同 → idempotent、零写入;
 //           abandoned 或不在 → EventConflict、零写入;pending 且 seq 与 begin 时相同 → remember_commit_all(要抽取时)与
-//           收据 UPDATE 一起提交。committed 而 sha 不同、pending 而 seq 不同(行被删后同一个 key 又被重建)→ EventConflict、
-//           零写入(裁定 R96 M1)。
+//           收据 UPDATE 一起提交。committed 而 sha 不同、pending 而 seq 不同 → EventConflict、零写入(裁定 R96 M1)。
+//           这两项比对认不全「行被删后同一个 key 又被重建」,见 RememberEventBegun 里 text_sha256 / seq 的注释(裁定 R102)。
 //
 // RememberEventBegun 在三段之间原样传递,调用方不解构。begin 与 finish 必须在同一个 adapter 上调。
 struct RememberEventBegun {
@@ -130,8 +130,14 @@ struct RememberEventBegun {
     std::string key;
     RememberPrepared prepared;                 // remember_prepare 的结果(补齐时为空)
     std::optional<RememberOutcome> completed;  // 补齐分支找回的结果(有值时不抽取,finish 只写收据)
-    // begin 读到 / 写下的那一行的身份(最后修复波 A4,裁定 R96 M1):finish 重读时用它认出「还是同一行」。clear_tenant 把行删掉、
-    // 同一个 key 又被重建,重建的行与 begin 时的不是同一行:committed 时 text_sha256 可能不同,pending 时 seq 一定不同。
+    // begin 读到 / 写下的那一行的 text_sha256 与 seq(最后修复波 A4,裁定 R96 M1):finish 重读时拿它们比,认出一部分「行被删后
+    // 同一个 key 又被重建」的情形。限制(裁定 R102):
+    //   - clear_tenant 删掉本租户全部 events 行,next_seq 是 MAX(seq)+1,所以清空之后 seq 从 0 重新编号,会复用;
+    //   - committed 分支比 sha 是可靠的:重建那次写的是别的文本,sha 一定不同,抛;写的是同一段文本时 finish 返回重建那次的
+    //     收据(idempotent),与同 key 重放的语义一致,不写任何东西;
+    //   - pending 分支比 seq 只能认出「清空之后、重建这个 key 之前已经有过别的写入」的情形(重建的行因此拿到别的 seq)。清空之后
+    //     第一条写入就是重建这个 key 时,两边 seq 相同(多半都是 0),比不出来:finish 照常收尾,可能改写重建行的 failure_category。
+    //   真正的修法要给行一个删除重建后不复用的身份(nonce 列或清空代数),要做迁移,推迟(裁定 R102)。
     std::string text_sha256;
     std::int64_t seq = 0;
     [[nodiscard]] bool needs_extraction() const {

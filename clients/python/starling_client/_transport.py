@@ -24,19 +24,22 @@ def _json_or(resp: httpx.Response, error_value):
 
 
 def _is_loopback(url: str) -> bool:
-    """url 的主机是回环地址（127.0.0.0/8、::1、localhost）。解析不了的 url 不算（交给 httpx 照常报 invalid_config）。"""
+    """url 的主机落在本机：回环地址（127.0.0.0/8、::1）、未指定地址（0.0.0.0、::，连过去落在本机，裁定 R102）、localhost
+    与带一个尾点的完全限定写法 localhost.（不区分大小写）。localhost.example 之类的名字不算。解析不了的 url 不算（交给 httpx
+    照常报 invalid_config）。"""
     try:
         host = urlsplit(url).hostname
     except ValueError:
         return False
     if not host:
         return False
-    if host.lower() == "localhost":
+    if host.lower() in ("localhost", "localhost."):
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
     except ValueError:
         return False
+    return address.is_loopback or address.is_unspecified
 
 
 class Transport:

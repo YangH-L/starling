@@ -430,9 +430,10 @@ RememberOutcome remember_event_finish(persistence::SqliteAdapter& adapter,
             "remember_event: key was abandoned or removed while the write was in flight; "
             "nothing was written (key=" + std::string(key) + ")");
     }
-    // 裁定 R96 M1:行不是 begin 时那一行(clear_tenant 删掉之后同一个 key 又被重建)就不收尾。committed 时比文本摘要(重建的
-    // 那次写的是别的文本,不能把它的语句当成本次的结果);pending 时比 seq(重建的行另分配了序号,本次的 bundle 不能提交到
-    // 别人的行上,也不改写它的 failure_category)。两者都零写入,抛 EventConflict。
+    // 裁定 R96 M1:认出行不是 begin 时那一行(clear_tenant 删掉之后同一个 key 又被重建)就不收尾,零写入,抛 EventConflict。
+    // committed 时比文本摘要(重建的那次写的是别的文本,不能把它的语句当成本次的结果),这项比对可靠;pending 时比 seq,只在
+    // 重建的行拿到了别的序号时认得出:清空之后 seq 从 0 重新编号,重建是清空后第一条写入时两边 seq 相同,比不出来(裁定 R102,
+    // 见 RememberEventBegun 的注释)。
     if ((row.state == "committed" && row.text_sha256 != begun.text_sha256) ||
         (row.state == "pending" && row.seq != begun.seq)) {
         throw EventConflict(

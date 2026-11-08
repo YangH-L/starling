@@ -244,7 +244,10 @@ def test_loopback_host_ignores_a_dead_proxy(dead_proxy, host):
 
 
 @pytest.mark.parametrize("url", ["http://127.0.0.1:1", "http://127.1.2.3:1", "http://[::1]:1",
-                                 "http://localhost:1", "http://LOCALHOST:1"])
+                                 "http://localhost:1", "http://LOCALHOST:1",
+                                 # 裁定 R102：未指定地址（连过去落在本机）与带尾点的 localhost（完全限定写法）也算回环
+                                 "http://0.0.0.0:1", "http://[::]:1", "http://localhost.:1",
+                                 "http://LocalHost.:1"])
 def test_every_loopback_spelling_turns_trust_env_off(url):
     t = Transport(url, "tok", 1.0)
     try:
@@ -254,7 +257,9 @@ def test_every_loopback_spelling_turns_trust_env_off(url):
 
 
 @pytest.mark.parametrize("url", ["http://10.9.8.7:4242", "http://svc.invalid", "https://example.com",
-                                 "http://128.0.0.1:1", "http://localhost.example.com:1"])
+                                 "http://128.0.0.1:1", "http://localhost.example.com:1",
+                                 "http://localhost.example:1", "http://localhost.example.:1",
+                                 "http://localhost..:1", "http://notlocalhost:1"])
 def test_non_loopback_host_still_reads_the_environment(url):
     t = Transport(url, "tok", 1.0)
     try:

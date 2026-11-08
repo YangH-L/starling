@@ -1358,7 +1358,10 @@ TEST(MemoryEventsSplit, ExtractTouchesNoDatabase) {
 
 
 // 最后修复波 A4（裁定 R96 M1）：begin 记下 text_sha256 与 seq；finish 重读到 committed 比 sha，重读到 pending 比 seq，任一不同
-// 都抛 EventConflict、零写入。场景：A 完成 begin；clear_tenant 把行删掉；B 用同一个 key、不同的文本重建这一行。
+// 都抛 EventConflict、零写入。场景：A 完成 begin；clear_tenant 把行删掉；B 用同一个 key 重建这一行。
+// 限制（裁定 R102）：clear_tenant 之后 seq 从 0 重新编号、会复用。committed 分支的 sha 比对可靠；pending 分支的 seq 比对只认得出
+// 「重建之前已经有过别的写入」的情形（下面第二个用例先垫一条无关的行，就是这种情形）。清空之后第一条写入就是重建时两边 seq 相同，
+// 比不出来；要靠删除重建后不复用的身份（nonce 列或清空代数），需要迁移，推迟。
 namespace {
 
 void clear_events(persistence::SqliteAdapter& adapter) {
@@ -1401,11 +1404,12 @@ TEST(MemoryEventsSplit, FinishAfterTheKeyWasRecreatedWithAnotherTextAndCommitted
     EXPECT_EQ(library_of(*adapter), before);                       // B 的语句不变、A 一条不写
 }
 
-TEST(MemoryEventsSplit, FinishAfterTheKeyWasRecreatedAndIsStillPendingThrowsWithoutTouchingIt) {
+TEST(MemoryEventsSplit, FinishAfterTheKeyWasRecreatedWithAnotherSeqAndIsStillPendingThrowsWithoutTouchingIt) {
     auto adapter = make_adapter();
     extractor::FakeLLMAdapter llm;
     llm.set_default_response(extractor::LLMResponse{.raw_xml = kCannedJson, .ok = true});
-    // 先占一个序号，让 B 重建的那一行拿到与 A 不同的 seq（clear 之后 next_seq 从 0 重算，再插一行无关的 key 垫上）。
+    // 清空之后、重建这个 key 之前先有一条别的写入（垫一行无关的 key），B 重建的那一行才拿到与 A 不同的 seq。这是 seq 比对能认出的
+    // 唯一情形：不垫行时 clear 之后 next_seq 从 0 重算，B 的行与 A 同为 seq 0，比不出来（裁定 R102，见文件里这一组用例前的注释）。
     auto begun_a = remember_event_begin(*adapter, event_params(), "k1", "bob:hi", kEpoch);
     const auto extracted_a = remember_event_extract(*adapter, llm, begun_a, RememberPrompts{});
     clear_events(*adapter);
