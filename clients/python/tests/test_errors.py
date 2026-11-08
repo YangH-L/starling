@@ -17,6 +17,7 @@ from starling_client import errors as E
         ("endpoint_changed", 409, E.WorldError),
         ("event_not_found", 404, KeyError),
         ("internal_error", 500, E.ServiceError),
+        ("unauthorized", 401, E.Unauthorized),
     ],
 )
 def test_error_body_maps_to_named_exceptions(code, status, cls):

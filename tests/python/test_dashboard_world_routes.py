@@ -172,7 +172,9 @@ def test_inspecting_a_world_whose_database_is_missing(client):
     rec = pool.create_world("gone", "")
     os.remove(rec["db_path"])
     resp = client.get("/api/w/gone/statements")
-    assert (resp.status_code, resp.json()) == (409, {"detail": "world_not_initialized"})
+    # 最后修复波 A6（裁定 R48）：码表的错误体，detail 不变（前端读 detail）。
+    assert (resp.status_code, resp.json()) == (409, {"code": "world_not_initialized", "transient": False,
+                                                     "detail": "world_not_initialized"})
     assert "gone" not in pool.open_worlds()
     assert not os.path.exists(rec["db_path"])
 

@@ -42,6 +42,8 @@ constexpr Expected kSpecCodes[] = {
     {"rollback_reopen_failed", false, 500}, {"world_open_failed", false, 500},
     // Task 4.5：客户端路由的请求错误（未知方法、参数形状不对）与抽取角色没绑定。
     {"invalid_request", false, 400}, {"llm_not_configured", false, 409},
+    // 最后修复波 A5–A7：bearer token 错（401）、检视路由找不到行（404）、兜底的服务端错误（500）。
+    {"unauthorized", false, 401}, {"not_found", false, 404}, {"internal_error", false, 500},
 };
 
 // src/governance/*.cpp 里以字面量给出的全部码：WorldStoreError("<code>" 与 WorldStoreError::after_replace("<code>"，

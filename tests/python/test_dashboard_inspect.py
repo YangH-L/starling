@@ -147,3 +147,14 @@ def test_statement_by_id_roundtrip(client):
 def test_statement_by_id_404_when_absent(client):
     r = client.get("/api/statement/does-not-exist")
     assert r.status_code == 404 and r.json()["detail"] == "not_found"
+    # 最后修复波 A6（裁定 R48）：码表的错误体。
+    assert r.json() == {"code": "not_found", "transient": False, "detail": "not_found"}
+
+
+@pytest.mark.parametrize("path", ["/api/statement/nope", "/api/provenance/nope",
+                                  "/api/cascade_preview/nope"])
+def test_missing_statement_routes_use_the_catalog_not_found_body(client, path):
+    """最后修复波 A6（裁定 R48）：检视路由找不到行时 404 用码表的错误体，detail 仍是 not_found（前端读 detail）。"""
+    r = client.get(path)
+    assert (r.status_code, r.json()) == (404, {"code": "not_found", "transient": False,
+                                               "detail": "not_found"})

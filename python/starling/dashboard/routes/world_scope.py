@@ -33,18 +33,21 @@ _CATALOG = {row["code"]: row for row in _core.error_catalog()}
 _STATUS = {code: row["http_status"] for code, row in _CATALOG.items()}
 
 
-def error_body(code: str) -> dict:
-    """统一错误体：detail 仍等于 code（前端 describeError 读 detail），code 与 transient 给程序用。"""
+def error_body(code: str, detail: str | None = None) -> dict:
+    """统一错误体：detail 缺省等于 code（前端 describeError 读 detail），code 与 transient 给程序用。detail 只在前端早就读着另一段
+    固定文字时才给（401 的 "invalid or missing bearer token"，最后修复波 A5），不带地址、密钥或服务器路径。"""
     row = _CATALOG.get(code)
-    return {"code": code, "transient": bool(row and row["transient"]), "detail": code}
+    return {"code": code, "transient": bool(row and row["transient"]),
+            "detail": code if detail is None else detail}
 
 
 class WorldHTTPError(HTTPException):
-    """带统一错误体的世界错误；由 install_error_handlers 注册的处理器渲染。"""
+    """带统一错误体的世界错误；由 install_error_handlers 注册的处理器渲染。状态取自码表（未登记 500）。"""
 
-    def __init__(self, code: str) -> None:
-        super().__init__(status_code=_STATUS.get(code, 500), detail=code)
+    def __init__(self, code: str, detail: str | None = None) -> None:
+        super().__init__(status_code=_STATUS.get(code, 500), detail=code if detail is None else detail)
         self.code = code
+        self.body_detail = detail
 
 
 def world_name(request: Request) -> str:
@@ -122,7 +125,7 @@ def install_error_handlers(app: FastAPI) -> None:
         return JSONResponse(error_body(code), status_code=status)
 
     async def _world_http_error(_request: Request, exc: WorldHTTPError) -> JSONResponse:
-        return JSONResponse(error_body(exc.code), status_code=exc.status_code)
+        return JSONResponse(error_body(exc.code, exc.body_detail), status_code=exc.status_code)
 
     app.add_exception_handler(WorldHTTPError, _world_http_error)
     app.add_exception_handler(WorldSwitchError, _switch_error)

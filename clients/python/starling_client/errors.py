@@ -48,6 +48,12 @@ class SessionExpired(StarlingClientError):
     code = "session_expired"
 
 
+class Unauthorized(StarlingClientError):
+    """The service rejected the bearer token (HTTP 401 `unauthorized`). Not transient:
+    retrying with the same token fails the same way."""
+    code = "unauthorized"
+
+
 class WorldError(StarlingClientError):
     """Every other server code (world_*, invalid_*, snapshot_*, endpoint_*, ...)."""
 
@@ -66,6 +72,7 @@ _BY_CODE = {
     "protocol_mismatch": ProtocolMismatch,
     "session_expired": SessionExpired,
     "event_not_found": EventNotFound,
+    "unauthorized": Unauthorized,
 }
 
 

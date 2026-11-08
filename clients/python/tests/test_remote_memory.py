@@ -337,7 +337,8 @@ def test_close_service_side_world_busy_is_timeout_and_handle_stays_open(svc):
 
 _NAMED = {"recall_degraded": E.RecallDegradedError, "event_conflict": E.EventConflict,
           "handle_closed": E.MemoryClosed, "protocol_mismatch": E.ProtocolMismatch,
-          "session_expired": E.SessionExpired, "event_not_found": E.EventNotFound}
+          "session_expired": E.SessionExpired, "event_not_found": E.EventNotFound,
+          "unauthorized": E.Unauthorized}
 
 # (code, http_status, transient) for every code the /api/v1/client routes return: the catalog values
 # (pinned against the C++ catalog by tests/python/test_client_routes.py::ROUTE_CODES).
@@ -354,7 +355,7 @@ _ROUTE_CODES = [
     ("restore_digest_mismatch", 500, False), ("fork_digest_mismatch", 500, False),
     ("insufficient_disk", 507, False), ("invalid_world_query", 400, False), ("world_protected", 409, False),
     ("labels_immutable", 409, False), ("invalid_labels", 400, False), ("snapshot_failed", 500, False),
-    ("internal_error", 500, False),
+    ("internal_error", 500, False), ("unauthorized", 401, False),
 ]
 
 
@@ -373,3 +374,19 @@ def test_every_route_code_raises_its_class_through_a_call(svc, code, status, tra
         assert isinstance(err.value, KeyError)
     if code == "handle_closed":
         assert isinstance(err.value, RuntimeError)
+
+
+# ───────────────────────── 最后修复波 A5（裁定 R91(5)）：401 unauthorized ─────────────────────────
+
+def test_wrong_token_raises_unauthorized_without_the_token():
+    """服务端 401 {"code":"unauthorized",...}：connect 抛 Unauthorized（StarlingClientError 的子类），code 是 unauthorized、非瞬态，
+    异常与它的链上都没有 token 与地址。"""
+    service = _Service()
+    service.fail["/connect"] = httpx.Response(401, json={"code": "unauthorized", "transient": False,
+                                                          "detail": "invalid or missing bearer token"})
+    with pytest.raises(E.Unauthorized) as err:
+        _client(service)
+    assert isinstance(err.value, E.StarlingClientError)
+    assert (err.value.code, err.value.transient) == ("unauthorized", False)
+    _assert_clean(err.value)
+    assert E.Unauthorized is starling_client.Unauthorized

@@ -314,7 +314,8 @@ def test_every_catalog_code_maps_to_its_client_exception(row):
     from starling_client import errors as E
     named = {"recall_degraded": E.RecallDegradedError, "event_conflict": E.EventConflict,
              "handle_closed": E.MemoryClosed, "protocol_mismatch": E.ProtocolMismatch,
-             "session_expired": E.SessionExpired, "event_not_found": E.EventNotFound}
+             "session_expired": E.SessionExpired, "event_not_found": E.EventNotFound,
+             "unauthorized": E.Unauthorized}
     code = row["code"]
     assert status_for(code) == row["http_status"]
     exc = E.from_body(status_for(code), error_body(code))
@@ -332,12 +333,15 @@ ROUTE_CODES = ("protocol_mismatch", "session_expired", "handle_closed", "world_h
                "world_exists", "invalid_world_name", "world_schema_behind", "world_not_seed",
                "snapshot_not_found", "snapshot_corrupt", "restore_digest_mismatch",
                "fork_digest_mismatch", "insufficient_disk", "invalid_world_query", "world_protected",
-               "labels_immutable", "invalid_labels", "snapshot_failed", "internal_error")
+               "labels_immutable", "invalid_labels", "snapshot_failed", "internal_error",
+               "unauthorized")
 
 
-def test_route_codes_are_cataloged_except_internal_error():
-    catalog = {row["code"] for row in _core.error_catalog()}
-    assert set(ROUTE_CODES) - catalog == {"internal_error"}       # 兜底码，未登记 → 500 非瞬态
+def test_route_codes_are_all_cataloged():
+    """最后修复波 A7（裁定 R100 M1）：兜底码 internal_error 也在码表里（500，非瞬态），没有例外。"""
+    catalog = {row["code"]: row for row in _core.error_catalog()}
+    assert set(ROUTE_CODES) - set(catalog) == set()
+    assert (catalog["internal_error"]["http_status"], catalog["internal_error"]["transient"]) == (500, False)
     assert (status_for("internal_error"), error_body("internal_error")["transient"]) == (500, False)
 
 
@@ -660,3 +664,24 @@ def test_the_default_world_without_a_provider_is_unchanged(no_key_svc):
     _ok(_call(client, handle, "embed_pending", now="2026-01-01T00:00:05Z"))
     assert _ok(_call(client, handle, "recall", query="auth", strict=True))["result"] == []
     _err(_call(client, handle, "remember_event", key="k", text="t", interlocutor="bob"), "llm_not_configured")
+
+
+# ───────────────────────── 最后修复波 A5（裁定 R91(5)）：401 也用码表的错误体 ─────────────────────────
+
+def test_wrong_or_missing_token_is_the_catalog_unauthorized_body(tmp_path):
+    """token 错或没带：401 {"code":"unauthorized","transient":false,"detail":"invalid or missing bearer token"}。detail 保留原来的
+    文字（前端只按状态码判 401，显示的是 detail）；体里没有 token。"""
+    app = create_app(_cfg(tmp_path, token="tok-secret-0451"), engine_factory=_stub_factory,
+                     idle_close_interval_s=0)
+    with TestClient(app) as client:
+        want = {"code": "unauthorized", "transient": False, "detail": "invalid or missing bearer token"}
+        for headers in ({}, {"Authorization": "Bearer wrong"}, {"Authorization": "tok-secret-0451"}):
+            resp = client.post(f"{API}/connect", json={"protocol": 1}, headers=headers)
+            assert (resp.status_code, resp.json()) == (401, want)
+            assert "tok-secret-0451" not in resp.text
+        resp = client.get("/api/ping")
+        assert (resp.status_code, resp.json()) == (401, want)
+        assert status_for("unauthorized") == 401
+        ok = client.post(f"{API}/connect", json={"protocol": 1},
+                         headers={"Authorization": "Bearer tok-secret-0451"})
+        assert ok.status_code == 200

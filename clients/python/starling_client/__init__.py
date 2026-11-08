@@ -4,7 +4,7 @@ from .client import Client, connect
 from .errors import (
     EventConflict, EventNotFound, MemoryClosed, ProtocolMismatch, RecallDegradedError,
     ServiceError, ServiceTimeout, ServiceUnavailable, SessionExpired, StarlingClientError,
-    WorldError,
+    Unauthorized, WorldError,
 )
 from .remote_memory import RemoteMemory
 from .types import EmbedStats, PendingEvent, RememberResult, StatementRow
@@ -18,5 +18,5 @@ __all__ = [
     "connect", "Client", "RemoteMemory", "PROTOCOL", "Transport", "COMMIT", "VERSION", "EmbedStats", "PendingEvent",
     "RememberResult", "StatementRow", "StarlingClientError", "RecallDegradedError",
     "EventConflict", "EventNotFound", "MemoryClosed", "ProtocolMismatch", "ServiceError",
-    "ServiceTimeout", "ServiceUnavailable", "SessionExpired", "WorldError",
+    "ServiceTimeout", "ServiceUnavailable", "SessionExpired", "Unauthorized", "WorldError",
 ]

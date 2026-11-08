@@ -310,7 +310,8 @@ def test_routes_non_domain_exception_is_json_500_internal_error(tmp_path, monkey
     with caplog.at_level("ERROR"):
         r = client.post("/api/worlds/default/snapshots", json={})
     assert r.status_code == 500 and r.headers["content-type"].startswith("application/json")
-    assert r.json() == {"detail": "internal_error"}            # 不把异常文本（含路径）泄给客户端
+    # 不把异常文本（含路径）泄给客户端；最后修复波 A6：码表的错误体，detail 不变。
+    assert r.json() == {"code": "internal_error", "transient": False, "detail": "internal_error"}
     assert "disk exploded" in caplog.text                       # 服务端日志里有
     app.state.pool.close_all()
 

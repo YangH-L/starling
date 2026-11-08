@@ -115,7 +115,7 @@ async def _run(fn, *args, **kwargs):
         # 不兜住的话 Starlette 回的是纯文本 500，前端按 JSON detail 解析会炸。异常文本可能
         # 带服务器路径，只进日志，不回给客户端。
         logger.exception("worlds route failed")
-        raise HTTPException(status_code=500, detail="internal_error") from exc
+        raise _fail("internal_error") from exc
 
 
 def _pool(request: Request):

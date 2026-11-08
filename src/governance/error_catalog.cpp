@@ -60,6 +60,10 @@ const std::vector<ErrorInfo>& error_catalog() {
         // Task 4.5：客户端路由的请求错误（未知方法、未知管理操作、参数形状不对），与抽取角色没绑定（看板旧码，状态沿用）。
         entry("invalid_request", false, 400),
         entry("llm_not_configured", false, 409),
+        // 最后修复波 A5–A7（裁定 R91(5)、R48、R100 M1）：bearer token 错或没带；检视路由按 id 找不到行；路由兜底的服务端错误。
+        entry("unauthorized", false, 401),
+        entry("not_found", false, 404),
+        entry("internal_error", false, 500),
     };
     return kCatalog;
 }
