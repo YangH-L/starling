@@ -8,9 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import queue
-import re
-import signal
 import subprocess
 import sys
 import threading
@@ -22,11 +19,14 @@ from pathlib import Path
 import httpx
 import pytest
 
+from fakes.service_proc import LISTENING as _LISTENING
+from fakes.service_proc import START_TIMEOUT_S as _START_TIMEOUT_S
+from fakes.service_proc import ServiceFactory
+from fakes.service_proc import ServiceProc as _Service
+from fakes.service_proc import clean_env as _clean_env
+
 ROOT = Path(__file__).resolve().parents[2]
 TOKEN = "t43-service-token"
-_LISTENING = re.compile(r"starling-serve listening on http://127\.0\.0\.1:(\d+)")
-_READY = "starling-serve ready"
-_START_TIMEOUT_S = 60.0
 
 
 # ───────────────────────── 本机假抽取端点 ─────────────────────────
@@ -69,112 +69,16 @@ def fake_openai():
 
 
 # ───────────────────────── 子进程服务 ─────────────────────────
-
-def _clean_env(home: Path, **extra: str) -> dict:
-    env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("OPENAI_", "STARLING_"))}
-    env["HOME"] = str(home)
-    env.update(extra)
-    return env
-
-
-class _Service:
-    """一个 starling-serve 子进程。stdout 由读线程逐行放进队列；stderr 写到文件（访问日志多，管道会写满）。"""
-
-    def __init__(self, argv: list[str], env: dict, cwd: Path, stderr_path: Path) -> None:
-        self.stderr_path = stderr_path
-        self._stderr = open(stderr_path, "wb")
-        self.proc = subprocess.Popen(argv, env=env, cwd=str(cwd), stdout=subprocess.PIPE,
-                                     stderr=self._stderr, text=True)
-        self.lines: queue.Queue = queue.Queue()
-        self.stdout: list[str] = []
-        self._reader = threading.Thread(target=self._read, daemon=True)
-        self._reader.start()
-        self.port: int | None = None
-
-    def _read(self) -> None:
-        for line in self.proc.stdout:
-            self.stdout.append(line)
-            self.lines.put(line)
-        self.lines.put(None)
-
-    def wait_line(self, predicate, timeout_s: float = _START_TIMEOUT_S) -> str:
-        deadline = time.monotonic() + timeout_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AssertionError(f"no matching stdout line; stdout={self.stdout!r}; "
-                                     f"stderr={self.stderr()[-2000:]!r}")
-            try:
-                line = self.lines.get(timeout=remaining)
-            except queue.Empty:
-                continue
-            if line is None:
-                raise AssertionError(f"service exited ({self.proc.wait()}) before the line; "
-                                     f"stdout={self.stdout!r}; stderr={self.stderr()[-2000:]!r}")
-            if predicate(line):
-                return line
-
-    def wait_listening(self) -> int:
-        line = self.wait_line(lambda text: _LISTENING.search(text) is not None)
-        self.port = int(_LISTENING.search(line).group(1))
-        return self.port
-
-    def wait_ready(self) -> None:
-        self.wait_line(lambda text: _READY in text)
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
-
-    def client(self) -> httpx.Client:
-        return httpx.Client(base_url=self.url, timeout=30.0,
-                            headers={"Authorization": f"Bearer {TOKEN}"})
-
-    def stderr(self) -> str:
-        self._stderr.flush()
-        return self.stderr_path.read_text("utf-8", "replace")
-
-    def terminate(self, timeout_s: float = 30.0) -> int:
-        self.proc.send_signal(signal.SIGTERM)
-        return self.proc.wait(timeout_s)
-
-    def kill(self) -> None:
-        if self.proc.poll() is None:
-            self.proc.kill()
-            self.proc.wait(10)
-        self._stderr.close()
-
+# 子进程辅助（clean_env、ServiceProc、ServiceFactory）在 fakes/service_proc.py，与验收测试共用。
 
 @pytest.fixture
 def services(tmp_path):
     """起服务的工厂；用例结束时（含失败）杀掉每一个还活着的子进程。"""
-    started: list[_Service] = []
-    home = tmp_path / "home"
-    home.mkdir()
-
-    def start(data_dir: Path, *, argv_extra: tuple[str, ...] = (), env_extra: dict | None = None,
-              token_file: bool = True, launcher: Path | None = None) -> _Service:
-        index = len(started)
-        argv = [sys.executable]
-        argv += [str(launcher)] if launcher is not None else ["-m", "starling.service"]
-        argv += ["--data-dir", str(data_dir), "--host", "127.0.0.1", "--port", "0"]
-        env = _clean_env(home, **(env_extra or {}))
-        if token_file:
-            token_path = tmp_path / f"token-{index}"
-            token_path.write_text(TOKEN + "\n", encoding="utf-8")
-            argv += ["--token-file", str(token_path)]
-        argv += list(argv_extra)
-        service = _Service(argv, env, tmp_path, tmp_path / f"stderr-{index}.log")
-        started.append(service)
-        return service
-
-    start.home = home
+    factory = ServiceFactory(tmp_path, token=TOKEN)
     try:
-        yield start
+        yield factory
     finally:
-        for service in started:
-            service.kill()
+        factory.kill_all()
 
 
 def _write_config(data_dir: Path, base_url: str) -> None:

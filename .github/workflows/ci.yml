@@ -83,9 +83,13 @@ jobs:
           CC: clang-17
           CXX: clang++-17
           CMAKE_ARGS: "-DSQLite3_INCLUDE_DIR=/usr/local/include -DSQLite3_LIBRARY=/usr/local/lib/libsqlite3.so"
-        run: pip install -e ".[dev,dashboard]"   # dashboard extra = fastapi/uvicorn/httpx (dashboard tests import them)
+        run: |
+          pip install -e ".[dev,dashboard]"   # dashboard extra = fastapi/uvicorn/httpx (dashboard tests import them)
+          pip install -e clients/python       # starling_client: the service acceptance tests import it
       - name: pytest
         run: python -m pytest   # `python -m` puts the repo root on sys.path so tests that import `scripts` resolve
+      - name: pytest (client package)
+        run: python -m pytest clients/python/tests -q
 
   static-scan:
     runs-on: ubuntu-24.04
