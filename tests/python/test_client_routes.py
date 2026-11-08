@@ -328,6 +328,7 @@ ROUTE_CODES = ("protocol_mismatch", "session_expired", "handle_closed", "world_h
                "world_read_only", "world_not_found", "world_settings_mismatch", "invalid_settings",
                "invalid_request", "recall_degraded", "event_conflict", "event_not_found",
                "llm_not_configured", "worlds_unavailable", "world_open_failed", "endpoint_changed",
+               "endpoint_key_missing",
                "world_exists", "invalid_world_name", "world_schema_behind", "world_not_seed",
                "snapshot_not_found", "snapshot_corrupt", "restore_digest_mismatch",
                "fork_digest_mismatch", "insufficient_disk", "invalid_world_query", "world_protected",
@@ -612,3 +613,50 @@ def test_completion_mode_needs_strict_and_include_volatile_off(svc):
                                                      "detail": "invalid_request"})
     _err(_call(client, handle, "recall", query="q", mode="completion", strict=False), "invalid_request")
     _ok(_call(client, handle, "recall", query="q", mode="completion", strict=False, include_volatile=False))
+
+
+# ───────────────────────── 最后修复波 A1：显式端点缺服务密钥 → endpoint_key_missing ─────────────────────────
+
+# 客户端显式给的端点（没有 provider_name）。地址是本机一个不监听的端口：万一真发出请求也只会连不上，不会走到外网。
+_EXPLICIT = {"extraction": {"provider": "openai", "base_url": "http://127.0.0.1:9/v1", "model": "m-x"},
+             "embedding": {"provider": "openai", "base_url": "http://127.0.0.1:9/v1", "model": "e-x",
+                           "dim": 8}}
+
+
+@pytest.fixture
+def no_key_svc(tmp_path, monkeypatch):
+    """服务环境里没有 OPENAI_API_KEY；默认世界没配 provider（看板「没有配 provider 的默认世界」）。引擎是真的
+    DashboardEngine，不注入抽取替身：替身不是从设置建的，会绕过这道判定。"""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    app = create_app(_cfg(tmp_path, providers={}, roles={}), idle_close_interval_s=0)
+    with TestClient(app) as client:
+        client.app.state.pool._monotonic_ms = _Clock()
+        yield client
+
+
+def test_explicit_endpoint_without_the_service_key_is_endpoint_key_missing(no_key_svc):
+    """裁定 R100 I1（spec §8.3）：显式端点、服务环境里没有密钥：remember_event、embed_pending、recall(strict=True) 都回 409
+    endpoint_key_missing（非瞬态），不退回占位嵌入、也不当成「抽取没绑定」。remember_event 在写 pending 行之前就拒绝。"""
+    client = no_key_svc
+    _ok(client.post(f"{API}/admin/create_world", json={"name": "x1", "settings": _EXPLICIT}))
+    sid = _connect(client)
+    handle = _ok(_open(client, sid, world="x1"))["handle_id"]
+    resp = _call(client, handle, "remember_event", key="k", text="Bob owns auth", interlocutor="bob")
+    assert (resp.status_code, resp.json()) == (409, {"code": "endpoint_key_missing", "transient": False,
+                                                     "detail": "endpoint_key_missing"})
+    _err(_call(client, handle, "embed_pending", now="2026-01-01T00:00:05Z"), "endpoint_key_missing")
+    _err(_call(client, handle, "recall", query="auth", strict=True, include_volatile=True),
+         "endpoint_key_missing")
+    _err(_call(client, handle, "recall", query="auth", strict=False), "endpoint_key_missing")
+    assert _ok(_call(client, handle, "pending_events"))["result"] == []
+    assert _ok(_call(client, handle, "next_seq"))["result"] == 0
+
+
+def test_the_default_world_without_a_provider_is_unchanged(no_key_svc):
+    """没配 provider 的默认世界照旧：嵌入用占位（embed_pending、strict 召回都 200），抽取没绑定是 llm_not_configured。"""
+    client = no_key_svc
+    sid = _connect(client)
+    handle = _ok(_open(client, sid, world="default"))["handle_id"]
+    _ok(_call(client, handle, "embed_pending", now="2026-01-01T00:00:05Z"))
+    assert _ok(_call(client, handle, "recall", query="auth", strict=True))["result"] == []
+    _err(_call(client, handle, "remember_event", key="k", text="t", interlocutor="bob"), "llm_not_configured")

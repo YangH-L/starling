@@ -49,8 +49,8 @@ constexpr Expected kSpecCodes[] = {
 // 布局校验）只传 registry_corrupt / snapshot_failed，两者已在表内。session_table.cpp 贡献 handle_closed、
 // session_expired、world_held、world_in_use；registry_db.cpp 的 require_writable 贡献 world_held、world_read_only。
 constexpr std::string_view kThrownBySrcGovernance[] = {
-    "endpoint_changed", "fork_digest_mismatch", "handle_closed", "insufficient_disk",
-    "invalid_auto_snapshot", "invalid_labels", "invalid_retention", "invalid_settings",
+    "endpoint_changed", "endpoint_key_missing", "fork_digest_mismatch", "handle_closed",
+    "insufficient_disk", "invalid_auto_snapshot", "invalid_labels", "invalid_retention", "invalid_settings",
     "invalid_snapshot_kind", "invalid_world_name", "invalid_world_query", "labels_immutable",
     "registry_corrupt", "restore_digest_mismatch", "session_expired", "snapshot_corrupt",
     "snapshot_failed", "snapshot_not_found", "snapshot_unsupported_backend", "world_busy",

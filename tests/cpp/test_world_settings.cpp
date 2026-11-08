@@ -352,6 +352,29 @@ TEST(WorldSettings, EndpointChangedWhenTheProviderWasDeleted) {
               "endpoint_changed");
 }
 
+// 裁定 R100 I1（spec §8.3）：显式端点（provider_name 为空）没有服务密钥 → endpoint_key_missing；有密钥，或继承 provider 的
+// 端点（不论有没有密钥）都不抛。消息点名角色、不带地址。
+TEST(WorldSettings, EndpointKeyMissingOnlyForAnExplicitEndpointWithoutTheServiceKey) {
+    EndpointSettings explicit_ep;
+    explicit_ep.provider = "openai";
+    explicit_ep.base_url = "http://client.example/v1";
+    EXPECT_EQ(error_code([&] { require_endpoint_key(explicit_ep, false, "embedding"); }),
+              "endpoint_key_missing");
+    EXPECT_NO_THROW(require_endpoint_key(explicit_ep, true, "embedding"));
+    EndpointSettings inherited = explicit_ep;
+    inherited.provider_name = "p";
+    EXPECT_NO_THROW(require_endpoint_key(inherited, false, "extraction"));
+    EXPECT_NO_THROW(require_endpoint_key(inherited, true, "extraction"));
+    try {
+        require_endpoint_key(explicit_ep, false, "extraction");
+        ADD_FAILURE() << "no throw";
+    } catch (const WorldStoreError& err) {
+        const std::string text = err.what();
+        EXPECT_EQ(text.find("example"), std::string::npos) << text;
+        EXPECT_NE(text.find("extraction"), std::string::npos) << text;
+    }
+}
+
 // 裁定 R58：向量只在嵌入的模型或维度变了时作废；只换地址、种类不重嵌入；解绑不重嵌入。
 TEST(WorldSettings, EmbeddingNeedsReembedOnlyWhenModelOrDimChanges) {
     EndpointSettings before;

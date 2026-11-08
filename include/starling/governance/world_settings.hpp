@@ -103,6 +103,13 @@ void require_endpoint_unchanged(const EndpointSettings& world_endpoint,
                                 const std::optional<ProviderEndpoint>& current,
                                 std::string_view role);
 
+// 裁定 R100 I1（spec §8.3）：客户端显式给的端点（provider_name 为空）调用时用服务进程的 OPENAI_API_KEY；key_present 为假
+// （服务环境里没有这个密钥）就抛 endpoint_key_missing。显式端点永远不退回占位（嵌入不用占位向量、抽取不当成「没绑定」）。
+// provider_name 非空（继承 provider，密钥取 provider 表）永不抛：没有密钥时由调用方照旧按没绑定处理（抽取
+// llm_not_configured，看板没配 provider 的默认世界用占位嵌入）。只收「密钥在不在」这个布尔值，不收密钥本身。role 只用于
+// 消息，消息不带地址（裁定 R54）。
+void require_endpoint_key(const EndpointSettings& endpoint, bool key_present, std::string_view role);
+
 // 嵌入 endpoint 从 before 换成 after 时，世界里已有的向量是否作废、要重嵌入（裁定 R58）。向量的空间由嵌入的模型与维度决定，
 // 与地址、密钥、种类无关，所以：after 为空（角色解绑，例如 provider 被删掉）→ false，向量留着（召回降级到重新绑定为止）；
 // before 为空、after 不为空 → true（之前是占位嵌入）；两者都在时 model 或 dim 任一不同 → true，只换地址 → false。

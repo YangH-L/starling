@@ -397,6 +397,15 @@ void require_endpoint_unchanged(const EndpointSettings& world_endpoint,
     }
 }
 
+void require_endpoint_key(const EndpointSettings& endpoint, bool key_present, std::string_view role) {
+    if (!endpoint.provider_name.empty() || key_present) {
+        return;
+    }
+    throw WorldStoreError("endpoint_key_missing",
+                          "显式端点（角色 " + std::string(role) +
+                              "）要用服务进程的 OPENAI_API_KEY，服务环境里没有设置");
+}
+
 bool embedding_needs_reembed(const std::optional<EndpointSettings>& before,
                              const std::optional<EndpointSettings>& after) {
     if (!after.has_value()) {

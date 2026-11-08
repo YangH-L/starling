@@ -288,6 +288,8 @@ _ROLE_ATTR = {"extraction": "llm", "chat": "chat_llm", "consolidation": "consoli
 _REFUSED_ENDPOINT = {"refused_at_open": True}
 # _key_stale 的 snap 缺省值：自己拍一份快照。
 _FRESH = object()
+# tick 里嵌入端点被拒时只跳过嵌入阶段的码（裁定 R54；R100 I1 加 endpoint_key_missing）。
+_EMBEDDING_REFUSALS = ("endpoint_changed", "endpoint_key_missing")
 # NORM-gist 阈值里绑定层要整数的几项（ReplayScheduler.run_sleep / run_idle 的签名）。世界设置把阈值
 # 存成 double（C++ map<string,double>），所以 4.0 要还原成 4 才能传进去。
 _INT_GIST_KEYS = ("min_holders", "min_replay_count", "entity_gist_enabled")
@@ -335,6 +337,7 @@ class DashboardEngine:
         # 的状态。只在 tick（持 self._lock）里写；后台循环按两者是否不同决定记不记一次日志。
         self.embedding_refused = False
         self._embedding_refusal_logged = False
+        self._embedding_refusal_code = "endpoint_changed"
         # 裁定 R41：每个角色的适配器是按哪个 endpoint 建的（建与重建时记下；None = 不是从设置建的，例如测试
         # 直接 eng.llm = fake，或角色没有 endpoint）。用到适配器之前核对的是这个，不是 _settings 里的：设置
         # 被换了却没重建适配器时，按旧 endpoint 建的适配器（带着密钥指着旧地址）不能被新设置的核对放行。
@@ -497,6 +500,15 @@ class DashboardEngine:
         current = provider_endpoint(prov) if prov is not None else None
         _core.world_require_endpoint_unchanged(ep, current, role)
 
+    def _require_endpoint_key(self, role: str, ep: dict | None, prov) -> None:
+        """裁定 R100 I1（spec §8.3）：用到 role 的世界适配器之前调（持 self._lock）。客户端显式给的端点（provider_name 为空）
+        要用服务进程的 OPENAI_API_KEY，环境里没有就抛 endpoint_key_missing：显式端点不退回占位嵌入，也不当成「抽取没绑定」。
+        判定在 C++ world_require_endpoint_key，这里只传「密钥在不在」。没有 endpoint 的角色、继承 provider 的端点（C++ 不判，
+        没有密钥时照旧按没绑定处理）、不是从设置建的适配器（测试直接装的替身不在 _built_endpoints 里，它不用服务密钥）都放行。"""
+        if not ep or role not in self._built_endpoints:
+            return
+        _core.world_require_endpoint_key(ep, bool(endpoint_key_from(ep, prov)), role)
+
     def _source_endpoint(self, role: str) -> dict | None:
         """role 的适配器此刻该按哪个 endpoint 建：_settings[role]；chat 没绑定时回退到抽取的（与构造时一致）。"""
         if role == "chat":
@@ -587,6 +599,7 @@ class DashboardEngine:
         attr = _ROLE_ATTR[role]
         ep = self._source_endpoint(role)
         prov = self._provider_snapshot(ep)
+        self._require_endpoint_key(role, ep, prov)           # 裁定 R100 I1：显式端点缺服务密钥 → endpoint_key_missing
         stale = role in self._built_endpoints and self._built_endpoints[role] != ep
         # 密钥指纹变了（裁定 R52）也要走一遍：没有适配器、provider 刚加上密钥时，按新密钥建出来。
         if stale or getattr(self._core, attr) is not None or self._key_stale(role, prov):
@@ -598,6 +611,8 @@ class DashboardEngine:
         请求，不核对；但设置已换成另一个 endpoint 时照样按新设置核对并重建（裁定 R41）。快照只拍一份（裁定 R57）。"""
         ep = self._settings.get("embedding")
         prov = self._provider_snapshot(ep)
+        # 裁定 R100 I1：显式端点没有服务密钥时 endpoint_key_missing，不拿占位向量去嵌入或召回。占位只留给没有嵌入端点的世界。
+        self._require_endpoint_key("embedding", ep, prov)
         stale = ("embedding" in self._built_endpoints
                  and self._built_endpoints["embedding"] != ep)
         if self._embedder_live or stale or self._key_stale("embedding", prov):
@@ -884,7 +899,14 @@ class DashboardEngine:
         returned as a warning string so the save can surface it (silent success
         with broken embeddings is worse than a clear heads-up)."""
         # 裁定 R38：在删任何向量之前核对嵌入的继承地址；改了就抛 endpoint_changed，一行不删。
-        self._require_embedding_unchanged()
+        # 裁定 R100 I1：显式端点缺服务密钥时不重嵌入（不清向量、不拿占位向量重写），与其他「跳过」一样回提示，不让改设置失败。
+        try:
+            self._require_embedding_unchanged()
+        except _core.WorldStoreError as exc:
+            if _core.world_store_error_code(exc) != "endpoint_key_missing":
+                raise
+            return ("re-embed skipped: the embedding endpoint needs the service's OPENAI_API_KEY "
+                    "(endpoint_key_missing); vectors NOT cleared")
         if self.read_only:
             # 只读世界（spec §6.3）：库只读打开，向量一行不删；换上的嵌入只用于查询。
             return "re-embed skipped: the world is opened read-only; vectors NOT cleared"
@@ -1187,14 +1209,17 @@ class DashboardEngine:
         return stats
 
     def _embedding_usable(self) -> bool:
-        """持 self._lock。嵌入端点此刻能不能用：_require_embedding_unchanged 抛 endpoint_changed → False，其余照常
-        抛出。结果记在 embedding_refused。"""
+        """持 self._lock。嵌入端点此刻能不能用：_require_embedding_unchanged 抛 endpoint_changed 或 endpoint_key_missing
+        （裁定 R100 I1：显式端点缺服务密钥，与 endpoint_changed 同样只跳过嵌入阶段，其余维护照常）→ False，其余照常抛出。
+        结果记在 embedding_refused，码记在 _embedding_refusal_code（后台循环的日志点名它）。"""
         try:
             self._require_embedding_unchanged()
         except _core.WorldStoreError as exc:
-            if _core.world_store_error_code(exc) != "endpoint_changed":
+            code = _core.world_store_error_code(exc)
+            if code not in _EMBEDDING_REFUSALS:
                 raise
             self.embedding_refused = True
+            self._embedding_refusal_code = code
             return False
         self.embedding_refused = False
         return True
@@ -1206,7 +1231,11 @@ class DashboardEngine:
         if refused == self._embedding_refusal_logged:
             return
         self._embedding_refusal_logged = refused
-        if refused:
+        if refused and self._embedding_refusal_code == "endpoint_key_missing":
+            logger.warning("world %s: embedding endpoint has no service key (endpoint_key_missing); "
+                           "background embedding is paused until OPENAI_API_KEY is set for the "
+                           "service, other maintenance continues", self._ctx.name)
+        elif refused:
             logger.warning("world %s: embedding endpoint changed (endpoint_changed); background "
                            "embedding is paused until the endpoint is re-confirmed, other "
                            "maintenance continues", self._ctx.name)

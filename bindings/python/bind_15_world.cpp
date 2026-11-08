@@ -382,6 +382,15 @@ void bind_15_world(pybind11::module_& m) {
               gov::require_endpoint_unchanged(*parsed.extraction, now_at, role);
           }, py::arg("world_endpoint"), py::arg("current"), py::arg("role"));
 
+    // 裁定 R100 I1：endpoint 同上（settings 里一个 endpoint 段的 dict），key_present 是服务进程环境里有没有 OPENAI_API_KEY
+    // （调用方只传布尔值，不传密钥）。provider_name 为空且 key_present 为假时抛 endpoint_key_missing，规则在 C++
+    // require_endpoint_key。
+    m.def("world_require_endpoint_key",
+          [](const py::dict& endpoint, bool key_present, const std::string& role) {
+              const auto parsed = gov::settings_from_json(from_py(py::dict("extraction"_a = endpoint)));
+              gov::require_endpoint_key(*parsed.extraction, key_present, role);
+          }, py::arg("endpoint"), py::arg("key_present"), py::arg("role"));
+
     // 嵌入 endpoint 从 before 换成 after（各为设置里 embedding 段的 dict，None = 没绑定）时要不要重嵌入（裁定 R58）。
     // 解析走 settings_from_json（字段规则同一份），规则在 C++ embedding_needs_reembed。
     m.def("world_embedding_needs_reembed",

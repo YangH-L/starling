@@ -348,6 +348,7 @@ _ROUTE_CODES = [
     ("invalid_settings", 400, False), ("invalid_request", 400, False), ("recall_degraded", 503, True),
     ("event_conflict", 409, False), ("event_not_found", 404, False), ("llm_not_configured", 409, False),
     ("worlds_unavailable", 503, True), ("world_open_failed", 500, False), ("endpoint_changed", 409, False),
+    ("endpoint_key_missing", 409, False),
     ("world_exists", 409, False), ("invalid_world_name", 400, False), ("world_schema_behind", 409, False),
     ("world_not_seed", 409, False), ("snapshot_not_found", 404, False), ("snapshot_corrupt", 409, False),
     ("restore_digest_mismatch", 500, False), ("fork_digest_mismatch", 500, False),
