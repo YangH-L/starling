@@ -85,7 +85,7 @@ class CallBody(_Body):
 # 门面方法的参数（缺省同 spec §13.3 的客户端签名）。
 class _RecallArgs(_Body):
     query: str
-    k: int = 10
+    k: int = Field(default=10, ge=0)            # 修复轮 2 N2：负数回 400；0 照常（空结果）
     mode: Literal["semantic", "completion"] = "semantic"
     strict: bool = True
     include_volatile: bool = True

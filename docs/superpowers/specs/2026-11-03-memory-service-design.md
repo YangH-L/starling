@@ -247,7 +247,7 @@ starling-serve --data-dir D --host 127.0.0.1 --port P [--token-file F]
 - 打开的触发：客户端 `open`、看板点进一个世界、管理操作需要。
 - 关闭的触发：客户端显式 `close_world`；或 C++ 的空闲判定（没有活句柄、没有在途调用、超过空闲时限，默认 10 分钟，§11）说可以关。默认世界不因空闲关闭。
 - 引擎之间没有共享锁。一个世界在等抽取或嵌入的 HTTP 响应时，其他世界照常读写（GIL 见 §12）。
-- 同一世界内的调用由引擎锁串行化（需求 5.2）。所以同一世界里 holder A 抽取时，holder B 的召回要等。rise 的 rollout 一条一条顺序跑，可以接受；把 `remember_event` 拆成「锁外抽取、锁内提交」（像今天看板的 `remember` 那样）留作以后的优化。
+- 同一世界内的写入由引擎锁串行化（需求 5.2）。`remember_event` 分三段（C++ `remember_event_begin` / `remember_event_extract` / `remember_event_finish`，与看板的 `remember` 同一种写法）：begin（读收据行、占位、补齐、写 engram）与 finish（提交语句与收据）在引擎锁内，抽取在锁外。所以同一世界里 holder A 抽取时，holder B 的召回不用等。同一个 key 的并发调用（例如客户端超时后的重放）由 finish 在事务里重读收据行收敛：行已 committed 就返回 idempotent、不写；行已 abandoned 或被清空就抛 `event_conflict`、不写；仍 pending 才把语句与收据一起提交。
 - 今天 `WorldManager` 的「切换窗口 + 租约归零才换引擎」那一套缩小到单个世界：恢复、关闭、删除一个世界时，只等这个世界的租约归零。
 
 ## 11. 句柄、租约与会话

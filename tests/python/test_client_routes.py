@@ -589,3 +589,26 @@ def test_abandon_during_a_write_wins_and_leaves_no_statements(svc):
     ids, receipts = _statements_and_receipts(pool, "w1")
     assert receipts["k"] == ("abandoned", [])
     assert ids == set()
+
+
+# ───────────────────────── 修复轮 2 N2、N3：recall 的参数校验 ─────────────────────────
+
+def test_recall_negative_k_is_invalid_request_and_zero_is_fine(svc):
+    client, _clock = svc
+    sid = _connect(client)
+    handle = _ok(_open(client, sid))["handle_id"]
+    _err(_call(client, handle, "recall", query="q", k=-1), "invalid_request")
+    assert _ok(_call(client, handle, "recall", query="q", k=0))["result"] == []
+
+
+def test_completion_mode_needs_strict_and_include_volatile_off(svc):
+    """R93(3)：completion 模式没有降级信号，客户端缺省的 strict=True / include_volatile=True 与它不兼容，在调引擎之前回 400
+    invalid_request（非瞬态）；两者都传 False 时 200。"""
+    client, _clock = svc
+    sid = _connect(client)
+    handle = _ok(_open(client, sid))["handle_id"]
+    resp = _call(client, handle, "recall", query="q", mode="completion")
+    assert (resp.status_code, resp.json()) == (400, {"code": "invalid_request", "transient": False,
+                                                     "detail": "invalid_request"})
+    _err(_call(client, handle, "recall", query="q", mode="completion", strict=False), "invalid_request")
+    _ok(_call(client, handle, "recall", query="q", mode="completion", strict=False, include_volatile=False))

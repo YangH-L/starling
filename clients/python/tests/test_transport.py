@@ -66,6 +66,14 @@ def test_non_json_5xx_is_transient_service_error():
     with pytest.raises(E.ServiceError) as ei:
         make(lambda r: httpx.Response(502, text="bad gateway")).get("/p", None)
     assert ei.value.transient is True
+    _assert_clean(ei.value)                       # 修复轮 2 N4：JSON 解析失败不挂在链上
+
+
+def test_non_json_2xx_is_bad_response_without_a_chain():
+    with pytest.raises(E.ServiceError) as ei:
+        make(lambda r: httpx.Response(200, text="<html>ok</html>")).post("/p", {})
+    assert ei.value.code == "bad_response"
+    _assert_clean(ei.value)
 
 
 URL_SECRET = "10.9.8.7:4242/secret-path"
@@ -145,6 +153,7 @@ def test_non_json_4xx_gets_http_status_code():
     with pytest.raises(E.StarlingClientError) as ei:
         make(lambda r: httpx.Response(404, text="nope")).get("/p", None)
     assert ei.value.code == "http_404" and ei.value.transient is False
+    _assert_clean(ei.value)
 
 
 def test_200_non_json_is_service_error():
