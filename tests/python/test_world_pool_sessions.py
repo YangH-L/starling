@@ -11,7 +11,8 @@ import pytest
 
 from starling import _core
 from starling.dashboard.config import DashboardConfig
-from starling.dashboard.world_manager import WorldPool
+from starling.dashboard.engine import DashboardEngine
+from starling.dashboard.world_manager import WorldPool, WorldSwitchError
 
 
 class _Clock:
@@ -1099,3 +1100,70 @@ def test_idle_round_expires_sessions_first(tmp_path):
     finally:
         pool.close_all()
 
+
+
+# ═════════════════════════ 最后修复波 A3（裁定 R87 N1）：钩子在起摄入线程时装 ═════════════════════════
+
+def test_ingest_hook_is_installed_when_the_ingest_thread_starts_after_a_settings_change(tmp_path):
+    """世界以 ingest=False 打开（引擎打开时不挂钩子）；PUT 设置把 ingest 改成 True；接着一次关闭失败（租约排不干，world_busy），
+    _restart_after_failed_close 按新设置补起摄入线程。此时摄入线程在跑，钩子不为 None。"""
+    pool, _sessions, _clock = _idle_pool(tmp_path)
+    try:
+        pool.create_world("w2", "", overrides={"background": {"ingest": False}})
+        pool.start_background(stats_interval_s=999, scheduler_poll_s=999, scheduler_first_delay_s=999,
+                              idle_close_interval_s=0)
+        with pool.lease("w2") as engine:
+            assert engine._ingest_thread is None and engine.session_snapshot_hook is None
+            engine = None
+        pool.update_settings("w2", {"background": {"ingest": True}})
+        held = pool.lease("w2")                                   # 一份不放的租约：关闭排不干
+        try:
+            with pytest.raises(WorldSwitchError) as ei:
+                pool.close_world("w2", timeout_s=0.05)
+            assert ei.value.code == "world_busy"
+            engine = held.engine
+            assert engine._ingest_thread is not None and engine._ingest_thread.is_alive()
+            assert engine.session_snapshot_hook is not None
+            engine = None
+        finally:
+            held.release()
+    finally:
+        pool.close_all()
+
+
+def test_ingest_hook_is_installed_when_lost_workers_are_restarted(tmp_path, monkeypatch):
+    """workers-lost 之后补起（_retry_lost_workers）同样经 _start_workers 装钩子：打开时摄入关着，PUT 改成开着，起线程失败一次后
+    下一次租约补起，钩子已装上。"""
+    pool, _sessions, _clock = _idle_pool(tmp_path)
+    try:
+        pool.create_world("w2", "", overrides={"background": {"ingest": False}})
+        pool.start_background(stats_interval_s=999, scheduler_poll_s=999, scheduler_first_delay_s=999,
+                              idle_close_interval_s=0)
+        with pool.lease("w2") as engine:
+            assert engine.session_snapshot_hook is None
+            engine = None
+        pool.update_settings("w2", {"background": {"ingest": True}})
+        real = DashboardEngine.start_ingest_worker
+        calls = {"n": 0}
+
+        def flaky(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("spool unreadable")
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(DashboardEngine, "start_ingest_worker", flaky)
+        held = pool.lease("w2")
+        try:
+            with pytest.raises(WorldSwitchError):
+                pool.close_world("w2", timeout_s=0.05)            # 补起时第一次失败 → workers-lost
+            assert pool.workers_lost_worlds() == ["w2"]
+        finally:
+            held.release()
+        with pool.lease("w2") as engine:                          # 下一次租约补起
+            assert engine._ingest_thread is not None
+            assert engine.session_snapshot_hook is not None
+            engine = None
+        assert pool.workers_lost_worlds() == []
+    finally:
+        pool.close_all()

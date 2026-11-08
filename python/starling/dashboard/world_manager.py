@@ -783,7 +783,8 @@ class WorldPool:
     def _wire(self, world: str, engine) -> None:
         """挂上池的回调：统计去抖广播（on_commit）与按会话的自动快照钩子（有注册表时）。钩子只由摄入线程调，所以只挂给可写打开、
         且 C++ 给的生效设置开着摄入的世界（spec §6.3、裁定 R68、R83 M1）：只读引擎不挂；可回收世界的生效设置后台全关（C++
-        effective_world_settings 判，切成可写引擎也一样），不挂。Python 不另判世界类型。"""
+        effective_world_settings 判，切成可写引擎也一样），不挂。Python 不另判世界类型。这里按打开时的设置挂；打开之后设置才开了
+        摄入的，由 _start_workers 在起摄入线程时补挂（裁定 R87 N1）。"""
         engine.on_commit = lambda: self._note_change(world)
         if self._registry is None or getattr(engine, "read_only", False):
             return
@@ -1016,7 +1017,12 @@ class WorldPool:
     # ───────────────────────── 后台线程 ─────────────────────────
 
     def _start_workers(self, world: str, engine) -> None:
-        """按该世界的 settings.background 起 tick / 摄入线程（钩子已在 _open_engine 挂好）。"""
+        """按该世界的 settings.background 起 tick / 摄入线程。
+
+        裁定 R87 N1：按会话的自动快照钩子在起摄入线程的这一刻按引擎此刻的设置装上（有注册表时；只读引擎不起摄入，
+        start_ingest_worker 是 no-op）。所有起摄入线程的路径都经这里：发布新引擎、start_background、关闭失败后补起
+        （_restart_after_failed_close）、workers-lost 之后补起（_retry_lost_workers）。引擎打开时 _wire 按当时的设置已挂过一次；
+        设置在打开之后才把摄入改成开着（PUT 设置）时，打开时没挂，这里补上，不会起一个钩子为 None 的摄入线程。"""
         background = engine._settings["background"]
         interval = float(background["tick_interval_s"])
         if interval > 0:
@@ -1024,6 +1030,8 @@ class WorldPool:
             engine.start_background_tick(
                 interval, (lambda stats: on_tick(world, stats)) if on_tick is not None else None)
         if background["ingest"]:
+            if self._registry is not None and not getattr(engine, "read_only", False):
+                self.attach_hooks(world, engine)
             engine.start_ingest_worker()
 
     def start_background(self, *, stats_interval_s: float = _STATS_REFRESH_S,
