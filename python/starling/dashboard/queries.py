@@ -235,7 +235,7 @@ def conflicts(db_path: str, tenant: str, *, frozen: bool = False) -> dict:
             "FROM statement_edges e "
             "LEFT JOIN statements s ON s.id = e.src_id AND s.tenant_id = e.tenant_id "
             "LEFT JOIN statements d ON d.id = e.dst_id AND d.tenant_id = e.tenant_id "
-            "WHERE e.tenant_id=? AND e.edge_kind='CONFLICTS_WITH' "
+            "WHERE e.tenant_id=? AND e.edge_kind='conflicts_with' "
             "ORDER BY e.weight DESC LIMIT 500",
             (tenant,),
         )
