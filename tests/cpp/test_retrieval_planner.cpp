@@ -300,4 +300,51 @@ TEST(RetrievalPlanner, Pr1aHistoryCompletesThreeGenerationsFromOneMainRow) {
     EXPECT_EQ(history.entries.size(), 3U);
 }
 
+TEST(RetrievalPlanner, HistoryDoesNotCompleteOtherHoldersStatements) {
+    for (const auto* holder : {"cog-self", "alice"}) {
+        Rig rig;
+        auto& conn = rig.a->connection();
+        insert_statement(conn, "local", holder, "Bob", "responsible_for", "auth");
+        insert_statement(conn, "foreign", "mallory", "Bob", "responsible_for",
+                         "deploy", "archived");
+        conn.exec("UPDATE statements SET valid_to='2026-06-11T00:00:00Z' WHERE id='foreign'");
+        conn.exec("INSERT INTO statement_edges(id,tenant_id,src_id,dst_id,edge_kind,weight,created_at) "
+                  "VALUES('cross-holder','default','local','foreign','supersedes',1.0,'2026-06-10T00:00:00Z')");
+        auto q = rig.q(QueryIntent::HISTORY);
+        q.querier = holder;
+        q.global_holder_filter = holder;
+        q.subject_id = "Bob";
+        q.predicate = "responsible_for";
+        q.k = 10;
+        const auto history = rig.planner.run(q);
+        ASSERT_FALSE(history.abstained);
+        ASSERT_EQ(history.entries.size(), 1U);
+        EXPECT_EQ(history.entries[0].row.id, "local");
+        EXPECT_EQ(history.entries[0].row.holder_id, holder);
+        EXPECT_EQ(history.receipt.candidate_counts.fetched, 1);
+    }
+}
+
+TEST(RetrievalPlanner, HistoryCycleTerminatesWithoutDuplicateRows) {
+    Rig rig;
+    auto& conn = rig.a->connection();
+    insert_statement(conn, "cycle-a", "cog-self", "Bob", "responsible_for", "auth");
+    insert_statement(conn, "cycle-b", "cog-self", "Bob", "responsible_for", "deploy", "archived");
+    conn.exec("UPDATE statements SET valid_to='2026-06-11T00:00:00Z' WHERE id='cycle-b'");
+    conn.exec("INSERT INTO statement_edges(id,tenant_id,src_id,dst_id,edge_kind,weight,created_at) VALUES"
+              "('ab','default','cycle-a','cycle-b','supersedes',1.0,'2026-06-10T00:00:00Z'),"
+              "('ba','default','cycle-b','cycle-a','supersedes',1.0,'2026-06-10T00:00:00Z')");
+    auto q = rig.q(QueryIntent::HISTORY);
+    q.subject_id = "Bob";
+    q.predicate = "responsible_for";
+    q.k = 10;
+    const auto history = rig.planner.run(q);
+    ASSERT_FALSE(history.abstained);
+    std::set<std::string> ids;
+    for (const auto& entry : history.entries) { ids.insert(entry.row.id); }
+    EXPECT_EQ(ids, (std::set<std::string>{"cycle-a", "cycle-b"}));
+    EXPECT_EQ(history.entries.size(), 2U);
+    EXPECT_EQ(history.receipt.candidate_counts.fetched, 2);
+}
+
 }  // namespace starling::retrieval

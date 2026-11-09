@@ -338,7 +338,8 @@ PlannerResult RetrievalPlanner::run(const PlannerQuery& q) {
         const std::string sql = std::string(kSelectCols) +
             "WHERE id = ?1 AND tenant_id = ?2" +
             (q.intent == QueryIntent::HISTORY
-                ? " AND consolidation_state IN ('consolidated','archived')"
+                ? " AND holder_id = ?3"
+                  " AND consolidation_state IN ('consolidated','archived')"
                   " AND review_status NOT IN ('rejected','pending_review')"
                   " AND (valid_from IS NULL OR valid_from = '' OR valid_from <= ?9) "
                 : kStableTail);
@@ -348,6 +349,10 @@ PlannerResult RetrievalPlanner::run(const PlannerQuery& q) {
         StmtHandle h(raw);
         bind_sv(h.get(), 1, id);
         bind_sv(h.get(), 2, q.tenant_id);
+        if (q.intent == QueryIntent::HISTORY) {
+            // Both HISTORY scope steps use the querier's holder, like statement_main.
+            bind_sv(h.get(), 3, q.querier);
+        }
         bind_sv(h.get(), 9, q.as_of_iso8601);
         if (sqlite3_step(h.get()) == SQLITE_ROW) {
             auto f=read_row(h.get());
