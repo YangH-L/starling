@@ -217,6 +217,11 @@ void bind_13_memory_ops(pybind11::module_& m) {
     m.def("is_summary_request", &starling::memoryops::is_summary_request,
           py::arg("message"));
 
+    py::class_<starling::memoryops::SummarySourceOverride>(m, "SummarySourceOverride")
+        .def(py::init<int, int>(), py::arg("k_source"), py::arg("chunk_byte_budget"))
+        .def_readwrite("k_source", &starling::memoryops::SummarySourceOverride::k_source)
+        .def_readwrite("chunk_byte_budget", &starling::memoryops::SummarySourceOverride::chunk_byte_budget);
+
     m.def("memory_converse_prepare",
           [](starling::persistence::SqliteAdapter& adapter,
              starling::retrieval::SemanticRetriever& semantic,
@@ -224,7 +229,8 @@ void bind_13_memory_ops(pybind11::module_& m) {
              const std::string& interlocutor, const std::string& adapter_name,
              const std::string& source_prefix, const std::string& created_at_iso8601,
              const std::string& message, int recall_k,
-             std::optional<starling::retrieval::SourceLaneDeps> source_lane) {
+             std::optional<starling::retrieval::SourceLaneDeps> source_lane,
+             std::optional<starling::memoryops::SummarySourceOverride> summary_source_override) {
               starling::memoryops::ConverseParams params;
               params.tenant_id          = tenant_id;
               params.holder_id          = holder_id;
@@ -236,6 +242,7 @@ void bind_13_memory_ops(pybind11::module_& m) {
               params.recall_k           = recall_k;
               // 形态 S：左脑 lane（None = 关闭）。只存指针，调用方须持有 index/embedder。
               params.source_lane        = std::move(source_lane);
+              params.summary_source_override = std::move(summary_source_override);
               starling::memoryops::ConversePrepared prep;
               {
                   py::gil_scoped_release release;   // 内含 query-embed 网络
@@ -247,7 +254,8 @@ void bind_13_memory_ops(pybind11::module_& m) {
           py::arg("holder_id"), py::arg("interlocutor"), py::arg("adapter_name"),
           py::arg("source_prefix"), py::arg("created_at_iso8601"),
           py::arg("message"), py::arg("recall_k") = 6,
-          py::arg("source_lane") = py::none());
+          py::arg("source_lane") = py::none(),
+          py::arg("summary_source_override") = py::none());
 
     m.def("memory_generate_stream",
           [](starling::extractor::LLMAdapter& chat_llm, const std::string& prompt,

@@ -373,7 +373,7 @@ class MemoryCore:
         return holder_id, created_iso
 
     def converse_prepare(self, message: str, *, holder=None, interlocutor=None,
-                         k: int = 6, now=None):
+                         k: int = 6, now=None, summary_source_override=None):
         """三相之一(锁内):写门 fail-fast + recall + 围栏 + prompt。"""
         holder_id, created_iso = self._converse_turn_args(holder, now)
         return _core.memory_converse_prepare(
@@ -382,7 +382,8 @@ class MemoryCore:
             interlocutor=interlocutor or "",
             adapter_name=self.adapter_name, source_prefix=self.source_prefix,
             created_at_iso8601=created_iso, message=message, recall_k=k,
-            source_lane=self.source_lane)
+            source_lane=self.source_lane,
+            summary_source_override=summary_source_override)
 
     def generate_stream(self, chat_llm, prompt: str, on_token=None, *, grounded: bool = False):
         """三相之二(锁外):纯网络,绑定释放 GIL、逐 delta 回调。

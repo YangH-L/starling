@@ -163,6 +163,13 @@ RememberOutcome remember_all(
     const extractor::ValidationPolicy& policy = {});
 
 // ── converse — chat-with-memory turn (Phase 2c) ──
+// Opt-in, per-query expansion for summary requests. Neither value may shrink
+// the configured source lane; nullopt preserves the existing production path.
+struct SummarySourceOverride {
+    int k_source;
+    int chunk_byte_budget;
+};
+
 struct ConverseParams {
     std::string tenant_id;
     std::string holder_id;            // querier (recall) + holder (remember) = agent/self
@@ -175,6 +182,7 @@ struct ConverseParams {
     // 形态 S：左脑原文 lane。默认 nullopt = 关闭，对话提示与改动前一致。
     // 只持有 index/embedder 的指针，调用方须在 converse_prepare 期间持有它们。
     std::optional<retrieval::SourceLaneDeps> source_lane;
+    std::optional<SummarySourceOverride> summary_source_override;
 };
 
 struct ConverseOutcome {

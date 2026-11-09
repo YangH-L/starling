@@ -287,6 +287,100 @@ TEST(ConversePhases, NoSourceLaneLeavesPromptUnchanged) {
         << prepared.prompt;
 }
 
+
+namespace {
+void expect_prepared_equal(const ConversePrepared& a, const ConversePrepared& b) {
+    EXPECT_EQ(a.context_pack, b.context_pack);
+    EXPECT_EQ(a.prompt, b.prompt);
+    EXPECT_EQ(a.abstained, b.abstained);
+    EXPECT_EQ(a.grounded, b.grounded);
+    EXPECT_EQ(a.created_at_iso8601, b.created_at_iso8601);
+}
+}
+
+TEST(SummarySourceOverride, ExpandsByteBudgetOnlyForSummary) {
+    SourceFixture fx;
+    fx.retain("summarize the vault code is 4321");
+    auto p = conv_params("summarize the vault code is 4321");
+    p.source_lane = fx.deps();
+    p.source_lane->chunk_byte_budget = 1;
+    const auto base = converse_prepare(*fx.adapter, fx.semantic, p);
+    EXPECT_EQ(base.context_pack.find("[SOURCE]"), std::string::npos);
+    p.summary_source_override = SummarySourceOverride{100, 128000};
+    const auto expanded = converse_prepare(*fx.adapter, fx.semantic, p);
+    EXPECT_NE(expanded.context_pack.find("[SOURCE]"), std::string::npos);
+    EXPECT_FALSE(expanded.grounded);
+    EXPECT_EQ(expanded.prompt.find("<evidence> block"), std::string::npos);
+    auto direct = p;
+    direct.summary_source_override.reset();
+    direct.source_lane->k_source = 100;
+    direct.source_lane->chunk_byte_budget = 128000;
+    expect_prepared_equal(expanded, converse_prepare(*fx.adapter, fx.semantic, direct));
+    EXPECT_EQ(p.source_lane->chunk_byte_budget, 1); // caller deps are unchanged
+    EXPECT_EQ(p.source_lane->k_source, 30);
+}
+
+TEST(SummarySourceOverride, ExpandsCandidateCount) {
+    SourceFixture fx;
+    fx.retain("summarize the vault code is 4321");
+    fx.retain("the backup vault code is 5678");
+    fx.retain("the spare vault code is 9012");
+    auto p = conv_params("summarize the vault code is 4321");
+    p.source_lane = fx.deps();
+    p.source_lane->k_source = 1;
+    const auto base = converse_prepare(*fx.adapter, fx.semantic, p);
+    p.summary_source_override = SummarySourceOverride{3, 32000};
+    const auto expanded = converse_prepare(*fx.adapter, fx.semantic, p);
+    EXPECT_GT(expanded.context_pack.size(), base.context_pack.size());
+    auto direct = p;
+    direct.summary_source_override.reset();
+    direct.source_lane->k_source = 3;
+    expect_prepared_equal(expanded, converse_prepare(*fx.adapter, fx.semantic, direct));
+}
+
+TEST(SummarySourceOverride, NonSummaryIsByteIdentical) {
+    SourceFixture fx;
+    fx.retain("the vault code is 4321");
+    auto p = conv_params("the vault code is 4321");
+    p.source_lane = fx.deps();
+    const auto base = converse_prepare(*fx.adapter, fx.semantic, p);
+    ASSERT_NE(base.context_pack.find("[SOURCE]"), std::string::npos);
+    ASSERT_TRUE(base.grounded);
+    p.summary_source_override = SummarySourceOverride{100, 128000};
+    expect_prepared_equal(base, converse_prepare(*fx.adapter, fx.semantic, p));
+}
+
+TEST(SummarySourceOverride, DisabledLaneAndEmptyOverrideAreByteIdentical) {
+    SourceFixture fx;
+    fx.retain("summarize the vault code is 4321");
+    auto p = conv_params("summarize the vault code is 4321");
+    EXPECT_FALSE(p.summary_source_override.has_value());
+    const auto base = converse_prepare(*fx.adapter, fx.semantic, p);
+    p.summary_source_override = SummarySourceOverride{100, 128000};
+    expect_prepared_equal(base, converse_prepare(*fx.adapter, fx.semantic, p));
+    p.source_lane = fx.deps();
+    p.summary_source_override.reset();
+    const auto lane_base = converse_prepare(*fx.adapter, fx.semantic, p);
+    p.summary_source_override = SummarySourceOverride{30, 32000};
+    expect_prepared_equal(lane_base, converse_prepare(*fx.adapter, fx.semantic, p));
+}
+
+TEST(SummarySourceOverride, RejectsInvalidValuesBeforeRecall) {
+    SourceFixture fx;
+    for (const auto& message : {"Summarize the vault", "What is the code?"}) {
+        auto p = conv_params(message);
+        for (const auto& bad : std::vector<SummarySourceOverride>{{0, 128000}, {-1, 128000},
+                               {100, 0}, {100, -1}, {29, 128000}, {100, 31999}}) {
+            p.source_lane = fx.deps();
+            p.summary_source_override = bad;
+            EXPECT_THROW(converse_prepare(*fx.adapter, fx.semantic, p), std::invalid_argument);
+        }
+        p.source_lane.reset();
+        p.summary_source_override = SummarySourceOverride{0, 128000};
+        EXPECT_THROW(converse_prepare(*fx.adapter, fx.semantic, p), std::invalid_argument);
+    }
+}
+
 // ── 先引用、后作答（弃答修复 v2）──────────────────────────────────────────────
 
 TEST(GroundedAnswer, SourceLinesTurnOnEvidenceInstruction) {

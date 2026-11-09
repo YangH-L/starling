@@ -67,3 +67,31 @@ def test_is_summary_request_binding_matches_native_rule():
     # 中文经 pybind 以 UTF-8 传入，判定与 C++ 一致。
     assert _core.is_summary_request("帮我总结一下这周的进展")
     assert not _core.is_summary_request("我的牙医预约是哪天？")
+
+
+def test_summary_override_default_and_forwarding(tmp_path, monkeypatch):
+    core, _ = _core_handles(tmp_path)
+    seen = []
+    monkeypatch.setattr(_core, "memory_converse_prepare", lambda *a, **kw: seen.append(kw))
+    core.converse_prepare("summary", now="2026-07-05T10:00:00Z")
+    assert seen[-1]["summary_source_override"] is None
+    override = _core.SummarySourceOverride(100, 128000)
+    core.converse_prepare("summary", summary_source_override=override,
+                          now="2026-07-05T10:00:00Z")
+    assert seen[-1]["summary_source_override"] is override
+    assert override.k_source == 100 and override.chunk_byte_budget == 128000
+
+
+def test_summary_override_native_binding_and_none_default(tmp_path):
+    import pytest
+    core, _ = _core_handles(tmp_path)
+    now = "2026-07-05T10:00:00Z"
+    base = core.converse_prepare("summary", now=now)
+    explicit = core.converse_prepare("summary", now=now, summary_source_override=None)
+    override = core.converse_prepare("summary", now=now,
+                                    summary_source_override=_core.SummarySourceOverride(100, 128000))
+    assert base.context_pack == explicit.context_pack == override.context_pack
+    assert base.prompt == explicit.prompt == override.prompt
+    with pytest.raises(ValueError, match="source lane:.*summary"):
+        core.converse_prepare("summary", now=now,
+                              summary_source_override=_core.SummarySourceOverride(0, 128000))

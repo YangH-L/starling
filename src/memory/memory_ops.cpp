@@ -405,6 +405,25 @@ ConversePrepared converse_prepare(persistence::SqliteAdapter& adapter,
     query.trace_id      = "conv-" + seed_hash.substr(0, 16);
     query.query_id      = "convq-" + seed_hash.substr(16, 16);
     query.source_lane   = params.source_lane;   // nullopt = 左脑关闭
+    if (params.summary_source_override) {
+        const auto& override = *params.summary_source_override;
+        if (override.k_source <= 0 || override.chunk_byte_budget <= 0) {
+            throw std::invalid_argument("source lane: summary override values must be > 0");
+        }
+        if (query.source_lane) {
+            // Validate the original dependencies before replacing any values.
+            retrieval::validate_source_lane(*query.source_lane);
+            if (override.k_source < query.source_lane->k_source ||
+                override.chunk_byte_budget < query.source_lane->chunk_byte_budget) {
+                throw std::invalid_argument(
+                    "source lane: summary override must not shrink k_source or chunk_byte_budget");
+            }
+            if (is_summary_request(params.message)) {
+                query.source_lane->k_source = override.k_source;
+                query.source_lane->chunk_byte_budget = override.chunk_byte_budget;
+            }
+        }
+    }
     retrieval::RetrievalPlanner planner(adapter, semantic);
     const auto plan = planner.run(query);
     prep.context_pack = plan.context_pack;
