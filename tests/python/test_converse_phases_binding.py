@@ -95,3 +95,21 @@ def test_summary_override_native_binding_and_none_default(tmp_path):
     with pytest.raises(ValueError, match="source lane:.*summary"):
         core.converse_prepare("summary", now=now,
                               summary_source_override=_core.SummarySourceOverride(0, 128000))
+
+
+def test_summary_override_above_k_max_is_value_error():
+    import pytest
+    adapter = _core.SqliteAdapter.open(":memory:")
+    embedder = _core.StubEmbeddingAdapter(8)
+    index = _core.SqliteBlobVectorIndex()
+    source_index = _core.SqliteSourceVectorIndex()
+    semantic = _core.SemanticRetriever(adapter, embedder, index)
+    lane = _core.SourceLaneDeps(source_index, embedder, 0.56)
+    for message in ("Summarize the vault", "What is the code?"):
+        with pytest.raises(ValueError, match="summary.*k_source.*k_max"):
+            _core.memory_converse_prepare(
+                adapter, semantic, tenant_id="default", holder_id="user",
+                interlocutor="", adapter_name="test", source_prefix="test-",
+                created_at_iso8601="2026-07-05T10:00:00Z", message=message,
+                recall_k=10, source_lane=lane,
+                summary_source_override=_core.SummarySourceOverride(201, 128000))

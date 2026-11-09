@@ -413,7 +413,13 @@ ConversePrepared converse_prepare(persistence::SqliteAdapter& adapter,
         if (query.source_lane) {
             // Validate the original dependencies before replacing any values.
             retrieval::validate_source_lane(*query.source_lane);
-            if (override.k_source < query.source_lane->k_source ||
+            if (override.k_source > query.source_lane->k_max) {
+                throw std::invalid_argument(
+                    "source lane: summary override k_source must not exceed k_max");
+            }
+            const int original_source_k = query.source_lane->k_source > 0
+                ? query.source_lane->k_source : query.k;
+            if (override.k_source < original_source_k ||
                 override.chunk_byte_budget < query.source_lane->chunk_byte_budget) {
                 throw std::invalid_argument(
                     "source lane: summary override must not shrink k_source or chunk_byte_budget");

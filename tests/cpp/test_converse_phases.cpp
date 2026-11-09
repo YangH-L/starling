@@ -381,6 +381,41 @@ TEST(SummarySourceOverride, RejectsInvalidValuesBeforeRecall) {
     }
 }
 
+TEST(SummarySourceOverride, RejectsKSourceAboveKMax) {
+    SourceFixture fx;
+    for (const auto* message : {"Summarize the vault", "What is the code?"}) {
+        auto p = conv_params(message);
+        p.source_lane = fx.deps();
+        p.summary_source_override = SummarySourceOverride{201, 128000};
+        EXPECT_THROW(converse_prepare(*fx.adapter, fx.semantic, p), std::invalid_argument);
+    }
+}
+
+TEST(SummarySourceOverride, ZeroKSourceCannotShrinkRecallK) {
+    SourceFixture fx;
+    for (const auto* message : {"Summarize the vault", "What is the code?"}) {
+        auto p = conv_params(message);
+        p.recall_k = 10;
+        p.source_lane = fx.deps();
+        p.source_lane->k_source = 0;
+        p.summary_source_override = SummarySourceOverride{9, 128000};
+        EXPECT_THROW(converse_prepare(*fx.adapter, fx.semantic, p), std::invalid_argument);
+        p.summary_source_override = SummarySourceOverride{10, 128000};
+        EXPECT_NO_THROW(converse_prepare(*fx.adapter, fx.semantic, p));
+        EXPECT_EQ(p.source_lane->k_source, 0);
+    }
+}
+
+TEST(SummarySourceOverride, ZeroKSourceUsesRecallKInsteadOfDefaultThirty) {
+    SourceFixture fx;
+    auto p = conv_params("Summarize the vault");
+    p.recall_k = 6;
+    p.source_lane = fx.deps();
+    p.source_lane->k_source = 0;
+    p.summary_source_override = SummarySourceOverride{6, 128000};
+    EXPECT_NO_THROW(converse_prepare(*fx.adapter, fx.semantic, p));
+}
+
 // ── 先引用、后作答（弃答修复 v2）──────────────────────────────────────────────
 
 TEST(GroundedAnswer, SourceLinesTurnOnEvidenceInstruction) {
