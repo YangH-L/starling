@@ -15,9 +15,9 @@ int evidence_count(std::string_view evidence_json) {
     for (const auto& ref : refs) {
         if (!ref.is_object()) { continue; }
         const auto has_reference = [&](const char* key) {
-            const auto it = ref.find(key);
-            return it != ref.end() && it->is_string() &&
-                   !it->get_ref<const std::string&>().empty();
+            const auto field = ref.find(key);
+            return field != ref.end() && field->is_string() &&
+                   !field->get_ref<const std::string&>().empty();
         };
         if (has_reference("engram_ref") || has_reference("engram_id")) { ++n; }
     }

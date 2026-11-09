@@ -392,7 +392,7 @@ PlannerResult RetrievalPlanner::run(const PlannerQuery& q) {
         // Worklist traversal: newly materialized rows may have older ancestors.
         // have also prevents cycles and duplicate fetches.
         for (std::size_t next = 0; next < seeds.size(); ++next) {
-            const std::string id = seeds[next];
+            const std::string seed_id = seeds[next];
             sqlite3_stmt* raw = nullptr;
             if (sqlite3_prepare_v2(db,
                 "SELECT dst_id FROM statement_edges WHERE src_id=?1 AND "
@@ -401,7 +401,7 @@ PlannerResult RetrievalPlanner::run(const PlannerQuery& q) {
                 "tenant_id=?2 AND edge_kind='supersedes'",
                 -1, &raw, nullptr) != SQLITE_OK) continue;
             StmtHandle h(raw);
-            bind_sv(h.get(), 1, id); bind_sv(h.get(), 2, q.tenant_id);
+            bind_sv(h.get(), 1, seed_id); bind_sv(h.get(), 2, q.tenant_id);
             std::vector<std::string> others;
             while (sqlite3_step(h.get()) == SQLITE_ROW) {
                 const auto* p = sqlite3_column_text(h.get(), 0);

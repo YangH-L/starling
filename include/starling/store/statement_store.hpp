@@ -95,7 +95,7 @@ public:
     virtual int forget(std::string_view id, std::string_view tenant,
                        std::string_view updated_at) = 0;
     // 支持仲裁: SET confidence + consolidation_state='consolidated'。返回实际更新行数。
-    virtual int set_confidence_consolidated(std::string_view id,
+    virtual int set_confidence_consolidated(std::string_view stmt_id,
                                              std::string_view tenant,
                                              double confidence) = 0;
     // 二阶 salience 继承: SET salience=MAX(salience,?), affect_json=?。

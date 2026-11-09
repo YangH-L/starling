@@ -295,13 +295,15 @@ void clear_pending_evidence(persistence::Connection& conn,
     sqlite3_stmt* raw = nullptr;
     if (sqlite3_prepare_v2(conn.raw(),
         "DELETE FROM reconsolidation_pending_evidence "
-        "WHERE window_stmt_id=?1 AND window_tenant_id=?2", -1, &raw, nullptr) != SQLITE_OK)
+        "WHERE window_stmt_id=?1 AND window_tenant_id=?2", -1, &raw, nullptr) != SQLITE_OK) {
         throw make_sqlite_error(conn.raw(), "clear_pending_evidence: prepare");
-    StmtHandle h(raw);
-    bind_sv(h.get(), 1, stmt_id);
-    bind_sv(h.get(), 2, tenant_id);
-    if (sqlite3_step(h.get()) != SQLITE_DONE)
+    }
+    StmtHandle handle(raw);
+    bind_sv(handle.get(), 1, stmt_id);
+    bind_sv(handle.get(), 2, tenant_id);
+    if (sqlite3_step(handle.get()) != SQLITE_DONE) {
         throw make_sqlite_error(conn.raw(), "clear_pending_evidence: step");
+    }
 }
 
 }  // namespace starling::reconsolidation

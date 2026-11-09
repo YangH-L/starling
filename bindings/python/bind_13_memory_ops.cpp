@@ -242,7 +242,7 @@ void bind_13_memory_ops(pybind11::module_& m) {
               params.recall_k           = recall_k;
               // 形态 S：左脑 lane（None = 关闭）。只存指针，调用方须持有 index/embedder。
               params.source_lane        = std::move(source_lane);
-              params.summary_source_override = std::move(summary_source_override);
+              params.summary_source_override = summary_source_override;
               starling::memoryops::ConversePrepared prep;
               {
                   py::gil_scoped_release release;   // 内含 query-embed 网络
