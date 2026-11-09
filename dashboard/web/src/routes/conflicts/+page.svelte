@@ -135,10 +135,10 @@
 	{#if q.data}
 		<div class="mb-4 flex flex-wrap gap-2">
 			{#each Object.entries(q.data.by_kind) as [k, v]}
-				<!-- CONFLICTS_WITH 计数取过滤后的实际可处理数(sorted),与下方列表一致;
+				<!-- conflicts_with 计数取过滤后的实际可处理数(sorted),与下方列表一致;
 				     by_kind 是原始边 COUNT(含已遗忘侧),直接显示会比列表多。 -->
-				<Badge tone={k === 'CONFLICTS_WITH' ? 'danger' : 'neutral'}>
-					{k}: {k === 'CONFLICTS_WITH' ? sorted.length : v}
+				<Badge tone={k === 'conflicts_with' ? 'danger' : 'neutral'}>
+					{k}: {k === 'conflicts_with' ? sorted.length : v}
 				</Badge>
 			{/each}
 		</div>
