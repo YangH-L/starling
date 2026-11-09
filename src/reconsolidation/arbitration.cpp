@@ -202,8 +202,10 @@ void apply_supports(persistence::Connection& conn, std::string_view stmt_id,
     (void)now_iso;  // available for future updated_at extension
 
     // UPDATE confidence + consolidation_state —— P3.b1 phase 2:写收编进 StatementStore。
-    store::SqliteStatementStore(conn).set_confidence_consolidated(
-        stmt_id, tenant_id, new_conf);
+    if (store::SqliteStatementStore(conn).set_confidence_consolidated(
+            stmt_id, tenant_id, new_conf) == 0) {
+        return;
+    }
 
     // Emit statement.consolidated
     {

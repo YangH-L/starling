@@ -558,3 +558,41 @@ TEST(ReconsolidationEngine, Pr1aForceCloseAlsoClearsPending) {
     ASSERT_EQ(scol(conn.raw(), "SELECT status FROM reconsolidation_windows WHERE stmt_id='force'"), "closed");
     EXPECT_EQ(icol(conn.raw(), "SELECT COUNT(*) FROM reconsolidation_pending_evidence WHERE window_stmt_id='force'"), 0);
 }
+
+
+TEST(ReconsolidationEngine, SupportsGuardDoesNotEmitForTerminalStates) {
+    auto adapter = open_fresh();
+    auto& conn = adapter->connection();
+    const Aggregated supports{ArbitrationPath::Supports, 0.2, "supports"};
+    for (const auto* state : {"archived", "forgotten"}) {
+        seed_stmt(conn.raw(), state);
+        conn.exec("UPDATE statements SET consolidation_state='" + std::string(state) +
+                  "' WHERE id='" + state + "'");
+        apply_supports(conn, state, "default", supports, "2026-05-27T10:31:00Z");
+        EXPECT_EQ(scol(conn.raw(), "SELECT consolidation_state FROM statements WHERE id='" +
+                       std::string(state) + "'"), state);
+        EXPECT_EQ(scol(conn.raw(), "SELECT confidence FROM statements WHERE id='" +
+                       std::string(state) + "'"), "0.7");
+        EXPECT_EQ(icol(conn.raw(), "SELECT COUNT(*) FROM bus_events "
+                                  "WHERE event_type='statement.consolidated'"), 0);
+    }
+}
+
+TEST(ReconsolidationEngine, SupportsStillUpdatesAndEmitsForEligibleStates) {
+    auto adapter = open_fresh();
+    auto& conn = adapter->connection();
+    const Aggregated supports{ArbitrationPath::Supports, 0.2, "supports"};
+    for (const auto* state : {"consolidated", "replaying_reconsolidating"}) {
+        seed_stmt(conn.raw(), state);
+        conn.exec("UPDATE statements SET consolidation_state='" + std::string(state) +
+                  "' WHERE id='" + state + "'");
+        apply_supports(conn, state, "default", supports, "2026-05-27T10:31:00Z");
+        EXPECT_EQ(scol(conn.raw(), "SELECT consolidation_state FROM statements WHERE id='" +
+                       std::string(state) + "'"), "consolidated");
+        EXPECT_EQ(icol(conn.raw(), "SELECT confidence > 0.7 FROM statements WHERE id='" +
+                       std::string(state) + "'"), 1);
+        EXPECT_EQ(icol(conn.raw(), "SELECT COUNT(*) FROM bus_events "
+                                  "WHERE event_type='statement.consolidated' AND primary_id='" +
+                       std::string(state) + "'"), 1);
+    }
+}

@@ -49,7 +49,7 @@ public:
     // changed (>0 = promoted). SqliteStatementStore-only.
     int promote_gist_to_consolidated(std::string_view stmt_id, std::string_view tenant,
                                      std::string_view now_iso);
-    void set_confidence_consolidated(std::string_view, std::string_view,
+    int set_confidence_consolidated(std::string_view, std::string_view,
                                      double) override;
     void inherit_salience(std::string_view, std::string_view, double,
                           std::string_view) override;

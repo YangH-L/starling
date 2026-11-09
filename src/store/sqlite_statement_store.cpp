@@ -311,7 +311,7 @@ int SqliteStatementStore::approve_review(std::string_view id, std::string_view t
     return sqlite3_changes(db);
 }
 
-void SqliteStatementStore::set_confidence_consolidated(
+int SqliteStatementStore::set_confidence_consolidated(
     std::string_view id, std::string_view tenant, double confidence) {
     // Supports cannot revive terminal or unrelated consolidation states.
     sqlite3* db = conn_.raw();
@@ -328,6 +328,7 @@ void SqliteStatementStore::set_confidence_consolidated(
     bind_sv(h.get(), 3, tenant);
     if (sqlite3_step(h.get()) != SQLITE_DONE)
         throw make_sqlite_error(db, "StatementStore::set_confidence_consolidated step");
+    return sqlite3_changes(db);
 }
 
 void SqliteStatementStore::insert_arbitrated_fork(const ArbitratedFork& f) {
