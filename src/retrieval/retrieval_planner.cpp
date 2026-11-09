@@ -336,7 +336,12 @@ PlannerResult RetrievalPlanner::run(const PlannerQuery& q) {
     auto fetch_by_id = [&](const std::string& id, const SemanticScored* semantic_row=nullptr) {
         sqlite3_stmt* raw = nullptr;
         const std::string sql = std::string(kSelectCols) +
-            "WHERE id = ?1 AND tenant_id = ?2" + kStableTail;
+            "WHERE id = ?1 AND tenant_id = ?2" +
+            (q.intent == QueryIntent::HISTORY
+                ? " AND consolidation_state IN ('consolidated','archived')"
+                  " AND review_status NOT IN ('rejected','pending_review')"
+                  " AND (valid_from IS NULL OR valid_from = '' OR valid_from <= ?9) "
+                : kStableTail);
         if (sqlite3_prepare_v2(db, sql.c_str(), -1, &raw, nullptr) != SQLITE_OK) {
             return;
 }
@@ -379,7 +384,10 @@ PlannerResult RetrievalPlanner::run(const PlannerQuery& q) {
         std::unordered_set<std::string> have;
         for (const auto& f : fetched) have.insert(f.row.id);
         std::vector<std::string> seeds(have.begin(), have.end());
-        for (const auto& id : seeds) {
+        // Worklist traversal: newly materialized rows may have older ancestors.
+        // have also prevents cycles and duplicate fetches.
+        for (std::size_t next = 0; next < seeds.size(); ++next) {
+            const std::string id = seeds[next];
             sqlite3_stmt* raw = nullptr;
             if (sqlite3_prepare_v2(db,
                 "SELECT dst_id FROM statement_edges WHERE src_id=?1 AND "
@@ -396,9 +404,11 @@ PlannerResult RetrievalPlanner::run(const PlannerQuery& q) {
                 if (p != nullptr) { others.emplace_back(reinterpret_cast<const char*>(p)); }
             }
             for (const auto& other : others) {
-                if (!have.contains(other)) { continue; }
-                fetch_by_id(other);
+                if (have.contains(other)) { continue; }
                 have.insert(other);
+                const auto before = fetched.size();
+                fetch_by_id(other);
+                if (fetched.size() > before) { seeds.push_back(other); }
             }
         }
     };
