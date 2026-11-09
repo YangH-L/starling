@@ -313,11 +313,12 @@ int SqliteStatementStore::approve_review(std::string_view id, std::string_view t
 
 void SqliteStatementStore::set_confidence_consolidated(
     std::string_view id, std::string_view tenant, double confidence) {
-    // exact 自 src/reconsolidation/arbitration.cpp:204(apply_supports)。
+    // Supports cannot revive terminal or unrelated consolidation states.
     sqlite3* db = conn_.raw();
     const char* sql =
         "UPDATE statements SET confidence=?, consolidation_state='consolidated' "
-        "WHERE id=? AND tenant_id=?";
+        "WHERE id=? AND tenant_id=? "
+        "AND consolidation_state IN ('consolidated','replaying_reconsolidating')";
     sqlite3_stmt* raw = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &raw, nullptr) != SQLITE_OK)
         throw make_sqlite_error(db, "StatementStore::set_confidence_consolidated prepare");
@@ -330,8 +331,8 @@ void SqliteStatementStore::set_confidence_consolidated(
 }
 
 void SqliteStatementStore::insert_arbitrated_fork(const ArbitratedFork& f) {
-    // exact 自 src/reconsolidation/arbitration.cpp:364(severe-contradict 分叉)。
-    // provenance/consolidation_state 硬编码;salience/activation 字符串复制。
+    // Fork identity/state/timestamps come from arbitration; all remaining
+    // non-generated columns are inherited from the tenant-scoped original.
     sqlite3* db = conn_.raw();
     const char* sql =
         "INSERT INTO statements("
@@ -339,9 +340,22 @@ void SqliteStatementStore::insert_arbitrated_fork(const ArbitratedFork& f) {
         "predicate, object_kind, object_value, canonical_object_hash, "
         "canonical_object_hash_version, modality, polarity, confidence, observed_at, "
         "salience, affect_json, activation, last_accessed, provenance, "
-        "consolidation_state, review_status, supersedes_id, created_at, updated_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-        "'reconsolidation_derived','consolidated',?,?,?,?)";
+        "consolidation_state, review_status, supersedes_id, created_at, updated_at, "
+        "inferred_at, valid_from, valid_to, event_time_start, "
+        "event_time_end, confidence_history_json, evidence_json, source_spans_json, "
+        "temporal_anchor_json, derived_from_json, derived_depth, perceived_by_json, "
+        "access_count, last_replayed, replay_count, nesting_depth, "
+        "visibility_json, retention_policy, last_replay_batch_id, scope_parties_json, "
+        "consolidation_summary, semantic_claim_json) "
+        "SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
+        "'reconsolidation_derived','consolidated',?20,?21,?22,?23, "
+        "inferred_at, valid_from, valid_to, event_time_start, "
+        "event_time_end, confidence_history_json, evidence_json, source_spans_json, "
+        "temporal_anchor_json, derived_from_json, derived_depth, perceived_by_json, "
+        "access_count, last_replayed, replay_count, nesting_depth, "
+        "visibility_json, retention_policy, last_replay_batch_id, scope_parties_json, "
+        "consolidation_summary, semantic_claim_json "
+        "FROM statements WHERE id=?21 AND tenant_id=?2";
     sqlite3_stmt* raw = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &raw, nullptr) != SQLITE_OK)
         throw make_sqlite_error(db, "StatementStore::insert_arbitrated_fork prepare");

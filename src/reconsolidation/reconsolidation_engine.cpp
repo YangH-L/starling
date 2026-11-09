@@ -194,7 +194,7 @@ EngineStats ReconsolidationEngine::tick_one_batch(
                 ev.event_id,      // event_id
                 ev.event_type,    // event_type
                 ev.event_id,      // payload_hash (use event_id as hash)
-                1.0,              // weight
+                ev.event_type == "statement.recalled" ? 0.0 : 1.0, // recall is not evidence
                 modality,
                 now_iso);
             if (res.opened) stats.windows_opened++;
@@ -260,6 +260,7 @@ int ReconsolidationEngine::close_due_windows(
                 sqlite3_step(h.get());
             }
         }
+        clear_pending_evidence(conn, stmt_id, tenant);
         closed++;
     }
 

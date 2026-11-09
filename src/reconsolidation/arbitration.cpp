@@ -141,6 +141,7 @@ Aggregated aggregate_evidence(persistence::Connection& conn, std::string_view st
     const char* sql =
         "SELECT weight FROM reconsolidation_pending_evidence "
         "WHERE window_stmt_id=? AND window_tenant_id=? "
+        "AND event_type <> 'statement.recalled' "
         "ORDER BY weight DESC LIMIT 50";
 
     sqlite3_stmt* raw = nullptr;

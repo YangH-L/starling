@@ -31,4 +31,8 @@ std::vector<DueWindow> due_windows(persistence::Connection& conn, std::string_vi
 constexpr int kPendingEvidenceMax = 100;
 constexpr int kForceCloseTriggerCount = 10;
 
+// Delete only this window's pending evidence after closure.
+void clear_pending_evidence(persistence::Connection& conn,
+                            std::string_view stmt_id, std::string_view tenant_id);
+
 }  // namespace starling::reconsolidation

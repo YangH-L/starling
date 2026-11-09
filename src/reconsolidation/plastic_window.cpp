@@ -117,7 +117,7 @@ OpenResult open_or_append(persistence::Connection& conn,
             bind_sv(h.get(), 4, event_id);
             bind_sv(h.get(), 5, event_type);
             bind_sv(h.get(), 6, payload_hash);
-            sqlite3_bind_double(h.get(), 7, weight);
+            sqlite3_bind_double(h.get(), 7, event_type == "statement.recalled" ? 0.0 : weight);
             bind_sv(h.get(), 8, now_iso);
             if (sqlite3_step(h.get()) != SQLITE_DONE) {
                 throw make_sqlite_error(db, "open_or_append: INSERT evidence step");
@@ -226,6 +226,7 @@ OpenResult open_or_append(persistence::Connection& conn,
                     if (sqlite3_step(h2.get()) != SQLITE_DONE) {
                         throw make_sqlite_error(db, "open_or_append: force close step");
                     }
+                    clear_pending_evidence(conn, stmt_id, tenant_id);
                 }
             }
         }
@@ -287,6 +288,20 @@ std::vector<DueWindow> due_windows(persistence::Connection& conn, std::string_vi
         });
     }
     return result;
+}
+
+void clear_pending_evidence(persistence::Connection& conn,
+                            std::string_view stmt_id, std::string_view tenant_id) {
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(conn.raw(),
+        "DELETE FROM reconsolidation_pending_evidence "
+        "WHERE window_stmt_id=?1 AND window_tenant_id=?2", -1, &raw, nullptr) != SQLITE_OK)
+        throw make_sqlite_error(conn.raw(), "clear_pending_evidence: prepare");
+    StmtHandle h(raw);
+    bind_sv(h.get(), 1, stmt_id);
+    bind_sv(h.get(), 2, tenant_id);
+    if (sqlite3_step(h.get()) != SQLITE_DONE)
+        throw make_sqlite_error(conn.raw(), "clear_pending_evidence: step");
 }
 
 }  // namespace starling::reconsolidation
