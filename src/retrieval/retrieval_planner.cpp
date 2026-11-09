@@ -820,7 +820,7 @@ PlannerResult RetrievalPlanner::run(const PlannerQuery& q) {
     if(temporal_view) { out.context_pack+="\n"+render_temporal_evidence(*temporal_view);
 }
     rc.candidate_counts.returned = static_cast<std::int64_t>(out.entries.size());
-    rc.sufficiency_status = out.entries.empty() ? Sufficiency::MISSING_INFO
+    rc.sufficiency_status = (out.entries.empty() && out.source_entries.empty()) ? Sufficiency::MISSING_INFO
                                                 : Sufficiency::SUFFICIENT;
     if(temporal_view && !temporal_view->sufficient) { rc.sufficiency_status=Sufficiency::MISSING_INFO;
 }

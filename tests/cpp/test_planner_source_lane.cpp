@@ -496,4 +496,17 @@ TEST(PlannerSourceLane, Pr1aConflictWithoutOriginalStillAbstains) {
     EXPECT_NE(r.context_pack.find("[ABSTAIN]"), std::string::npos);
 }
 
+
+TEST(PlannerSourceLane, Pr1aOriginalOnlyReceiptIsSufficient) {
+    Rig rig; auto& conn = rig.adapter->connection();
+    seed_engram(conn, "only-source", {{"alice", "alpha original evidence"}});
+    embed_engram(conn, rig.source_index, "only-source", rig.embedder.embed("alpha").vector);
+    grant_presence(*rig.adapter, "only-source", {"alice", "cog-self"});
+    auto q = rig.query(); q.text = "alpha"; q.source_lane = rig.deps();
+    const auto r = rig.planner.run(q);
+    ASSERT_FALSE(r.abstained); ASSERT_TRUE(r.entries.empty());
+    ASSERT_EQ(r.source_entries.size(), 1U);
+    EXPECT_EQ(r.receipt.sufficiency_status, Sufficiency::SUFFICIENT);
+}
+
 }  // namespace starling::retrieval
