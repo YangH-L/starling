@@ -454,4 +454,46 @@ TEST(PlannerSourceLane, IngestClockProvenanceOmitsDate) {
     EXPECT_EQ(r.context_pack.find("[" + std::string(kObserved) + "]"), std::string::npos);
 }
 
+
+namespace {
+PlannerResult pr1a_conflict_pack(Rig& rig, bool with_source) {
+    auto& conn = rig.adapter->connection();
+    for (const auto* id : {"conflict-a", "conflict-b"}) {
+        conn.exec("INSERT INTO statements(id,tenant_id,holder_id,holder_perspective,subject_kind,subject_id,"
+            "predicate,object_kind,object_value,canonical_object_hash,canonical_object_hash_version,modality,polarity,"
+            "confidence,observed_at,salience,affect_json,activation,last_accessed,provenance,consolidation_state,created_at,updated_at) VALUES('" +
+            std::string(id) + "','default','cog-self','first_person','entity','topic','knows','str','alpha','" + id +
+            "','v1','knows','pos',0.9,'2026-06-10T00:00:00Z',0.5,'{}',0.0,'2026-06-10T00:00:00Z',"
+            "'user_input','consolidated','2026-06-10T00:00:00Z','2026-06-10T00:00:00Z')");
+    }
+    conn.exec("INSERT INTO statement_edges(id,tenant_id,src_id,dst_id,edge_kind,weight,created_at) VALUES"
+        "('actual-writer-case','default','conflict-a','conflict-b','conflicts_with',1.0,'2026-06-10T00:00:00Z')");
+    auto q = rig.query(); q.subject_id = "topic"; q.predicate = "knows"; q.text = "alpha";
+    if (with_source) {
+        seed_engram(conn, "conflict-source", {{"alice", "alpha original evidence"}});
+        embed_engram(conn, rig.source_index, "conflict-source", rig.embedder.embed("alpha").vector);
+        grant_presence(*rig.adapter, "conflict-source", {"alice", "cog-self"});
+        q.source_lane = rig.deps();
+    }
+    return rig.planner.run(q);
+}
+}  // namespace
+
+TEST(PlannerSourceLane, Pr1aConflictWithOriginalRendersConflictTag) {
+    Rig rig; const auto r = pr1a_conflict_pack(rig, true);
+    EXPECT_FALSE(r.abstained) << r.receipt.abstention_reason;
+    ASSERT_EQ(r.source_entries.size(), 1U);
+    ASSERT_EQ(r.entries.size(), 2U);
+    for (const auto& entry : r.entries) EXPECT_EQ(entry.label, ContextPackLabel::CONFLICT);
+    EXPECT_NE(r.context_pack.find("[SOURCE]"), std::string::npos);
+    EXPECT_NE(r.context_pack.find("[CONFLICT]"), std::string::npos);
+}
+
+TEST(PlannerSourceLane, Pr1aConflictWithoutOriginalStillAbstains) {
+    Rig rig; const auto r = pr1a_conflict_pack(rig, false);
+    EXPECT_TRUE(r.abstained);
+    EXPECT_EQ(r.receipt.abstention_reason, "conflict_unresolved");
+    EXPECT_NE(r.context_pack.find("[ABSTAIN]"), std::string::npos);
+}
+
 }  // namespace starling::retrieval

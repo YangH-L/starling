@@ -685,7 +685,7 @@ PlannerResult RetrievalPlanner::run(const PlannerQuery& q) {
         sqlite3_stmt* raw = nullptr;
         if (sqlite3_prepare_v2(db,
             "SELECT src_id, dst_id FROM statement_edges WHERE tenant_id=?1 AND "
-            "edge_kind='CONFLICTS_WITH'", -1, &raw, nullptr) == SQLITE_OK) {
+            "edge_kind='conflicts_with'", -1, &raw, nullptr) == SQLITE_OK) {
             StmtHandle h(raw);
             bind_sv(h.get(), 1, q.tenant_id);
             while (sqlite3_step(h.get()) == SQLITE_ROW) {

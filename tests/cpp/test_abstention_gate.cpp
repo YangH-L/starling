@@ -41,9 +41,18 @@ TEST(AbstentionGate, SourceEvidenceIsNotVetoedByStatementThreshold) {
     in.max_score = 0.0;             // 没有语句候选
     EXPECT_EQ(evaluate_abstention(in), "");
 
-    // 语句侧的 recanted / conflict 否决仍然成立（spec：保守）。
+    // Renderable original evidence keeps conflicts as labels, not a whole-query veto.
     in.unresolved_conflict = true;
+    EXPECT_EQ(evaluate_abstention(in), "");
+    in.source_evidence = false;
     EXPECT_EQ(evaluate_abstention(in), "conflict_unresolved");
+
+    // Frontier and recantation guards retain their priority even with sources.
+    in.source_evidence = true;
+    in.only_recanted_evidence = true;
+    EXPECT_EQ(evaluate_abstention(in), "only_recanted");
+    in.frontier_denied = true;
+    EXPECT_EQ(evaluate_abstention(in), "frontier_deny");
 }
 
 TEST(AbstentionGate, NoSourceEvidenceKeepsLegacyBehaviour) {
