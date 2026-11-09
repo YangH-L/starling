@@ -96,4 +96,24 @@ TEST(ContextPack, RenderDoesNotRewriteNegationInsideObject) {
               "[FACT] NOT (street prefers no more bulk) (conf 0.70, holder Claudette)");
 }
 
+
+TEST(ContextPack, Pr1aProductionEvidenceKeysCountReferencesOncePerEntry) {
+    PackContext ctx; ctx.querier = "cog-self";
+    auto r = row("evidence", "Alice", "knows", 0.9);
+    r.evidence_json = R"([{"engram_ref":"e1","content_hash":"abc","status":"active"},{"engram_ref":"e2","content_hash":"def","status":"active"}])";
+    EXPECT_EQ(classify(r, ctx), ContextPackLabel::BELIEF);
+    r.evidence_json = R"([{"engram_id":"e1"},{"engram_ref":"e2"}])";
+    EXPECT_EQ(classify(r, ctx), ContextPackLabel::BELIEF);
+    // Two aliases for a single reference still describe only one evidence item.
+    r.evidence_json = R"([{"engram_id":"e1","engram_ref":"e1"}])";
+    EXPECT_EQ(classify(r, ctx), ContextPackLabel::HEARSAY);
+    // Strings/nested metadata that mention the keys are not evidence items.
+    r.evidence_json = R"([{"note":"engram_id engram_id","metadata":{"engram_ref":"nested"}}])";
+    EXPECT_EQ(classify(r, ctx), ContextPackLabel::HEARSAY);
+    for (const auto* invalid : {"broken", "null", "{}", "[null,3]"}) {
+        r.evidence_json = invalid;
+        EXPECT_EQ(classify(r, ctx), ContextPackLabel::HEARSAY);
+    }
+}
+
 }  // namespace starling::retrieval

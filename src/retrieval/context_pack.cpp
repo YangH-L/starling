@@ -6,12 +6,21 @@
 namespace starling::retrieval {
 
 namespace {
-// evidence_json 是 EvidenceRef 数组;数 "engram_id" 出现次数即证据条数。
+// EvidenceRef array: accept both the production key and the legacy alias.
+// Count each reference once; key names in text/metadata are not evidence.
 int evidence_count(std::string_view evidence_json) {
+    const auto refs = nlohmann::json::parse(evidence_json, nullptr, false);
+    if (!refs.is_array()) { return 0; }
     int n = 0;
-    std::string::size_type pos = 0;
-    const std::string s(evidence_json);
-    while ((pos = s.find("engram_id", pos)) != std::string::npos) { ++n; pos += 9; }
+    for (const auto& ref : refs) {
+        if (!ref.is_object()) { continue; }
+        const auto has_reference = [&](const char* key) {
+            const auto it = ref.find(key);
+            return it != ref.end() && it->is_string() &&
+                   !it->get_ref<const std::string&>().empty();
+        };
+        if (has_reference("engram_ref") || has_reference("engram_id")) { ++n; }
+    }
     return n;
 }
 }  // namespace
